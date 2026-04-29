@@ -1,0 +1,105 @@
+# DeerFlow config.yaml
+# ⚠️ 配置你的 API Key 后再启动服务
+
+config_version: 11
+log_level: info
+token_usage:
+  enabled: false
+
+models:
+  - name: qwen3.6-plus
+    display_name: Qwen 3.6 Plus
+    use: langchain_openai:ChatOpenAI
+    model: qwen3.6-plus
+    api_key: "YOUR_DASHSCOPE_API_KEY"
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    supports_thinking: true
+
+default_model: qwen3.6-plus
+
+sandbox:
+  use: deerflow.sandbox.local:LocalSandboxProvider
+  allow_host_bash: false
+
+skills:
+  enabled: true
+  path: ./skills
+  container_path: /mnt/skills
+
+memory:
+  enabled: true
+  storage_path: memory.json
+  storage_class: deerflow.agents.memory.storage.FileMemoryStorage
+  debounce_seconds: 30
+  injection_enabled: true
+  max_injection_tokens: 2000
+
+subagents:
+  enabled: true
+  timeout_seconds: 900
+  agents:
+    general-purpose:
+      description: "A general-purpose sub-agent for delegated tasks"
+      model: qwen3.6-plus
+      max_turns: 15
+
+tool_groups:
+  - name: web
+  - name: file:read
+  - name: file:write
+  - name: bash
+
+# Set https_proxy to null or "" on a web tool to disable proxying for that tool.
+tools:
+  - name: web_search
+    group: web
+    use: deerflow.community.ddg_search.tools:web_search_tool
+    max_results: 5
+    https_proxy: http://172.17.0.1:11055
+  - name: web_fetch
+    group: web
+    use: deerflow.community.jina_ai.tools:web_fetch_tool
+    timeout: 10
+    https_proxy: http://172.17.0.1:11055
+  - name: image_search
+    group: web
+    use: deerflow.community.image_search.tools:image_search_tool
+    max_results: 5
+    https_proxy: http://172.17.0.1:11055
+  - name: ls
+    group: file:read
+    use: deerflow.sandbox.tools:ls_tool
+  - name: read_file
+    group: file:read
+    use: deerflow.sandbox.tools:read_file_tool
+  - name: glob
+    group: file:read
+    use: deerflow.sandbox.tools:glob_tool
+    max_results: 200
+  - name: grep
+    group: file:read
+    use: deerflow.sandbox.tools:grep_tool
+    max_results: 100
+  - name: write_file
+    group: file:write
+    use: deerflow.sandbox.tools:write_file_tool
+  - name: str_replace
+    group: file:write
+    use: deerflow.sandbox.tools:str_replace_tool
+  - name: bash
+    group: bash
+    use: deerflow.sandbox.tools:bash_tool
+
+guardrails:
+  enabled: false
+  providers: []
+
+title:
+  enabled: true
+  model: qwen3.6-plus
+
+summarization:
+  enabled: false
+
+tracing:
+  enabled: false

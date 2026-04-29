@@ -1,0 +1,333 @@
+"""Client manager — singleton DeerFlowClient with checkpointer lifecycle."""
+import asyncio
+import logging
+import sqlite3
+import threading
+from pathlib import Path
+from typing import Any
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+_client_manager = None
+_lock = threading.Lock()
+
+
+class ClientManager:
+    """Manages the shared DeerFlowClient instance."""
+
+    def __init__(self):
+        self._client = None
+        self._checkpointer = None
+        self._sync_sqlite_conn: sqlite3.Connection | None = None
+        self._init_lock = asyncio.Lock()
+        self._async_checkpointer = None
+        self._async_checkpointer_cm = None
+        self._async_init_lock = asyncio.Lock()
+        self._client_map: dict[tuple[object, ...], Any] = {}  # config_key -> DeerFlowClient
+        self._async_client_map: dict[tuple[object, ...], Any] = {}  # config_key -> DeerFlowClient with async checkpointer
+        self._running_threads: set[str] = set()  # thread_ids currently running
+        self._thread_lock = threading.Lock()
+
+    async def startup(self):
+        """Initialize the DeerFlowClient on startup."""
+        from deerflow.config.app_config import get_app_config, reload_app_config
+        from app.config import ensure_data_dirs
+
+        ensure_data_dirs()
+
+        if settings.config_path:
+            reload_app_config(settings.config_path)
+
+        try:
+            config = get_app_config()
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load DeerFlow config: {e}\n"
+                f"Set DEER_FLOW_CONFIG_PATH or place config.yaml in the project root."
+            ) from e
+
+    def get_client(self, **overrides) -> Any:
+        """Get or create a DeerFlowClient instance."""
+        from deerflow.client import DeerFlowClient
+
+        key = (
+            settings.checkpointer_type,
+            settings.model_name,
+            settings.thinking_enabled,
+            settings.subagent_enabled,
+            settings.plan_mode,
+            settings.max_concurrent_subagents,
+            frozenset(overrides.items()),
+        )
+
+        if key not in self._client_map:
+            kwargs: dict[str, Any] = {
+                "config_path": settings.config_path or None,
+                "checkpointer": self._get_checkpointer(),
+                "model_name": settings.model_name,
+                "thinking_enabled": settings.thinking_enabled,
+                "subagent_enabled": settings.subagent_enabled,
+                "plan_mode": settings.plan_mode,
+                "max_concurrent_subagents": settings.max_concurrent_subagents,
+            }
+            kwargs.update(overrides)
+            self._client_map[key] = DeerFlowClient(**kwargs)
+
+        return self._client_map[key]
+
+    async def get_async_client(self, **overrides) -> Any:
+        """Get or create a DeerFlowClient instance backed by an async checkpointer."""
+        from deerflow.client import DeerFlowClient
+
+        key = (
+            "async",
+            settings.checkpointer_type,
+            settings.model_name,
+            settings.thinking_enabled,
+            settings.subagent_enabled,
+            settings.plan_mode,
+            settings.max_concurrent_subagents,
+            frozenset(overrides.items()),
+        )
+
+        if key not in self._async_client_map:
+            async with self._async_init_lock:
+                if key not in self._async_client_map:
+                    kwargs: dict[str, Any] = {
+                        "config_path": settings.config_path or None,
+                        "checkpointer": await self._get_async_checkpointer(),
+                        "model_name": settings.model_name,
+                        "thinking_enabled": settings.thinking_enabled,
+                        "subagent_enabled": settings.subagent_enabled,
+                        "plan_mode": settings.plan_mode,
+                        "max_concurrent_subagents": settings.max_concurrent_subagents,
+                    }
+                    kwargs.update(overrides)
+                    self._async_client_map[key] = DeerFlowClient(**kwargs)
+
+        return self._async_client_map[key]
+
+    def get_checkpointer(self):
+        """Get the shared checkpointer for direct operations."""
+        return self._get_checkpointer()
+
+    def _get_checkpointer(self):
+        """Create the appropriate checkpointer based on settings."""
+        if settings.checkpointer_type == "none":
+            return None
+
+        if settings.checkpointer_type == "memory":
+            from langgraph.checkpoint.memory import InMemorySaver
+            if self._checkpointer is None:
+                self._checkpointer = InMemorySaver()
+            return self._checkpointer
+
+        if self._checkpointer is not None:
+            return self._checkpointer
+
+        from langgraph.checkpoint.sqlite import SqliteSaver
+
+        db_path = Path(settings.checkpointer_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        try:
+            saver = SqliteSaver(conn)
+            self._sync_sqlite_conn = conn
+            self._checkpointer = saver
+            return saver
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            from langgraph.checkpoint.memory import InMemorySaver
+            self._checkpointer = InMemorySaver()
+            return self._checkpointer
+
+    async def _get_async_checkpointer(self):
+        """Create or return the shared async checkpointer for async graph execution."""
+        if settings.checkpointer_type == "none":
+            return None
+
+        if self._async_checkpointer is not None:
+            return self._async_checkpointer
+
+        async with self._async_init_lock:
+            # Double-check inside the lock to avoid racing initialization.
+            if self._async_checkpointer is not None:
+                return self._async_checkpointer
+
+            if settings.checkpointer_type == "memory":
+                from langgraph.checkpoint.memory import InMemorySaver
+
+                self._async_checkpointer = InMemorySaver()
+                return self._async_checkpointer
+
+            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+            db_path = Path(settings.checkpointer_path)
+            await asyncio.to_thread(db_path.parent.mkdir, parents=True, exist_ok=True)
+
+            cm = AsyncSqliteSaver.from_conn_string(str(db_path))
+            saver = None
+            try:
+                saver = await cm.__aenter__()
+                await saver.setup()
+            except Exception:
+                # Roll back partial initialization so a retry can succeed and we
+                # do not leak an open SQLite connection.
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    logger.warning("async checkpointer cleanup failed during init", exc_info=True)
+                raise
+            self._async_checkpointer_cm = cm
+            self._async_checkpointer = saver
+            return self._async_checkpointer
+
+    def mark_thread_running(self, thread_id: str):
+        with self._thread_lock:
+            self._running_threads.add(thread_id)
+
+    def mark_thread_done(self, thread_id: str):
+        with self._thread_lock:
+            self._running_threads.discard(thread_id)
+
+    def is_thread_running(self, thread_id: str) -> bool:
+        with self._thread_lock:
+            return thread_id in self._running_threads
+
+    def delete_thread_completely(self, thread_id: str) -> dict[str, Any]:
+        """Delete both checkpointer data and file system data for a thread.
+
+        Atomically refuses to delete a thread that is currently running.
+        """
+        import shutil
+
+        # Atomic check-and-reject: hold the running-threads lock so a concurrent
+        # mark_thread_running cannot start a run between our check and delete.
+        with self._thread_lock:
+            if thread_id in self._running_threads:
+                return {"success": False, "running": True, "detail": f"Thread {thread_id} is currently running"}
+
+            # 1. Delete from checkpointer
+            checkpointer = self.get_checkpointer()
+            if checkpointer is not None and hasattr(checkpointer, "delete_thread"):
+                try:
+                    checkpointer.delete_thread(thread_id)
+                except Exception:
+                    logger.warning("checkpointer delete_thread failed for %s", thread_id, exc_info=True)
+
+            # 2. Delete file system data
+            try:
+                from deerflow.config.paths import get_paths
+                paths = get_paths()
+                thread_dir = paths.thread_dir(thread_id)
+                if thread_dir.exists():
+                    shutil.rmtree(thread_dir)
+            except Exception:
+                logger.warning("filesystem cleanup failed for %s", thread_id, exc_info=True)
+
+            self._running_threads.discard(thread_id)
+
+        return {"success": True, "message": f"Deleted thread {thread_id}"}
+
+    def update_thread_metadata(self, thread_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        """Update thread metadata via direct SQLite write.
+
+        Updates the metadata JSON on the latest checkpoint for the thread.
+        """
+        import json
+        if settings.checkpointer_type != "sqlite":
+            return {"success": False, "detail": "Only SQLite supports metadata update"}
+
+        db_path = Path(settings.checkpointer_path)
+        if not db_path.exists():
+            return {"success": False, "detail": "Checkpointer DB not found"}
+
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.cursor()
+            # Find the latest checkpoint by selecting the one with highest step in metadata
+            cursor.execute("""
+                SELECT thread_id, checkpoint_ns, checkpoint_id, metadata
+                FROM checkpoints
+                WHERE thread_id = ?
+                ORDER BY json_extract(metadata, '$.step') DESC
+                LIMIT 1
+            """, (thread_id,))
+            row = cursor.fetchone()
+            if not row:
+                return {"success": False, "detail": f"No checkpoints found for {thread_id}"}
+
+            # Merge new metadata into existing. The DB row may be corrupted
+            # (truncated write, manual edit, schema mismatch); surface a clear
+            # error rather than the raw JSONDecodeError trace.
+            try:
+                existing = json.loads(row["metadata"]) if row["metadata"] else {}
+            except json.JSONDecodeError:
+                logger.exception(
+                    "Corrupted metadata JSON for thread %s; resetting", thread_id
+                )
+                existing = {}
+            existing.update(metadata)
+            merged = json.dumps(existing)
+
+            cursor.execute("""
+                UPDATE checkpoints
+                SET metadata = ?
+                WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?
+            """, [merged, thread_id, row["checkpoint_ns"], row["checkpoint_id"]])
+            conn.commit()
+            return {"success": True, "message": f"Updated metadata for {thread_id}"}
+        except Exception:
+            # Log full exception server-side; return generic message to caller.
+            logger.exception("update_thread_metadata failed for %s", thread_id)
+            return {"success": False, "detail": "Failed to update thread metadata"}
+        finally:
+            conn.close()
+
+    async def shutdown(self):
+        """Cleanup on shutdown."""
+        try:
+            from deerflow.agents.memory.queue import get_memory_queue
+            from deerflow.config.memory_config import get_memory_config
+
+            if get_memory_config().enabled:
+                await asyncio.to_thread(get_memory_queue().flush)
+        except Exception:
+            pass
+
+        self._client_map.clear()
+        self._async_client_map.clear()
+        if self._async_checkpointer_cm is not None:
+            try:
+                await self._async_checkpointer_cm.__aexit__(None, None, None)
+            except Exception:
+                logger.warning("Error during async checkpointer cleanup", exc_info=True)
+            finally:
+                self._async_checkpointer_cm = None
+                self._async_checkpointer = None
+        if self._sync_sqlite_conn is not None:
+            try:
+                self._sync_sqlite_conn.close()
+            except Exception:
+                logger.warning("Error closing sync SQLite connection", exc_info=True)
+            finally:
+                self._sync_sqlite_conn = None
+        self._checkpointer = None
+        self._running_threads.clear()
+
+
+def get_client_manager() -> ClientManager:
+    global _client_manager
+    if _client_manager is None:
+        with _lock:
+            if _client_manager is None:
+                _client_manager = ClientManager()
+    return _client_manager
