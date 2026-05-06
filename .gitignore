@@ -48,6 +48,8 @@ Thumbs.db
 .env.*
 config.yaml
 data/checkpoints.db
+data/checkpoints.db-shm
+data/checkpoints.db-wal
 data/deerflow/
 data/uploads/
 

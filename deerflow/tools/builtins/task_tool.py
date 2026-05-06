@@ -6,7 +6,7 @@ import logging
 import uuid
 from dataclasses import replace
 from functools import wraps
-from typing import Annotated
+from typing import Annotated, Any
 
 from langchain.tools import InjectedToolCallId, ToolRuntime
 from langchain_core.tools import StructuredTool
@@ -93,7 +93,7 @@ async def _task_tool_impl(
         return f"Error: {LOCAL_BASH_SUBAGENT_DISABLED_MESSAGE}"
 
     # Build config overrides
-    overrides: dict = {}
+    overrides: dict[str, Any] = {}
 
     # Skills are loaded by SubagentExecutor per-session (aligned with Codex's pattern:
     # each subagent loads its own skills based on config, injected as conversation items).
@@ -108,12 +108,13 @@ async def _task_tool_impl(
     thread_id = None
     parent_model = None
     trace_id = None
-    metadata: dict = {}
+    metadata: dict[str, Any] = {}
 
     if runtime is not None:
         sandbox_state = runtime.state.get("sandbox")
         thread_data = runtime.state.get("thread_data")
-        thread_id = runtime.context.get("thread_id") if runtime.context else None
+        ctx = runtime.context if isinstance(runtime.context, dict) else None
+        thread_id = ctx.get("thread_id") if ctx else None
         if thread_id is None:
             thread_id = runtime.config.get("configurable", {}).get("thread_id")
 

@@ -32,6 +32,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from deerflow.agents.lead_agent.agent import _build_middlewares
 from deerflow.agents.middlewares.subagent_limit_middleware import clamp_subagent_limit
@@ -561,6 +562,9 @@ class DeerFlowClient:
 
         thread_info_map = {}
 
+        if not isinstance(checkpointer, BaseCheckpointSaver):
+            return {"thread_list": []}
+
         for cp in checkpointer.list(config=None, limit=limit):
             cfg = cp.config.get("configurable", {})
             thread_id = cfg.get("thread_id")
@@ -614,8 +618,11 @@ class DeerFlowClient:
 
             checkpointer = get_checkpointer()
 
-        config = {"configurable": {"thread_id": thread_id}}
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
         checkpoints = []
+
+        if not isinstance(checkpointer, BaseCheckpointSaver):
+            return {"thread_id": thread_id, "checkpoints": checkpoints}
 
         for cp in checkpointer.list(config):
             channel_values = dict(cp.checkpoint.get("channel_values", {}))

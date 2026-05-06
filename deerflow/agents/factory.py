@@ -13,23 +13,25 @@ invocation time.  Full config-free runtime is a Phase 2 goal.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
-from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
 
 from deerflow.agents.features import RuntimeFeatures
-from deerflow.agents.middlewares.clarification_middleware import ClarificationMiddleware
-from deerflow.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
-from deerflow.agents.middlewares.tool_error_handling_middleware import ToolErrorHandlingMiddleware
 from deerflow.agents.thread_state import ThreadState
-from deerflow.tools.builtins import ask_clarification_tool
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
     from langchain_core.tools import BaseTool
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.graph.state import CompiledStateGraph
+
+    from deerflow.agents.middlewares.clarification_middleware import ClarificationMiddleware
+else:
+    BaseChatModel = Any
+    BaseTool = Any
+    BaseCheckpointSaver = Any
+    CompiledStateGraph = Any
 
 logger = logging.getLogger(__name__)
 
@@ -63,14 +65,14 @@ def create_deerflow_agent(
     tools: list[BaseTool] | None = None,
     *,
     system_prompt: str | None = None,
-    middleware: list[AgentMiddleware] | None = None,
+    middleware: list[AgentMiddleware[Any, Any, Any]] | None = None,
     features: RuntimeFeatures | None = None,
-    extra_middleware: list[AgentMiddleware] | None = None,
+    extra_middleware: list[AgentMiddleware[Any, Any, Any]] | None = None,
     plan_mode: bool = False,
     state_schema: type | None = None,
-    checkpointer: BaseCheckpointSaver | None = None,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
     name: str = "default",
-) -> CompiledStateGraph:
+) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Create a DeerFlow agent from plain Python arguments.
 
     The factory assembly itself reads no config files.  Some injected runtime
@@ -107,6 +109,8 @@ def create_deerflow_agent(
     ValueError
         If both *middleware* and *features*/*extra_middleware* are provided.
     """
+    _ensure_langchain_typing_globals()
+
     if middleware is not None and features is not None:
         raise ValueError("Cannot specify both 'middleware' and 'features'.  Use one or the other.")
     if middleware is not None and extra_middleware:
@@ -120,7 +124,7 @@ def create_deerflow_agent(
     effective_state = state_schema or ThreadState
 
     if middleware is not None:
-        effective_middleware = list(middleware)
+        effective_middleware: list[AgentMiddleware[Any, Any, Any]] = list(middleware)
     else:
         feat = features or RuntimeFeatures()
         effective_middleware, extra_tools = _assemble_from_features(
@@ -136,6 +140,8 @@ def create_deerflow_agent(
                 effective_tools.append(t)
                 existing_names.add(t.name)
 
+    from langchain.agents import create_agent
+
     return create_agent(
         model=model,
         tools=effective_tools or None,
@@ -145,6 +151,28 @@ def create_deerflow_agent(
         checkpointer=checkpointer,
         name=name,
     )
+
+
+def _ensure_langchain_typing_globals() -> None:
+    """Make LangChain's forward-ref annotations resolvable after module reloads.
+
+    Some tests intentionally remove ``langchain*`` modules from ``sys.modules``
+    to verify the public SDK facade is lazy. If this factory module was imported
+    before that cleanup, using stale top-level LangChain imports can leave
+    ``typing.get_type_hints`` evaluating ``AgentState`` annotations without the
+    PEP-655 names they reference. Import ``create_agent`` lazily and make the
+    names available in the modules that own those annotations.
+    """
+    from typing import NotRequired, Required
+
+    import langchain.agents as agents_module
+    import langchain.agents.middleware.types as middleware_types
+
+    for module in (agents_module, middleware_types):
+        if not hasattr(module, "Required"):
+            setattr(module, "Required", Required)
+        if not hasattr(module, "NotRequired"):
+            setattr(module, "NotRequired", NotRequired)
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +185,8 @@ def _assemble_from_features(
     *,
     name: str = "default",
     plan_mode: bool = False,
-    extra_middleware: list[AgentMiddleware] | None = None,
-) -> tuple[list[AgentMiddleware], list[BaseTool]]:
+    extra_middleware: list[AgentMiddleware[Any, Any, Any]] | None = None,
+) -> tuple[list[AgentMiddleware[Any, Any, Any]], list[BaseTool]]:
     """Build an ordered middleware chain + extra tools from *feat*.
 
     Middleware order matches ``make_lead_agent`` (14 middlewares):
@@ -186,7 +214,11 @@ def _assemble_from_features(
         ``summarization`` and ``guardrail`` — these require a custom instance)
       - ``AgentMiddleware`` instance: use directly (custom replacement)
     """
-    chain: list[AgentMiddleware] = []
+    from deerflow.agents.middlewares.clarification_middleware import ClarificationMiddleware
+    from deerflow.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
+    from deerflow.agents.middlewares.tool_error_handling_middleware import ToolErrorHandlingMiddleware
+
+    chain: list[AgentMiddleware[Any, Any, Any]] = []
     extra_tools: list[BaseTool] = []
 
     # --- [0-2] Sandbox infrastructure ---
@@ -198,9 +230,9 @@ def _assemble_from_features(
             from deerflow.agents.middlewares.uploads_middleware import UploadsMiddleware
             from deerflow.sandbox.middleware import SandboxMiddleware
 
-            chain.append(ThreadDataMiddleware(lazy_init=True))
-            chain.append(UploadsMiddleware())
-            chain.append(SandboxMiddleware(lazy_init=True))
+            chain.append(cast(AgentMiddleware[Any, Any, Any], ThreadDataMiddleware(lazy_init=True)))
+            chain.append(cast(AgentMiddleware[Any, Any, Any], UploadsMiddleware()))
+            chain.append(cast(AgentMiddleware[Any, Any, Any], SandboxMiddleware(lazy_init=True)))
 
     # --- [3] DanglingToolCall (always) ---
     chain.append(DanglingToolCallMiddleware())
@@ -226,7 +258,7 @@ def _assemble_from_features(
     if plan_mode:
         from deerflow.agents.middlewares.todo_middleware import TodoMiddleware
 
-        chain.append(TodoMiddleware(system_prompt=_TODO_SYSTEM_PROMPT, tool_description=_TODO_TOOL_DESCRIPTION))
+        chain.append(cast(AgentMiddleware[Any, Any, Any], TodoMiddleware(system_prompt=_TODO_SYSTEM_PROMPT, tool_description=_TODO_TOOL_DESCRIPTION)))
 
     # --- [8] Auto Title ---
     if feat.auto_title is not False:
@@ -235,7 +267,7 @@ def _assemble_from_features(
         else:
             from deerflow.agents.middlewares.title_middleware import TitleMiddleware
 
-            chain.append(TitleMiddleware())
+            chain.append(cast(AgentMiddleware[Any, Any, Any], TitleMiddleware()))
 
     # --- [9] Memory ---
     if feat.memory is not False:
@@ -253,7 +285,7 @@ def _assemble_from_features(
         else:
             from deerflow.agents.middlewares.view_image_middleware import ViewImageMiddleware
 
-            chain.append(ViewImageMiddleware())
+            chain.append(cast(AgentMiddleware[Any, Any, Any], ViewImageMiddleware()))
 
         if feat.sandbox is not False:
             from deerflow.tools.builtins import view_image_tool
@@ -279,6 +311,8 @@ def _assemble_from_features(
 
     # --- [13] Clarification (always last among built-ins) ---
     chain.append(ClarificationMiddleware())
+    from deerflow.tools.builtins import ask_clarification_tool
+
     extra_tools.append(ask_clarification_tool)
 
     # --- Insert extra_middleware via @Next/@Prev ---
@@ -308,6 +342,8 @@ def _insert_extra(chain: list[AgentMiddleware], extras: list[AgentMiddleware]) -
       4. Insert anchored extras iteratively (supports cross-external anchoring).
       5. If an anchor cannot be resolved after all rounds → error.
     """
+    from deerflow.agents.middlewares.clarification_middleware import ClarificationMiddleware
+
     next_targets: dict[type, type] = {}
     prev_targets: dict[type, type] = {}
 

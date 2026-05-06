@@ -56,13 +56,8 @@ class SubagentResult:
     error: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
-    ai_messages: list[dict[str, Any]] | None = None
+    ai_messages: list[dict[str, Any]] = field(default_factory=list)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
-
-    def __post_init__(self):
-        """Initialize mutable defaults."""
-        if self.ai_messages is None:
-            self.ai_messages = []
 
 
 # Global storage for background task results

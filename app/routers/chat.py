@@ -2,20 +2,22 @@
 import asyncio
 import json
 import uuid
-from typing import Any
+from typing import Any, cast
 
 import logging
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from sse_starlette.sse import EventSourceResponse
 
 from app.config import settings
 from app.dependencies import get_client_manager
+from app.middleware import get_request_id
 
 logger = logging.getLogger(__name__)
 from app.schemas import AguiRunAgentInput, ChatRequest, ChatResponse
-from deerflow.client import StreamEvent
+from deerflow.client import StreamEvent, StreamEventType
+from deerflow.runtime import ConflictError, END_SENTINEL, HEARTBEAT_SENTINEL, RunStatus
 
 router = APIRouter(tags=["chat"])
 
@@ -40,28 +42,28 @@ _AGUI_OPTIONS_HEADERS = {
 async def chat(req: ChatRequest = Body()):
     """Sync chat — returns final response text."""
     manager = get_client_manager()
-    client = manager.get_client()
 
     thread_id = req.thread_id or str(uuid.uuid4())
-    manager.mark_thread_running(thread_id)
-
-    kwargs = {}
-    if req.model_name:
-        kwargs["model_name"] = req.model_name
-    if req.thinking_enabled is not None:
-        kwargs["thinking_enabled"] = req.thinking_enabled
-    if req.subagent_enabled is not None:
-        kwargs["subagent_enabled"] = req.subagent_enabled
-    if req.plan_mode is not None:
-        kwargs["plan_mode"] = req.plan_mode
-    if req.max_concurrent_subagents is not None:
-        kwargs["max_concurrent_subagents"] = req.max_concurrent_subagents
-    if req.agent_name:
-        kwargs["agent_name"] = req.agent_name
+    kwargs = _chat_kwargs_from_request(req)
+    request_id = get_request_id()
 
     try:
+        record = await manager.run_manager.create_or_reject(
+            thread_id,
+            multitask_strategy=req.multitask_strategy or "reject",
+            metadata={"request_id": request_id, "entrypoint": "chat"},
+            kwargs=kwargs,
+        )
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    manager.mark_thread_running(thread_id)
+
+    try:
+        await manager.run_manager.set_status(record.run_id, RunStatus.running)
+        client = manager.get_client(**kwargs)
         content = await asyncio.wait_for(
-            asyncio.to_thread(client.chat, req.message, thread_id=thread_id, **kwargs),
+            asyncio.to_thread(client.chat, req.message, thread_id=thread_id),
             timeout=settings.chat_request_timeout,
         )
     except asyncio.TimeoutError:
@@ -69,56 +71,68 @@ async def chat(req: ChatRequest = Body()):
             "chat request timed out after %.0fs (thread=%s)",
             settings.chat_request_timeout, thread_id,
         )
+        await manager.run_manager.set_status(record.run_id, RunStatus.timeout, error="Chat request timed out")
         raise HTTPException(status_code=504, detail="Chat request timed out")
     except Exception:
         logger.exception("Unhandled error in /chat (thread=%s)", thread_id)
+        await manager.run_manager.set_status(record.run_id, RunStatus.error, error="Internal server error")
         raise HTTPException(status_code=500, detail="Internal server error")
+    else:
+        await manager.run_manager.set_status(record.run_id, RunStatus.success)
     finally:
         manager.mark_thread_done(thread_id)
+        asyncio.create_task(manager.run_manager.cleanup(record.run_id, delay=300))
 
     title = await asyncio.to_thread(_get_thread_title, client, thread_id)
 
     return ChatResponse(
         thread_id=thread_id,
+        run_id=record.run_id,
         content=content,
         title=title,
     )
 
 
 @router.post("/chat/stream")
-async def chat_stream(req: ChatRequest = Body()):
+async def chat_stream(request: Request, req: ChatRequest = Body()):
     """Streaming chat — Server-Sent Events with token-level deltas."""
     manager = get_client_manager()
-    client = await manager.get_async_client()
 
     thread_id = req.thread_id or str(uuid.uuid4())
-    manager.mark_thread_running(thread_id)
+    kwargs = _chat_kwargs_from_request(req)
 
-    kwargs = {}
-    if req.model_name:
-        kwargs["model_name"] = req.model_name
-    if req.thinking_enabled is not None:
-        kwargs["thinking_enabled"] = req.thinking_enabled
-    if req.subagent_enabled is not None:
-        kwargs["subagent_enabled"] = req.subagent_enabled
-    if req.plan_mode is not None:
-        kwargs["plan_mode"] = req.plan_mode
-    if req.max_concurrent_subagents is not None:
-        kwargs["max_concurrent_subagents"] = req.max_concurrent_subagents
-    if req.agent_name:
-        kwargs["agent_name"] = req.agent_name
+    try:
+        record = await manager.start_client_stream_run(
+            thread_id=thread_id,
+            message=req.message,
+            kwargs=kwargs,
+            request_id=get_request_id(),
+            on_disconnect=req.on_disconnect or "cancel",
+            multitask_strategy=req.multitask_strategy or "reject",
+        )
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    last_event_id = request.headers.get("last-event-id")
 
     async def event_generator():
         try:
-            async for event in client.astream(req.message, thread_id=thread_id, **kwargs):
+            async for entry in manager.stream_bridge.subscribe(record.run_id, last_event_id=last_event_id):
+                if entry is HEARTBEAT_SENTINEL:
+                    yield {"event": "heartbeat", "data": "{}"}
+                    continue
+                if entry is END_SENTINEL:
+                    break
+
                 yield {
-                    "event": event.type,
-                    "data": json.dumps(event.data, ensure_ascii=False, default=str),
+                    "id": entry.id,
+                    "event": entry.event,
+                    "data": json.dumps(entry.data, ensure_ascii=False, default=str),
                 }
 
                 # Simplified text event for easier client consumption
-                if event.type == "messages-tuple" and event.data:
-                    msg = event.data
+                if entry.event == "messages-tuple" and entry.data:
+                    msg = entry.data
                     if isinstance(msg, dict) and msg.get("type") == "ai" and msg.get("content") and not msg.get("tool_calls"):
                         yield {
                             "event": "text",
@@ -126,18 +140,21 @@ async def chat_stream(req: ChatRequest = Body()):
                                 {
                                     "content": msg.get("content", ""),
                                     "thread_id": thread_id,
+                                    "run_id": record.run_id,
                                 },
                                 ensure_ascii=False,
                             ),
                         }
+        except asyncio.CancelledError:
+            if (req.on_disconnect or "cancel") == "cancel":
+                await manager.cancel_run(record.run_id)
+            raise
         except Exception:
             logger.exception("Unhandled error in /chat/stream (thread=%s)", thread_id)
             yield {
                 "event": "error",
                 "data": json.dumps({"error": "Internal server error"}),
             }
-        finally:
-            manager.mark_thread_done(thread_id)
 
     return EventSourceResponse(event_generator())
 
@@ -161,24 +178,54 @@ def _get_thread_title(client: Any, thread_id: str) -> str | None:
     return None
 
 
+def _chat_kwargs_from_request(req: ChatRequest) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if req.model_name:
+        kwargs["model_name"] = req.model_name
+    if req.thinking_enabled is not None:
+        kwargs["thinking_enabled"] = req.thinking_enabled
+    if req.subagent_enabled is not None:
+        kwargs["subagent_enabled"] = req.subagent_enabled
+    if req.plan_mode is not None:
+        kwargs["plan_mode"] = req.plan_mode
+    if req.max_concurrent_subagents is not None:
+        kwargs["max_concurrent_subagents"] = req.max_concurrent_subagents
+    if req.agent_name:
+        kwargs["agent_name"] = req.agent_name
+    return kwargs
+
+
 @router.post("/chat/agui")
-async def chat_agui(req: AguiRunAgentInput = Body()):
+async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
     """AG-UI compatible chat stream.
 
     The wire contract follows AG-UI HTTP SSE: each chunk is a `data:` JSON
     object whose payload contains a standard AG-UI `type` field.
     """
     manager = get_client_manager()
-    client = await manager.get_async_client()
     thread_id = req.thread_id
     run_id = req.run_id
-    manager.mark_thread_running(thread_id)
 
     kwargs = _chat_kwargs_from_agui(req)
     user_message = _latest_user_message(req)
     if user_message is None:
-        manager.mark_thread_done(thread_id)
         raise HTTPException(status_code=400, detail="No user message found in request")
+
+    try:
+        record = await manager.start_client_stream_run(
+            thread_id=thread_id,
+            run_id=run_id,
+            message=user_message,
+            kwargs=kwargs,
+            request_id=get_request_id(),
+            entrypoint="chat_agui",
+            on_disconnect=req.on_disconnect or "cancel",
+            multitask_strategy=req.multitask_strategy or "reject",
+        )
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    last_event_id = request.headers.get("last-event-id")
 
     async def event_generator():
         open_text_message_id: str | None = None
@@ -193,7 +240,15 @@ async def chat_agui(req: AguiRunAgentInput = Body()):
         last_snapshot_sig: str | None = None
         try:
             yield _agui_sse({"type": "RUN_STARTED", "threadId": thread_id, "runId": run_id, **({"parentRunId": req.parent_run_id} if req.parent_run_id else {})})
-            async for event in client.astream(user_message, thread_id=thread_id, **kwargs):
+            async for entry in manager.stream_bridge.subscribe(record.run_id, last_event_id=last_event_id):
+                if entry is HEARTBEAT_SENTINEL:
+                    yield _agui_sse({"type": "CUSTOM", "name": "deerflow.heartbeat", "value": {}})
+                    continue
+                if entry is END_SENTINEL:
+                    break
+                if entry.event not in {"values", "messages-tuple", "custom", "end"}:
+                    continue
+                event = StreamEvent(type=cast(StreamEventType, entry.event), data=entry.data)
                 if event.type == "end":
                     if open_text_message_id:
                         yield _agui_sse({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
@@ -220,7 +275,15 @@ async def chat_agui(req: AguiRunAgentInput = Body()):
             open_tool_call_ids.clear()
             if open_text_message_id:
                 yield _agui_sse({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
-            yield _agui_sse({"type": "RUN_FINISHED", "threadId": thread_id, "runId": run_id})
+            final_record = manager.run_manager.get(record.run_id)
+            if final_record is not None and final_record.status in {RunStatus.error, RunStatus.timeout, RunStatus.interrupted}:
+                yield _agui_sse({"type": "RUN_ERROR", "message": final_record.error or final_record.status.value})
+            else:
+                yield _agui_sse({"type": "RUN_FINISHED", "threadId": thread_id, "runId": run_id})
+        except asyncio.CancelledError:
+            if (req.on_disconnect or "cancel") == "cancel":
+                await manager.cancel_run(record.run_id)
+            raise
         except Exception:
             logger.exception("Unhandled error in /chat/agui (thread=%s)", thread_id)
             for tc_id in list(open_tool_call_ids):
@@ -229,8 +292,6 @@ async def chat_agui(req: AguiRunAgentInput = Body()):
             if open_text_message_id:
                 yield _agui_sse({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
             yield _agui_sse({"type": "RUN_ERROR", "message": "Internal server error"})
-        finally:
-            manager.mark_thread_done(thread_id)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 

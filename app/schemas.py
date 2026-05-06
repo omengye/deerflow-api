@@ -13,10 +13,13 @@ class ChatRequest(BaseModel):
     plan_mode: Optional[bool] = None
     max_concurrent_subagents: Optional[int] = Field(default=None, ge=2, le=4)
     agent_name: Optional[str] = None
+    multitask_strategy: Optional[Literal["reject", "interrupt", "rollback"]] = None
+    on_disconnect: Optional[Literal["cancel", "continue"]] = None
 
 
 class ChatResponse(BaseModel):
     thread_id: str
+    run_id: Optional[str] = None
     content: str
     title: Optional[str] = None
 
@@ -44,6 +47,8 @@ class AguiRunAgentInput(BaseModel):
     plan_mode: Optional[bool] = Field(default=None, alias="planMode")
     max_concurrent_subagents: Optional[int] = Field(default=None, ge=2, le=4, alias="maxConcurrentSubagents")
     agent_name: Optional[str] = Field(default=None, alias="agentName")
+    multitask_strategy: Optional[Literal["reject", "interrupt", "rollback"]] = Field(default=None, alias="multitaskStrategy")
+    on_disconnect: Optional[Literal["cancel", "continue"]] = Field(default=None, alias="onDisconnect")
 
 
 # --- Threads ---

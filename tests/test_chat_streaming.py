@@ -1,3 +1,4 @@
+import asyncio
 import json
 import unittest
 from collections.abc import AsyncIterator, Iterable, Iterator
@@ -8,6 +9,7 @@ from app.dependencies import ClientManager
 from app.routers import chat
 from app.schemas import AguiRunAgentInput, ChatRequest
 from deerflow.client import DeerFlowClient, StreamEvent
+from deerflow.runtime import MemoryStreamBridge, RunManager, RunStatus
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import AIMessageChunk
 from langchain_core.runnables import RunnableConfig
@@ -17,6 +19,7 @@ class _FakeClient:
     def __init__(self, events: Iterable[StreamEvent] | None = None, error_after_first: bool = False) -> None:
         self.astream_called: bool = False
         self.stream_called: bool = False
+        self.last_message: str | None = None
         self.events: list[StreamEvent] = list(
             events
             if events is not None
@@ -31,12 +34,20 @@ class _FakeClient:
         self.stream_called = True
         raise AssertionError("chat_stream must use async DeerFlowClient.astream(), not sync stream()")
 
-    async def astream(self, *_args: object, **_kwargs: object) -> AsyncIterator[StreamEvent]:
+    async def astream(self, *args: object, **_kwargs: object) -> AsyncIterator[StreamEvent]:
         self.astream_called = True
+        self.last_message = str(args[0]) if args else None
         for index, event in enumerate(self.events):
             yield event
             if self.error_after_first and index == 0:
                 raise RuntimeError("boom")
+
+
+class _FakeRequest:
+    headers: dict[str, str] = {}
+
+    async def is_disconnected(self) -> bool:
+        return False
 
 
 class _FakeManager:
@@ -44,12 +55,56 @@ class _FakeManager:
         self.client: _FakeClient = client
         self.running: list[str] = []
         self.done: list[str] = []
+        self.run_manager = RunManager()
+        self.stream_bridge = MemoryStreamBridge(queue_maxsize=32)
 
     def get_client(self) -> _FakeClient:
         return self.client
 
     async def get_async_client(self) -> _FakeClient:
         return self.client
+
+    async def start_client_stream_run(
+        self,
+        *,
+        thread_id: str,
+        message: str,
+        kwargs: dict[str, object],
+        request_id: str | None = None,
+        run_id: str | None = None,
+        entrypoint: str = "chat_stream",
+        on_disconnect: str = "cancel",
+        multitask_strategy: str = "reject",
+    ):
+        record = await self.run_manager.create_or_reject(
+            thread_id,
+            run_id=run_id,
+            on_disconnect=on_disconnect,
+            multitask_strategy=multitask_strategy,
+            metadata={"request_id": request_id, "entrypoint": entrypoint},
+            kwargs=kwargs,
+        )
+        self.mark_thread_running(thread_id)
+
+        async def produce() -> None:
+            try:
+                await self.run_manager.set_status(record.run_id, RunStatus.running)
+                await self.stream_bridge.publish(record.run_id, "metadata", {"run_id": record.run_id, "thread_id": thread_id})
+                async for event in self.client.astream(message, thread_id=thread_id):
+                    await self.stream_bridge.publish(record.run_id, event.type, event.data)
+                await self.run_manager.set_status(record.run_id, RunStatus.success)
+            except Exception as exc:
+                await self.stream_bridge.publish(record.run_id, "error", {"error": str(exc)})
+                await self.run_manager.set_status(record.run_id, RunStatus.error, error=str(exc))
+            finally:
+                self.mark_thread_done(thread_id)
+                await self.stream_bridge.publish_end(record.run_id)
+
+        record.task = asyncio.create_task(produce())
+        return record
+
+    async def cancel_run(self, run_id: str, *, action: str = "interrupt") -> bool:
+        return await self.run_manager.cancel(run_id, action=action)
 
     def mark_thread_running(self, thread_id: str) -> None:
         self.running.append(thread_id)
@@ -81,7 +136,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         original_get_client_manager = chat.get_client_manager
         chat.get_client_manager = lambda: fake_manager
         try:
-            response = await chat.chat_agui(self._agui_request(parent_run_id=parent_run_id))
+            response = await chat.chat_agui(_FakeRequest(), self._agui_request(parent_run_id=parent_run_id))
             chunks = [str(chunk) async for chunk in response.body_iterator]
         finally:
             chat.get_client_manager = original_get_client_manager
@@ -114,11 +169,100 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         original_get_client_manager = chat.get_client_manager
         chat.get_client_manager = lambda: fake_manager
         try:
-            response = await chat.chat_stream(ChatRequest(message="hello", thread_id="thread-1"))
+            response = await chat.chat_stream(_FakeRequest(), ChatRequest(message="hello", thread_id="thread-1"))
             chunks = [cast(dict[str, str], chunk) async for chunk in response.body_iterator]
         finally:
             chat.get_client_manager = original_get_client_manager
         return chunks, fake_manager
+
+    async def test_chat_stream_endpoint_forwards_request_options(self) -> None:
+        fake_client = _FakeClient()
+        fake_manager = _FakeManager(fake_client)
+        original_get_client_manager = chat.get_client_manager
+        chat.get_client_manager = lambda: fake_manager
+        try:
+            response = await chat.chat_stream(
+                _FakeRequest(),
+                ChatRequest(
+                    message="hello",
+                    thread_id="thread-1",
+                    model_name="model-a",
+                    thinking_enabled=False,
+                    subagent_enabled=True,
+                    plan_mode=True,
+                    max_concurrent_subagents=4,
+                    agent_name="agent-a",
+                    multitask_strategy="interrupt",
+                    on_disconnect="continue",
+                ),
+            )
+            chunks = [cast(dict[str, str], chunk) async for chunk in response.body_iterator]
+        finally:
+            chat.get_client_manager = original_get_client_manager
+
+        metadata = json.loads(chunks[0]["data"])
+        record = fake_manager.run_manager.get(metadata["run_id"])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.thread_id, "thread-1")
+        self.assertEqual(record.on_disconnect, "continue")
+        self.assertEqual(record.multitask_strategy, "interrupt")
+        self.assertEqual(
+            record.kwargs,
+            {
+                "model_name": "model-a",
+                "thinking_enabled": False,
+                "subagent_enabled": True,
+                "plan_mode": True,
+                "max_concurrent_subagents": 4,
+                "agent_name": "agent-a",
+            },
+        )
+
+    async def test_chat_agui_endpoint_uses_latest_user_message_and_options(self) -> None:
+        fake_client = _FakeClient()
+        fake_manager = _FakeManager(fake_client)
+        original_get_client_manager = chat.get_client_manager
+        chat.get_client_manager = lambda: fake_manager
+        payload = {
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "state": {},
+            "messages": [
+                {"id": "user-1", "role": "user", "content": "older"},
+                {"id": "assistant-1", "role": "assistant", "content": "assistant"},
+                {"id": "user-2", "role": "user", "content": "newest"},
+            ],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+            "modelName": "model-a",
+            "thinkingEnabled": False,
+            "subagentEnabled": True,
+            "planMode": True,
+            "maxConcurrentSubagents": 4,
+            "agentName": "agent-a",
+            "multitaskStrategy": "rollback",
+            "onDisconnect": "continue",
+        }
+        try:
+            response = await chat.chat_agui(_FakeRequest(), AguiRunAgentInput.model_validate(payload))
+            chunks = [str(chunk) async for chunk in response.body_iterator]
+        finally:
+            chat.get_client_manager = original_get_client_manager
+
+        events = [json.loads(chunk.removeprefix("data: ").strip()) for chunk in chunks]
+        self.assertEqual(events[0], {"type": "RUN_STARTED", "threadId": "thread-1", "runId": "run-1"})
+        record = fake_manager.run_manager.get("run-1")
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.thread_id, "thread-1")
+        self.assertEqual(record.on_disconnect, "continue")
+        self.assertEqual(record.multitask_strategy, "rollback")
+        self.assertEqual(record.kwargs["model_name"], "model-a")
+        self.assertEqual(record.kwargs["subagent_enabled"], True)
+        self.assertTrue(fake_client.astream_called)
+        self.assertEqual(fake_client.last_message, "newest")
 
     async def test_deerflow_client_astream_uses_agent_astream(self) -> None:
         class FakeAgent:
@@ -200,13 +344,14 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_manager.running, ["thread-1"])
         self.assertEqual(fake_manager.done, ["thread-1"])
 
-        first_event = chunks[0]
-        second_event = chunks[1]
-        third_event = chunks[2]
+        self.assertEqual(chunks[0]["event"], "metadata")
+        first_event = chunks[1]
+        second_event = chunks[2]
+        third_event = chunks[3]
         self.assertEqual(first_event["event"], "messages-tuple")
         self.assertEqual(json.loads(first_event["data"]), {"type": "ai", "content": "hello", "id": "msg-1"})
         self.assertEqual(second_event["event"], "text")
-        self.assertEqual(json.loads(second_event["data"]), {"content": "hello", "thread_id": "thread-1"})
+        self.assertEqual(json.loads(second_event["data"]), {"content": "hello", "thread_id": "thread-1", "run_id": json.loads(chunks[0]["data"])["run_id"]})
         self.assertEqual(third_event["event"], "end")
 
     async def test_chat_stream_does_not_emit_text_event_for_tool_calls(self) -> None:
@@ -219,14 +364,14 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         chunks, _fake_manager = await self._collect_chat_stream(fake_client)
 
-        self.assertEqual([chunk["event"] for chunk in chunks], ["messages-tuple", "end"])
+        self.assertEqual([chunk["event"] for chunk in chunks], ["metadata", "messages-tuple", "end"])
 
     async def test_chat_stream_emits_error_and_cleans_up_after_midstream_failure(self) -> None:
         fake_client = _FakeClient(error_after_first=True)
 
         chunks, fake_manager = await self._collect_chat_stream(fake_client)
 
-        self.assertEqual([chunk["event"] for chunk in chunks], ["messages-tuple", "text", "error"])
+        self.assertEqual([chunk["event"] for chunk in chunks], ["metadata", "messages-tuple", "text", "error"])
         self.assertEqual(json.loads(chunks[-1]["data"]), {"error": "boom"})
         self.assertEqual(fake_manager.done, ["thread-1"])
 

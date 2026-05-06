@@ -90,6 +90,16 @@ class Settings(BaseModel):
         default_factory=lambda: _env_bool("DEER_FLOW_CORS_ALLOW_CREDENTIALS", False)
     )
 
+    # API auth — disabled for local development unless keys are configured or
+    # DEER_FLOW_AUTH_ENABLED=true is set.
+    api_keys: list[str] = Field(default_factory=lambda: _env_csv("DEER_FLOW_API_KEYS", []))
+    auth_enabled: bool = Field(
+        default_factory=lambda: _env_bool(
+            "DEER_FLOW_AUTH_ENABLED",
+            bool(_env_csv("DEER_FLOW_API_KEYS", [])),
+        )
+    )
+
     # Per-request /chat timeout (seconds).
     chat_request_timeout: float = Field(
         default_factory=lambda: float(os.environ.get("DEER_FLOW_CHAT_TIMEOUT", "600"))
@@ -114,6 +124,13 @@ class Settings(BaseModel):
             "DEER_FLOW_ALLOWED_UPLOAD_EXTENSIONS",
             [],
         )
+    )
+
+    # Checkpointer fallback policy. Production should fail fast if persistent
+    # state cannot be opened; memory fallback is an explicit local-development
+    # escape hatch.
+    allow_memory_fallback: bool = Field(
+        default_factory=lambda: _env_bool("DEER_FLOW_ALLOW_MEMORY_FALLBACK", False)
     )
 
 settings = Settings()

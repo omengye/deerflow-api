@@ -95,8 +95,13 @@ def _convert_pdf_with_pymupdf4llm(file_path: Path) -> str | None:
 
 
 def _convert_with_markitdown(file_path: Path) -> str:
-    """Convert any supported file to markdown text using MarkItDown."""
-    from markitdown import MarkItDown
+    try:
+        from markitdown import MarkItDown
+    except ImportError as e:
+        raise RuntimeError(
+            "markitdown is not installed; install with `uv sync --extra docs` or "
+            "set uploads.pdf_converter to 'pymupdf4llm' in config.yaml"
+        ) from e
 
     md = MarkItDown()
     return md.convert(str(file_path)).text_content
