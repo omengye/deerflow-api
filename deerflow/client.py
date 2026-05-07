@@ -220,8 +220,12 @@ class DeerFlowClient:
             "subagent_enabled": overrides.get("subagent_enabled", self._subagent_enabled),
             "max_concurrent_subagents": overrides.get("max_concurrent_subagents", self._max_concurrent_subagents),
         }
+        metadata: dict[str, Any] = {}
+        if "live_event_callback" in overrides:
+            metadata["live_event_callback"] = overrides["live_event_callback"]
         return RunnableConfig(
             configurable=configurable,
+            metadata=metadata,
             recursion_limit=overrides.get("recursion_limit", 100),
         )
 
@@ -304,9 +308,11 @@ class DeerFlowClient:
         return [{"name": tc["name"], "args": tc["args"], "id": tc.get("id")} for tc in tool_calls]
 
     @staticmethod
-    def _ai_text_event(msg_id: str | None, text: str, usage: dict | None) -> "StreamEvent":
-        """Build a ``messages-tuple`` AI text event, attaching usage when present."""
+    def _ai_text_event(msg_id: str | None, text: str, usage: dict | None, reasoning_content: str | None = None) -> "StreamEvent":
+        """Build a ``messages-tuple`` AI text event, attaching usage and reasoning when present."""
         data: dict[str, Any] = {"type": "ai", "content": text, "id": msg_id}
+        if reasoning_content:
+            data["reasoning_content"] = reasoning_content
         if usage:
             data["usage_metadata"] = usage
         return StreamEvent(type="messages-tuple", data=data)
@@ -343,6 +349,9 @@ class DeerFlowClient:
         """Serialize a LangChain message to a plain dict for values events."""
         if isinstance(msg, AIMessage):
             d: dict[str, Any] = {"type": "ai", "content": msg.content, "id": getattr(msg, "id", None)}
+            reasoning = msg.additional_kwargs.get("reasoning_content")
+            if reasoning:
+                d["reasoning_content"] = reasoning
             if msg.tool_calls:
                 d["tool_calls"] = DeerFlowClient._serialize_tool_calls(msg.tool_calls)
             if getattr(msg, "usage_metadata", None):
@@ -453,7 +462,14 @@ class DeerFlowClient:
         """Convert one LangGraph stream item into DeerFlow stream events."""
         mode: str
         chunk: Any
-        if isinstance(item, tuple) and len(item) == 2:
+        if isinstance(item, tuple) and len(item) == 3:
+            # subgraphs=True: LangGraph yields (namespace_tuple, mode, chunk)
+            # Namespace identifies which subgraph emitted the event; we strip it
+            # so the rest of the handler treats subgraph events identically to
+            # top-level events.  This is intentional — callers see a flat stream.
+            _, mode, chunk = item
+            mode = str(mode)
+        elif isinstance(item, tuple) and len(item) == 2:
             mode, chunk = item
             mode = str(mode)
         else:
@@ -474,12 +490,13 @@ class DeerFlowClient:
 
             if isinstance(msg_chunk, AIMessage):
                 text = self._extract_text(msg_chunk.content)
+                reasoning = msg_chunk.additional_kwargs.get("reasoning_content")
                 counted_usage = self._account_usage(stream_state, msg_id, msg_chunk.usage_metadata)
 
-                if text:
+                if text or reasoning:
                     if msg_id:
                         stream_state.streamed_ids.add(msg_id)
-                    yield self._ai_text_event(msg_id, text, counted_usage)
+                    yield self._ai_text_event(msg_id, text, counted_usage, reasoning_content=reasoning)
 
                 # Tool calls are intentionally NOT emitted here. Individual streaming
                 # chunks have incomplete data: only the first chunk carries name/id
@@ -519,13 +536,14 @@ class DeerFlowClient:
 
             if isinstance(msg, AIMessage):
                 counted_usage = self._account_usage(stream_state, msg_id, msg.usage_metadata)
+                reasoning = msg.additional_kwargs.get("reasoning_content")
 
                 if msg.tool_calls:
                     yield self._ai_tool_calls_event(msg_id, msg.tool_calls)
 
                 text = self._extract_text(msg.content)
-                if text:
-                    yield self._ai_text_event(msg_id, text, counted_usage)
+                if text or reasoning:
+                    yield self._ai_text_event(msg_id, text, counted_usage, reasoning_content=reasoning)
 
             elif isinstance(msg, ToolMessage):
                 yield self._tool_message_event(msg)
@@ -743,6 +761,7 @@ class DeerFlowClient:
             config=config,
             context=context,
             stream_mode=["values", "messages", "custom"],
+            subgraphs=True,
         ):
             yield from self._events_from_stream_item(item, stream_state)
 
@@ -773,6 +792,7 @@ class DeerFlowClient:
             config=config,
             context=context,
             stream_mode=["values", "messages", "custom"],
+            subgraphs=True,
         ):
             for event in self._events_from_stream_item(item, stream_state):
                 yield event

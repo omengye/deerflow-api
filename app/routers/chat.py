@@ -1,4 +1,4 @@
-"""Chat endpoints — sync and streaming."""
+"""Chat endpoints — streaming and AG-UI."""
 import asyncio
 import json
 import uuid
@@ -10,12 +10,11 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from sse_starlette.sse import EventSourceResponse
 
-from app.config import settings
 from app.dependencies import get_client_manager
 from app.middleware import get_request_id
 
 logger = logging.getLogger(__name__)
-from app.schemas import AguiRunAgentInput, ChatRequest, ChatResponse
+from app.schemas import AguiRunAgentInput, ChatRequest
 from deerflow.client import StreamEvent, StreamEventType
 from deerflow.runtime import ConflictError, END_SENTINEL, HEARTBEAT_SENTINEL, RunStatus
 
@@ -36,61 +35,6 @@ _AGUI_OPTIONS_HEADERS = {
     "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
     "Access-Control-Max-Age": "86400",
 }
-
-
-@router.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest = Body()):
-    """Sync chat — returns final response text."""
-    manager = get_client_manager()
-
-    thread_id = req.thread_id or str(uuid.uuid4())
-    kwargs = _chat_kwargs_from_request(req)
-    request_id = get_request_id()
-
-    try:
-        record = await manager.run_manager.create_or_reject(
-            thread_id,
-            multitask_strategy=req.multitask_strategy or "reject",
-            metadata={"request_id": request_id, "entrypoint": "chat"},
-            kwargs=kwargs,
-        )
-    except ConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    manager.mark_thread_running(thread_id)
-
-    try:
-        await manager.run_manager.set_status(record.run_id, RunStatus.running)
-        client = manager.get_client(**kwargs)
-        content = await asyncio.wait_for(
-            asyncio.to_thread(client.chat, req.message, thread_id=thread_id),
-            timeout=settings.chat_request_timeout,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "chat request timed out after %.0fs (thread=%s)",
-            settings.chat_request_timeout, thread_id,
-        )
-        await manager.run_manager.set_status(record.run_id, RunStatus.timeout, error="Chat request timed out")
-        raise HTTPException(status_code=504, detail="Chat request timed out")
-    except Exception:
-        logger.exception("Unhandled error in /chat (thread=%s)", thread_id)
-        await manager.run_manager.set_status(record.run_id, RunStatus.error, error="Internal server error")
-        raise HTTPException(status_code=500, detail="Internal server error")
-    else:
-        await manager.run_manager.set_status(record.run_id, RunStatus.success)
-    finally:
-        manager.mark_thread_done(thread_id)
-        asyncio.create_task(manager.run_manager.cleanup(record.run_id, delay=300))
-
-    title = await asyncio.to_thread(_get_thread_title, client, thread_id)
-
-    return ChatResponse(
-        thread_id=thread_id,
-        run_id=record.run_id,
-        content=content,
-        title=title,
-    )
 
 
 @router.post("/chat/stream")
@@ -133,6 +77,12 @@ async def chat_stream(request: Request, req: ChatRequest = Body()):
                 # Simplified text event for easier client consumption
                 if entry.event == "messages-tuple" and entry.data:
                     msg = entry.data
+                    # worker.py serializes messages-mode as [chunk_dict, metadata_dict]
+                    if isinstance(msg, list) and len(msg) >= 1:
+                        msg = msg[0]
+                    # Normalize LangChain type names
+                    if isinstance(msg, dict) and msg.get("type") in ("AIMessageChunk", "AIMessage"):
+                        msg = {**msg, "type": "ai"}
                     if isinstance(msg, dict) and msg.get("type") == "ai" and msg.get("content") and not msg.get("tool_calls"):
                         yield {
                             "event": "text",
@@ -163,19 +113,6 @@ async def chat_stream(request: Request, req: ChatRequest = Body()):
 async def chat_stream_options():
     """CORS preflight support for the streaming chat endpoint."""
     return Response(status_code=204, headers=_CHAT_STREAM_OPTIONS_HEADERS)
-
-
-def _get_thread_title(client: Any, thread_id: str) -> str | None:
-    """Try to get the thread title from thread state."""
-    try:
-        thread = client.get_thread(thread_id)
-        if thread.get("checkpoints"):
-            return thread["checkpoints"][-1].get("values", {}).get("title")
-        if "values" in thread:
-            return thread["values"].get("title")
-    except Exception:
-        pass
-    return None
 
 
 def _chat_kwargs_from_request(req: ChatRequest) -> dict[str, Any]:
@@ -238,6 +175,9 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
         # LangGraph fires a values event after every middleware node even when
         # messages haven't changed, so we deduplicate here.
         last_snapshot_sig: str | None = None
+        # Reasoning message that has been started but not yet ended.
+        # Same deduplication pattern as open_text_message_id.
+        open_reasoning_message_id: str | None = None
         try:
             yield _agui_sse({"type": "RUN_STARTED", "threadId": thread_id, "runId": run_id, **({"parentRunId": req.parent_run_id} if req.parent_run_id else {})})
             async for entry in manager.stream_bridge.subscribe(record.run_id, last_event_id=last_event_id):
@@ -250,6 +190,9 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                     continue
                 event = StreamEvent(type=cast(StreamEventType, entry.event), data=entry.data)
                 if event.type == "end":
+                    if open_reasoning_message_id:
+                        yield _agui_sse({"type": "REASONING_MESSAGE_END", "messageId": open_reasoning_message_id})
+                        open_reasoning_message_id = None
                     if open_text_message_id:
                         yield _agui_sse({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
                         open_text_message_id = None
@@ -257,7 +200,7 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                         yield _agui_sse({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")})
                         yield _agui_sse({"type": "TOOL_CALL_END", "toolCallId": tc_id})
                     open_tool_call_ids.clear()
-                for agui_event in _stream_event_to_agui(event, thread_id, run_id, open_text_message_id, tool_call_args_state, open_tool_call_ids):
+                for agui_event in _stream_event_to_agui(event, thread_id, run_id, open_text_message_id, tool_call_args_state, open_tool_call_ids, open_reasoning_message_id):
                     event_type = agui_event.get("type")
                     if event_type == "MESSAGES_SNAPSHOT":
                         sig = ",".join(m.get("id", "") for m in agui_event.get("messages", []))
@@ -268,11 +211,17 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                         open_text_message_id = str(agui_event["messageId"])
                     elif event_type == "TEXT_MESSAGE_END":
                         open_text_message_id = None
+                    elif event_type == "REASONING_MESSAGE_START":
+                        open_reasoning_message_id = str(agui_event["messageId"])
+                    elif event_type == "REASONING_MESSAGE_END":
+                        open_reasoning_message_id = None
                     yield _agui_sse(agui_event)
             for tc_id in list(open_tool_call_ids):
                 yield _agui_sse({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")})
                 yield _agui_sse({"type": "TOOL_CALL_END", "toolCallId": tc_id})
             open_tool_call_ids.clear()
+            if open_reasoning_message_id:
+                yield _agui_sse({"type": "REASONING_MESSAGE_END", "messageId": open_reasoning_message_id})
             if open_text_message_id:
                 yield _agui_sse({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
             final_record = manager.run_manager.get(record.run_id)
@@ -289,6 +238,8 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
             for tc_id in list(open_tool_call_ids):
                 yield _agui_sse({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")})
                 yield _agui_sse({"type": "TOOL_CALL_END", "toolCallId": tc_id})
+            if open_reasoning_message_id:
+                yield _agui_sse({"type": "REASONING_MESSAGE_END", "messageId": open_reasoning_message_id})
             if open_text_message_id:
                 yield _agui_sse({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
             yield _agui_sse({"type": "RUN_ERROR", "message": "Internal server error"})
@@ -337,9 +288,25 @@ def _stream_event_to_agui(
     open_text_message_id: str | None,
     tool_call_args_state: dict[str, str],
     open_tool_call_ids: set[str],
+    open_reasoning_message_id: str | None = None,
 ) -> list[dict[str, Any]]:
     if event.type == "messages-tuple":
-        return _message_tuple_to_agui(event.data, open_text_message_id, tool_call_args_state, open_tool_call_ids)
+        # worker.py serializes messages-mode as [chunk_dict, metadata_dict].
+        # Unwrap to the chunk dict before delegating.
+        raw_data: Any = event.data
+        if isinstance(raw_data, list) and len(raw_data) >= 1:
+            raw_data = raw_data[0]
+        data = raw_data
+        if not isinstance(data, dict):
+            return []
+        # Normalize LangChain type names to the wire format used by client.py
+        if data.get("type") in ("AIMessageChunk", "AIMessage"):
+            data = {**data, "type": "ai"}
+        elif data.get("type") in ("HumanMessage", "HumanMessageChunk"):
+            data = {**data, "type": "human"}
+        elif data.get("type") in ("ToolMessage", "ToolMessageChunk"):
+            data = {**data, "type": "tool"}
+        return _message_tuple_to_agui(data, open_text_message_id, tool_call_args_state, open_tool_call_ids, open_reasoning_message_id)
     if event.type == "values":
         messages = event.data.get("messages")
         if isinstance(messages, list):
@@ -356,27 +323,54 @@ def _message_tuple_to_agui(
     open_text_message_id: str | None,
     tool_call_args_state: dict[str, str],
     open_tool_call_ids: set[str],
+    open_reasoning_message_id: str | None = None,
 ) -> list[dict[str, Any]]:
     message_type = data.get("type")
     if message_type == "ai":
         tool_calls = data.get("tool_calls")
         if isinstance(tool_calls, list) and tool_calls:
             events: list[dict[str, Any]] = []
+            if open_reasoning_message_id:
+                events.append({"type": "REASONING_MESSAGE_END", "messageId": open_reasoning_message_id})
             if open_text_message_id:
                 events.append({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
             events.extend(_tool_calls_to_agui(tool_calls, str(data.get("id") or uuid.uuid4()), tool_call_args_state, open_tool_call_ids))
             return events
 
         content = data.get("content")
+        reasoning = data.get("reasoning_content")
+        message_id = str(data.get("id") or uuid.uuid4())
+        reasoning_id = f"reasoning_{message_id}"
+        events: list[dict[str, Any]] = []
+
+        # --- Reasoning block ---
+        if isinstance(reasoning, str) and reasoning:
+            if open_reasoning_message_id != reasoning_id:
+                # Close any open reasoning from a different message (shouldn't happen,
+                # but be defensive) then open the new one.
+                if open_reasoning_message_id:
+                    events.append({"type": "REASONING_MESSAGE_END", "messageId": open_reasoning_message_id})
+                events.append({"type": "REASONING_MESSAGE_START", "messageId": reasoning_id, "role": "assistant"})
+            events.append({"type": "REASONING_MESSAGE_CONTENT", "messageId": reasoning_id, "delta": reasoning})
+            # If this chunk is reasoning-only (no content), return now.
+            # The caller will track open_reasoning_message_id and send END later.
+            if not (isinstance(content, str) and content):
+                return events
+
+        # Close reasoning if we are about to emit a content chunk
+        if open_reasoning_message_id and isinstance(content, str) and content:
+            events.append({"type": "REASONING_MESSAGE_END", "messageId": open_reasoning_message_id})
+
+        # --- Text content block ---
         if isinstance(content, str) and content:
-            message_id = str(data.get("id") or uuid.uuid4())
-            events: list[dict[str, Any]] = []
             if open_text_message_id != message_id:
                 if open_text_message_id:
                     events.append({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
                 events.append({"type": "TEXT_MESSAGE_START", "messageId": message_id, "role": "assistant"})
             events.append({"type": "TEXT_MESSAGE_CONTENT", "messageId": message_id, "delta": content})
             return events
+
+        return events
 
     if message_type == "tool":
         tool_call_id = data.get("tool_call_id")
@@ -436,6 +430,9 @@ def _message_to_agui(message: dict[str, Any]) -> dict[str, Any]:
         "role": role,
         "content": str(message.get("content") or ""),
     }
+    reasoning = message.get("reasoning_content")
+    if reasoning:
+        result["reasoning_content"] = str(reasoning)
     tool_calls = message.get("tool_calls")
     if isinstance(tool_calls, list) and tool_calls:
         result["toolCalls"] = [_tool_call_to_agui_message(tc) for tc in tool_calls if isinstance(tc, dict)]

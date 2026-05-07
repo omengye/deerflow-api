@@ -2,6 +2,13 @@
 import sys
 from pathlib import Path
 
+# Load .env from project root before any config/settings are imported.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+except ImportError:
+    pass
+
 # Prefer the embedded deerflow package in this API project. Fall back to the
 # original harness checkout only when the embedded package is absent.
 _project_root = Path(__file__).resolve().parent.parent

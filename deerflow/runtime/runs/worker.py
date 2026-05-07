@@ -347,11 +347,12 @@ def _lg_mode_to_sse_event(mode: str) -> str:
     """Map LangGraph internal stream_mode name to SSE event name.
 
     LangGraph's ``astream(stream_mode="messages")`` produces message
-    tuples.  The SSE protocol calls this ``messages-tuple`` when the
-    client explicitly requests it, but the default SSE event name used
-    by LangGraph Platform is simply ``"messages"``.
+    tuples.  The AG-UI consumer in ``chat.py`` (and downstream clients)
+    filters on the SSE event name ``"messages-tuple"``, so we must
+    translate the LangGraph-internal ``"messages"`` mode to that name.
     """
-    # All LG modes map 1:1 to SSE event names — "messages" stays "messages"
+    if mode == "messages":
+        return "messages-tuple"
     return mode
 
 

@@ -57,10 +57,25 @@ def serialize_channel_values(channel_values: dict[str, Any]) -> dict[str, Any]:
 
 
 def serialize_messages_tuple(obj: Any) -> Any:
-    """Serialize a messages-mode tuple ``(chunk, metadata)``."""
+    """Serialize a messages-mode tuple ``(chunk, metadata)``.
+
+    LangChain's ``model_dump()`` does not surface ``additional_kwargs``
+    sub-fields (e.g. ``reasoning_content``) as top-level keys in the
+    serialised dict.  We lift them manually so that downstream consumers
+    (the AG-UI adapter in ``chat.py``) can find ``reasoning_content``
+    at the top level of the chunk dict.
+    """
     if isinstance(obj, tuple) and len(obj) == 2:
         chunk, metadata = obj
-        return [serialize_lc_object(chunk), metadata if isinstance(metadata, dict) else {}]
+        serialized_chunk = serialize_lc_object(chunk)
+        # Lift reasoning_content from additional_kwargs to top level
+        if isinstance(serialized_chunk, dict):
+            additional_kwargs = serialized_chunk.get("additional_kwargs")
+            if isinstance(additional_kwargs, dict):
+                reasoning = additional_kwargs.get("reasoning_content")
+                if reasoning and not serialized_chunk.get("reasoning_content"):
+                    serialized_chunk["reasoning_content"] = reasoning
+        return [serialized_chunk, metadata if isinstance(metadata, dict) else {}]
     return serialize_lc_object(obj)
 
 

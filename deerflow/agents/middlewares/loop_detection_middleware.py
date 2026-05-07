@@ -17,8 +17,9 @@ import json
 import logging
 import threading
 from collections import OrderedDict, defaultdict
+from collections.abc import Callable
 from copy import deepcopy
-from typing import override
+from typing import Any, override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
@@ -165,6 +166,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         max_tracked_threads: int = _DEFAULT_MAX_TRACKED_THREADS,
         tool_freq_warn: int = _DEFAULT_TOOL_FREQ_WARN,
         tool_freq_hard_limit: int = _DEFAULT_TOOL_FREQ_HARD_LIMIT,
+        stream_callback: Callable[[dict[str, Any]], None] | None = None,
     ):
         super().__init__()
         self.warn_threshold = warn_threshold
@@ -173,6 +175,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         self.max_tracked_threads = max_tracked_threads
         self.tool_freq_warn = tool_freq_warn
         self.tool_freq_hard_limit = tool_freq_hard_limit
+        self.stream_callback = stream_callback
         self._lock = threading.Lock()
         # Per-thread tracking using OrderedDict for LRU eviction
         self._history: OrderedDict[str, list[str]] = OrderedDict()
@@ -344,10 +347,27 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
 
         return update
 
+    def _emit(self, event: dict[str, Any]) -> None:
+        """Emit a stream event via stream_callback (preferred) or get_stream_writer() fallback."""
+        if self.stream_callback is not None:
+            try:
+                self.stream_callback(event)
+            except Exception:
+                logger.debug("stream_callback raised on %s, ignoring", event.get("type"), exc_info=True)
+            return
+        try:
+            from langgraph.config import get_stream_writer
+            writer = get_stream_writer()
+            writer(event)
+        except Exception:
+            pass
+
     def _apply(self, state: AgentState, runtime: Runtime) -> dict | None:
         warning, hard_stop = self._track_and_check(state, runtime)
 
         if hard_stop:
+            self._emit({"type": "loop_hard_stop", "message": warning or _HARD_STOP_MSG})
+
             # Strip tool_calls from the last AIMessage to force text output
             messages = state.get("messages", [])
             last_msg = messages[-1]
@@ -356,6 +376,8 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             return {"messages": [stripped_msg]}
 
         if warning:
+            self._emit({"type": "loop_warning", "message": warning})
+
             # Inject as HumanMessage instead of SystemMessage to avoid
             # Anthropic's "multiple non-consecutive system messages" error.
             # Anthropic models require system messages only at the start of

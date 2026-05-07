@@ -17,13 +17,6 @@ class ChatRequest(BaseModel):
     on_disconnect: Optional[Literal["cancel", "continue"]] = None
 
 
-class ChatResponse(BaseModel):
-    thread_id: str
-    run_id: Optional[str] = None
-    content: str
-    title: Optional[str] = None
-
-
 class AguiMessage(BaseModel):
     id: str
     role: str

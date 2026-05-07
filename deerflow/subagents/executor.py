@@ -4,6 +4,7 @@ import asyncio
 import logging
 import threading
 import uuid
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ from typing import Any
 
 from langchain.agents import create_agent
 from langchain.tools import BaseTool
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 
 from deerflow.agents.thread_state import SandboxState, ThreadDataState, ThreadState
@@ -132,6 +133,7 @@ class SubagentExecutor:
         thread_data: ThreadDataState | None = None,
         thread_id: str | None = None,
         trace_id: str | None = None,
+        thinking_enabled: bool = False,
     ):
         """Initialize the executor.
 
@@ -149,6 +151,7 @@ class SubagentExecutor:
         self.sandbox_state = sandbox_state
         self.thread_data = thread_data
         self.thread_id = thread_id
+        self.thinking_enabled = thinking_enabled
         # Generate trace_id if not provided (for top-level calls)
         self.trace_id = trace_id or str(uuid.uuid4())[:8]
 
@@ -161,15 +164,19 @@ class SubagentExecutor:
 
         logger.info(f"[trace={self.trace_id}] SubagentExecutor initialized: {config.name} with {len(self.tools)} tools")
 
-    def _create_agent(self):
+    def _create_agent(self, stream_callback: Callable[[dict[str, Any]], None] | None = None):
         """Create the agent instance."""
         model_name = _get_model_name(self.config, self.parent_model)
-        model = create_chat_model(name=model_name, thinking_enabled=False)
+        model = create_chat_model(name=model_name, thinking_enabled=self.thinking_enabled)
 
+        from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware
         from deerflow.agents.middlewares.tool_error_handling_middleware import build_subagent_runtime_middlewares
 
-        # Reuse shared middleware composition with lead agent.
-        middlewares = build_subagent_runtime_middlewares(lazy_init=True)
+        # Reuse shared middleware composition with lead agent, forwarding stream_callback
+        # so TokenUsageMiddleware and LoopDetectionMiddleware can push events in the
+        # isolated subagent thread (where get_stream_writer() is not available).
+        middlewares = build_subagent_runtime_middlewares(lazy_init=True, stream_callback=stream_callback)
+        middlewares.append(LoopDetectionMiddleware(stream_callback=stream_callback))
 
         return create_agent(
             model=model,
@@ -265,12 +272,22 @@ class SubagentExecutor:
 
         return state
 
-    async def _aexecute(self, task: str, result_holder: SubagentResult | None = None) -> SubagentResult:
+    async def _aexecute(
+        self,
+        task: str,
+        result_holder: SubagentResult | None = None,
+        stream_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> SubagentResult:
         """Execute a task asynchronously.
 
         Args:
             task: The task description for the subagent.
             result_holder: Optional pre-created result object to update during execution.
+            stream_callback: Optional callback invoked with each LLM token chunk as it
+                arrives.  The callback receives a dict with ``type="token_chunk"`` and
+                a ``content`` field containing the raw chunk content (str or list).
+                This allows the caller (task_tool) to forward tokens to the SSE stream
+                in real time without waiting for the next polling cycle.
 
         Returns:
             SubagentResult with the execution result.
@@ -289,7 +306,7 @@ class SubagentExecutor:
             )
 
         try:
-            agent = self._create_agent()
+            agent = self._create_agent(stream_callback=stream_callback)
             state = await self._build_initial_state(task)
 
             # LangGraph recursion_limit counts individual node executions, not agent
@@ -305,8 +322,20 @@ class SubagentExecutor:
 
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} starting async execution with max_turns={self.config.max_turns}")
 
-            # Use stream instead of invoke to get real-time updates
-            # This allows us to collect AI messages as they are generated
+            # Notify caller that execution has truly begun (not just queued).
+            if stream_callback is not None:
+                try:
+                    stream_callback({
+                        "type": "subagent_started",
+                        "name": self.config.name,
+                        "trace_id": self.trace_id,
+                    })
+                except Exception:
+                    logger.debug(f"[trace={self.trace_id}] stream_callback raised on subagent_started, ignoring", exc_info=True)
+
+            # Use stream_mode=["values", "messages"] so we get both:
+            #   - "values" chunks: full state snapshots used for ai_messages aggregation
+            #   - "messages" chunks: individual LLM token deltas for real-time streaming
             final_state = None
 
             # Pre-check: bail out immediately if already cancelled before streaming starts
@@ -319,7 +348,12 @@ class SubagentExecutor:
                         result.completed_at = datetime.now()
                 return result
 
-            async for chunk in agent.astream(state, config=run_config, context=context, stream_mode="values"):  # type: ignore[arg-type]
+            async for mode, chunk in agent.astream(  # type: ignore[arg-type]
+                state,
+                config=run_config,
+                context=context,
+                stream_mode=["values", "messages"],
+            ):
                 # Cooperative cancellation: check if parent requested stop.
                 # Note: cancellation is only detected at astream iteration boundaries,
                 # so long-running tool calls within a single iteration will not be
@@ -333,7 +367,58 @@ class SubagentExecutor:
                             result.completed_at = datetime.now()
                     return result
 
+                if mode == "messages":
+                    # chunk is a tuple (message_chunk, metadata) from LangGraph messages mode
+                    msg_chunk = chunk[0] if isinstance(chunk, tuple) else chunk
+                    if stream_callback is not None:
+                        try:
+                            # LLM token stream — content may be str or list of blocks
+                            if isinstance(msg_chunk, AIMessage) and msg_chunk.content:
+                                content = msg_chunk.content
+                                if isinstance(content, list):
+                                    # Split thinking blocks from text blocks
+                                    for block in content:
+                                        if isinstance(block, dict):
+                                            if block.get("type") == "thinking" and block.get("thinking"):
+                                                stream_callback({"type": "thinking_chunk", "thinking": block["thinking"]})
+                                            elif block.get("type") == "text" and block.get("text"):
+                                                stream_callback({"type": "token_chunk", "content": block["text"]})
+                                        elif isinstance(block, str) and block:
+                                            stream_callback({"type": "token_chunk", "content": block})
+                                else:
+                                    stream_callback({"type": "token_chunk", "content": content})
+                            # Tool call invocation (args may arrive incrementally across chunks)
+                            if isinstance(msg_chunk, AIMessage) and msg_chunk.tool_calls:
+                                for tc in msg_chunk.tool_calls:
+                                    stream_callback({"type": "tool_call_chunk", "tool_call": tc})
+                            # Tool execution result
+                            if isinstance(msg_chunk, ToolMessage):
+                                stream_callback({
+                                    "type": "tool_result_chunk",
+                                    "tool_call_id": msg_chunk.tool_call_id,
+                                    "name": getattr(msg_chunk, "name", None),
+                                    "content": msg_chunk.content,
+                                    "status": getattr(msg_chunk, "status", None),
+                                })
+                        except Exception:
+                            logger.debug(f"[trace={self.trace_id}] stream_callback raised, ignoring", exc_info=True)
+                    # Don't update final_state from messages chunks
+                    continue
+
+                # mode == "values": full state snapshot — one per completed graph node
+                turn_number = final_state is not None  # False on first chunk → turn 0
                 final_state = chunk
+
+                # Emit turn_complete so callers can track agent progress
+                if stream_callback is not None:
+                    try:
+                        messages_so_far = chunk.get("messages", [])
+                        stream_callback({
+                            "type": "turn_complete",
+                            "message_count": len(messages_so_far),
+                        })
+                    except Exception:
+                        logger.debug(f"[trace={self.trace_id}] stream_callback raised on turn_complete, ignoring", exc_info=True)
 
                 # Extract AI messages from the current state
                 messages = chunk.get("messages", [])
@@ -439,7 +524,12 @@ class SubagentExecutor:
 
         return result
 
-    def _execute_in_isolated_loop(self, task: str, result_holder: SubagentResult | None = None) -> SubagentResult:
+    def _execute_in_isolated_loop(
+        self,
+        task: str,
+        result_holder: SubagentResult | None = None,
+        stream_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> SubagentResult:
         """Execute the subagent in a completely fresh event loop.
 
         This method is designed to run in a separate thread to ensure complete
@@ -455,7 +545,7 @@ class SubagentExecutor:
         loop = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)
-            return loop.run_until_complete(self._aexecute(task, result_holder))
+            return loop.run_until_complete(self._aexecute(task, result_holder, stream_callback))
         finally:
             try:
                 pending = asyncio.all_tasks(loop)
@@ -477,7 +567,12 @@ class SubagentExecutor:
                 finally:
                     asyncio.set_event_loop(previous_loop)
 
-    def execute(self, task: str, result_holder: SubagentResult | None = None) -> SubagentResult:
+    def execute(
+        self,
+        task: str,
+        result_holder: SubagentResult | None = None,
+        stream_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> SubagentResult:
         """Execute a task synchronously (wrapper around async execution).
 
         This method runs the async execution in a new event loop, allowing
@@ -491,6 +586,7 @@ class SubagentExecutor:
         Args:
             task: The task description for the subagent.
             result_holder: Optional pre-created result object to update during execution.
+            stream_callback: Optional callback for real-time LLM token chunks.
 
         Returns:
             SubagentResult with the execution result.
@@ -503,11 +599,11 @@ class SubagentExecutor:
 
             if loop is not None and loop.is_running():
                 logger.debug(f"[trace={self.trace_id}] Subagent {self.config.name} detected running event loop, using isolated thread")
-                future = _isolated_loop_pool.submit(self._execute_in_isolated_loop, task, result_holder)
+                future = _isolated_loop_pool.submit(self._execute_in_isolated_loop, task, result_holder, stream_callback)
                 return future.result()
 
             # Standard path: no running event loop, use asyncio.run
-            return asyncio.run(self._aexecute(task, result_holder))
+            return asyncio.run(self._aexecute(task, result_holder, stream_callback))
         except Exception as e:
             logger.exception(f"[trace={self.trace_id}] Subagent {self.config.name} execution failed")
             # Create a result with error if we don't have one
@@ -524,12 +620,18 @@ class SubagentExecutor:
             result.completed_at = datetime.now()
             return result
 
-    def execute_async(self, task: str, task_id: str | None = None) -> str:
+    def execute_async(
+        self,
+        task: str,
+        task_id: str | None = None,
+        stream_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
         """Start a task execution in the background.
 
         Args:
             task: The task description for the subagent.
             task_id: Optional task ID to use. If not provided, a random UUID will be generated.
+            stream_callback: Optional callback for real-time LLM token chunks.
 
         Returns:
             Task ID that can be used to check status later.
@@ -560,7 +662,7 @@ class SubagentExecutor:
             try:
                 # Submit execution to execution pool with timeout
                 # Pass result_holder so execute() can update it in real-time
-                execution_future: Future = _execution_pool.submit(self.execute, task, result_holder)
+                execution_future: Future = _execution_pool.submit(self.execute, task, result_holder, stream_callback)
                 try:
                     # Wait for execution with timeout
                     exec_result = execution_future.result(timeout=self.config.timeout_seconds)

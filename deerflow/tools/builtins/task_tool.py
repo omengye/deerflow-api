@@ -4,13 +4,13 @@ import asyncio
 import concurrent.futures
 import logging
 import uuid
+from collections.abc import Callable, Coroutine
 from dataclasses import replace
 from functools import wraps
 from typing import Annotated, Any
 
 from langchain.tools import InjectedToolCallId, ToolRuntime
 from langchain_core.tools import StructuredTool
-from langgraph.config import get_stream_writer
 from langgraph.typing import ContextT
 from pydantic import BaseModel, Field
 
@@ -121,6 +121,7 @@ async def _task_tool_impl(
         # Try to get parent model from configurable
         metadata = runtime.config.get("metadata", {})
         parent_model = metadata.get("model_name")
+        parent_thinking_enabled = bool(metadata.get("thinking_enabled", False))
 
         # Get or generate trace_id for distributed tracing
         trace_id = metadata.get("trace_id") or str(uuid.uuid4())[:8]
@@ -151,24 +152,70 @@ async def _task_tool_impl(
         thread_data=thread_data,
         thread_id=thread_id,
         trace_id=trace_id,
+        thinking_enabled=parent_thinking_enabled,
     )
+
+    # Resolve the live_event_callback from config metadata.
+    # This callback writes directly into the SSE bridge, bypassing LangGraph's
+    # per-node custom-stream buffer which is only flushed when the node returns.
+    # Without this, all writer() calls would be buffered until the tool coroutine
+    # exits, causing 30+ second delays for long-running task polls.
+    _live_cb: Callable[[dict[str, Any]], Coroutine[Any, Any, None]] | None = None
+    if runtime is not None:
+        _live_cb = runtime.config.get("metadata", {}).get("live_event_callback")
+
+    # Capture the main event loop so that _emit can schedule coroutines on it
+    # from any thread (including the subagent's isolated ThreadPoolExecutor thread).
+    _main_loop: asyncio.AbstractEventLoop | None = None
+    try:
+        _main_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+
+    def _emit(event: dict[str, Any]) -> None:
+        """Push an event to the SSE bridge (non-blocking fire-and-forget).
+
+        Safe to call from any thread: uses call_soon_threadsafe when invoked
+        from outside the main event loop thread.
+        """
+        if _live_cb is None or _main_loop is None:
+            return
+        cb = _live_cb
+        loop = _main_loop
+        try:
+            if loop.is_running():
+                loop.call_soon_threadsafe(
+                    lambda e=event: loop.create_task(cb(e))
+                )
+        except Exception:
+            pass
+
+    # Polling interval (seconds). 1s balances responsiveness with CPU overhead.
+    _POLL_INTERVAL = 1
+
+    # Forward LLM token chunks from the subagent thread to the SSE stream in real
+    # time.  The callback is invoked synchronously from the subagent's isolated
+    # event loop thread; _emit schedules the async bridge publish on the main loop,
+    # so it is safe to call across thread boundaries.
+    # tool_call_id is used as the task_id, so we can safely reference it here.
+    def _token_stream_callback(event: dict[str, Any]) -> None:
+        _emit({"type": "task_token_chunk", "task_id": tool_call_id, **event})
 
     # Start background execution (always async to prevent blocking)
     # Use tool_call_id as task_id for better traceability
-    task_id = executor.execute_async(prompt, task_id=tool_call_id)
+    task_id = executor.execute_async(prompt, task_id=tool_call_id, stream_callback=_token_stream_callback)
+
+    # Send Task Started message
+    _emit({"type": "task_started", "task_id": task_id, "description": description})
 
     # Poll for task completion in backend (removes need for LLM to poll)
     poll_count = 0
     last_status = None
     last_message_count = 0  # Track how many AI messages we've already sent
-    # Polling timeout: execution timeout + 60s buffer, checked every 5s
-    max_poll_count = (config.timeout_seconds + 60) // 5
+    # Polling timeout: execution timeout + 60s buffer, checked every _POLL_INTERVAL seconds
+    max_poll_count = (config.timeout_seconds + 60) // _POLL_INTERVAL
 
     logger.info(f"[trace={trace_id}] Started background task {task_id} (subagent={subagent_type}, timeout={config.timeout_seconds}s, polling_limit={max_poll_count} polls)")
-
-    writer = get_stream_writer()
-    # Send Task Started message'
-    writer({"type": "task_started", "task_id": task_id, "description": description})
 
     try:
         while True:
@@ -176,7 +223,7 @@ async def _task_tool_impl(
 
             if result is None:
                 logger.error(f"[trace={trace_id}] Task {task_id} not found in background tasks")
-                writer({"type": "task_failed", "task_id": task_id, "error": "Task disappeared from background tasks"})
+                _emit({"type": "task_failed", "task_id": task_id, "error": "Task disappeared from background tasks"})
                 cleanup_background_task(task_id)
                 return f"Error: Task {task_id} disappeared from background tasks"
 
@@ -191,7 +238,7 @@ async def _task_tool_impl(
                 # Send task_running event for each new message
                 for i in range(last_message_count, current_message_count):
                     message = result.ai_messages[i]
-                    writer(
+                    _emit(
                         {
                             "type": "task_running",
                             "task_id": task_id,
@@ -205,32 +252,32 @@ async def _task_tool_impl(
 
             # Check if task completed, failed, or timed out
             if result.status == SubagentStatus.COMPLETED:
-                writer({"type": "task_completed", "task_id": task_id, "result": result.result})
+                _emit({"type": "task_completed", "task_id": task_id, "result": result.result})
                 logger.info(f"[trace={trace_id}] Task {task_id} completed after {poll_count} polls")
                 cleanup_background_task(task_id)
                 return f"Task Succeeded. Result: {result.result}"
             elif result.status == SubagentStatus.FAILED:
-                writer({"type": "task_failed", "task_id": task_id, "error": result.error})
+                _emit({"type": "task_failed", "task_id": task_id, "error": result.error})
                 logger.error(f"[trace={trace_id}] Task {task_id} failed: {result.error}")
                 cleanup_background_task(task_id)
                 return f"Task failed. Error: {result.error}"
             elif result.status == SubagentStatus.CANCELLED:
-                writer({"type": "task_cancelled", "task_id": task_id, "error": result.error})
+                _emit({"type": "task_cancelled", "task_id": task_id, "error": result.error})
                 logger.info(f"[trace={trace_id}] Task {task_id} cancelled: {result.error}")
                 cleanup_background_task(task_id)
                 return "Task cancelled by user."
             elif result.status == SubagentStatus.TIMED_OUT:
-                writer({"type": "task_timed_out", "task_id": task_id, "error": result.error})
+                _emit({"type": "task_timed_out", "task_id": task_id, "error": result.error})
                 logger.warning(f"[trace={trace_id}] Task {task_id} timed out: {result.error}")
                 cleanup_background_task(task_id)
                 return f"Task timed out. Error: {result.error}"
 
             # Still running, wait before next poll
-            await asyncio.sleep(5)
+            await asyncio.sleep(_POLL_INTERVAL)
             poll_count += 1
 
             # Polling timeout as a safety net (in case thread pool timeout doesn't work)
-            # Set to execution timeout + 60s buffer, in 5s poll intervals
+            # Set to execution timeout + 60s buffer, in _POLL_INTERVAL-second intervals
             # This catches edge cases where the background task gets stuck
             # Note: We don't call cleanup_background_task here because the task may
             # still be running in the background. The cleanup will happen when the
@@ -238,7 +285,7 @@ async def _task_tool_impl(
             if poll_count > max_poll_count:
                 timeout_minutes = config.timeout_seconds // 60
                 logger.error(f"[trace={trace_id}] Task {task_id} polling timed out after {poll_count} polls (should have been caught by thread pool timeout)")
-                writer({"type": "task_timed_out", "task_id": task_id})
+                _emit({"type": "task_timed_out", "task_id": task_id})
                 return f"Task polling timed out after {timeout_minutes} minutes. This may indicate the background task is stuck. Status: {result.status.value}"
     except asyncio.CancelledError:
         # Signal the background subagent thread to stop cooperatively.
@@ -264,7 +311,7 @@ async def _task_tool_impl(
                     logger.warning(f"[trace={trace_id}] Deferred cleanup for task {task_id} timed out after {cleanup_poll_count} polls")
                     return
 
-                await asyncio.sleep(5)
+                await asyncio.sleep(_POLL_INTERVAL)
                 cleanup_poll_count += 1
 
         def log_cleanup_failure(cleanup_task: asyncio.Task[None]) -> None:

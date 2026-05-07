@@ -337,9 +337,18 @@ class ClientManager:
                     "request_id": request_id,
                 },
             )
+            # Build a live_event_callback that bypasses LangGraph's per-node
+            # custom-stream buffer and publishes events directly to the bridge.
+            # This is used by task_tool to push subagent progress events in
+            # real time while the tool coroutine is still running (polling).
+            bridge = self.stream_bridge
+
+            async def _live_event_callback(event: dict[str, Any]) -> None:
+                await bridge.publish(run_id, event.get("type", "custom"), event)
+
             client = await self.get_async_client(**kwargs)
             async with asyncio.timeout(settings.chat_request_timeout):
-                async for event in client.astream(message, thread_id=thread_id):
+                async for event in client.astream(message, thread_id=thread_id, live_event_callback=_live_event_callback):
                     if record.abort_event.is_set():
                         break
                     await self.stream_bridge.publish(run_id, event.type, event.data)
