@@ -53,7 +53,8 @@ tool_groups:
 tools:
   - name: web_search
     group: web
-    use: deerflow.community.ddg_search.tools:web_search_tool
+    use: deerflow.community.brave_search.tools:web_search_tool
+    api_key: "YOUR_BRAVE_API_KEY"
     max_results: 5
     https_proxy: http://172.17.0.1:11055
   - name: web_fetch

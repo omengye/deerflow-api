@@ -13,7 +13,6 @@ dependencies = [
     # DeerFlow harness (embedded)
     "agent-client-protocol>=0.4.0",
     "agent-sandbox>=0.0.19",
-    "ddgs>=9.10.0",
     "dotenv>=0.9.9",
     "httpx>=0.28.0",
     "langchain>=1.2.3",
