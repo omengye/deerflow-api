@@ -41,7 +41,7 @@ subagents:
     general-purpose:
       description: "A general-purpose sub-agent for delegated tasks"
       model: qwen3.6-plus
-      max_turns: 15
+      max_turns: 25
 
 tool_groups:
   - name: web

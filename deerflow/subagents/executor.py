@@ -292,9 +292,11 @@ class SubagentExecutor:
             agent = self._create_agent()
             state = await self._build_initial_state(task)
 
-            # Build config with thread_id for sandbox access and recursion limit
+            # LangGraph recursion_limit counts individual node executions, not agent
+            # turns. Each turn consumes at least 2 steps (agent + tools nodes), and
+            # middleware adds more. Multiply by 3 so max_turns maps to actual turns.
             run_config: RunnableConfig = {
-                "recursion_limit": self.config.max_turns,
+                "recursion_limit": self.config.max_turns * 3,
             }
             context = {}
             if self.thread_id:
@@ -563,27 +565,34 @@ class SubagentExecutor:
                     # Wait for execution with timeout
                     exec_result = execution_future.result(timeout=self.config.timeout_seconds)
                     with _background_tasks_lock:
-                        _background_tasks[task_id].status = exec_result.status
-                        _background_tasks[task_id].result = exec_result.result
-                        _background_tasks[task_id].error = exec_result.error
-                        _background_tasks[task_id].completed_at = datetime.now()
-                        _background_tasks[task_id].ai_messages = exec_result.ai_messages
+                        task_result = _background_tasks.get(task_id)
+                        if task_result is not None:
+                            task_result.status = exec_result.status
+                            task_result.result = exec_result.result
+                            task_result.error = exec_result.error
+                            task_result.completed_at = datetime.now()
+                            task_result.ai_messages = exec_result.ai_messages
                 except FuturesTimeoutError:
                     logger.error(f"[trace={self.trace_id}] Subagent {self.config.name} execution timed out after {self.config.timeout_seconds}s")
                     with _background_tasks_lock:
-                        if _background_tasks[task_id].status == SubagentStatus.RUNNING:
-                            _background_tasks[task_id].status = SubagentStatus.TIMED_OUT
-                            _background_tasks[task_id].error = f"Execution timed out after {self.config.timeout_seconds} seconds"
-                            _background_tasks[task_id].completed_at = datetime.now()
+                        task_result = _background_tasks.get(task_id)
+                        if task_result is not None and task_result.status == SubagentStatus.RUNNING:
+                            task_result.status = SubagentStatus.TIMED_OUT
+                            task_result.error = f"Execution timed out after {self.config.timeout_seconds} seconds"
+                            task_result.completed_at = datetime.now()
+                        else:
+                            logger.debug(f"[trace={self.trace_id}] Task {task_id} already cleaned up before timeout handler ran")
                     # Signal cooperative cancellation and cancel the future
                     result_holder.cancel_event.set()
                     execution_future.cancel()
             except Exception as e:
                 logger.exception(f"[trace={self.trace_id}] Subagent {self.config.name} async execution failed")
                 with _background_tasks_lock:
-                    _background_tasks[task_id].status = SubagentStatus.FAILED
-                    _background_tasks[task_id].error = str(e)
-                    _background_tasks[task_id].completed_at = datetime.now()
+                    task_result = _background_tasks.get(task_id)
+                    if task_result is not None:
+                        task_result.status = SubagentStatus.FAILED
+                        task_result.error = str(e)
+                        task_result.completed_at = datetime.now()
 
         _scheduler_pool.submit(run_task)
         return task_id
