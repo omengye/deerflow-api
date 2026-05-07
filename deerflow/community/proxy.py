@@ -2,7 +2,7 @@
 
 from deerflow.config import get_app_config
 
-DEFAULT_HTTPS_PROXY = "http://172.17.0.1:11055"
+DEFAULT_HTTPS_PROXY = None
 
 _SENTINEL = object()
 
@@ -10,9 +10,9 @@ _SENTINEL = object()
 def get_tool_https_proxy(tool_name: str) -> str | None:
     """Return the configured HTTPS proxy for a network tool.
 
-    Tools default to the host proxy used by local Docker-style deployments.
-    Set ``https_proxy`` to an empty string or null in config.yaml to disable
-    proxying for a specific tool.
+    Returns None (no proxy) when not configured. Set ``https_proxy`` in
+    config.yaml to enable proxying for a specific tool; set it to an empty
+    string or null to explicitly disable it.
     """
     try:
         tool_config = get_app_config().get_tool_config(tool_name)

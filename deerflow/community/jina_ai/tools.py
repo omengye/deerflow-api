@@ -29,8 +29,10 @@ class _WebFetchInput(BaseModel):
 
 async def _fetch_direct(url: str, timeout: int, https_proxy: str | None = None) -> str:
     headers = {
-        "User-Agent": "DeerFlow/1.0 (+https://github.com/bytedance/deer-flow)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
     }
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers, proxy=https_proxy, trust_env=False) as client:
@@ -46,7 +48,8 @@ async def _fetch_direct(url: str, timeout: int, https_proxy: str | None = None) 
 
 _DEFAULT_FETCH_TIMEOUT = 10
 _MAX_FETCH_TIMEOUT = 120
-_MAX_OUTPUT_CHARS = 4096
+_DEFAULT_MAX_OUTPUT_CHARS = 4096
+_MAX_MAX_OUTPUT_CHARS = 50000
 
 
 def _resolve_fetch_timeout() -> int:
@@ -67,11 +70,43 @@ def _resolve_fetch_timeout() -> int:
         return timeout
 
 
+def _resolve_jina_api_key() -> str | None:
+    """Resolve Jina API key: config.yaml api_key > JINA_API_KEY env var > None."""
+    import os
+    try:
+        config = get_app_config().get_tool_config("web_fetch")
+    except Exception:
+        return os.getenv("JINA_API_KEY")
+    if config is not None:
+        raw = config.model_extra.get("api_key") if config.model_extra else None
+        if raw and isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return os.getenv("JINA_API_KEY")
+
+
+def _resolve_max_output_chars() -> int:
+    """Resolve the web_fetch max output chars from config with safe clamping."""
+    try:
+        config = get_app_config().get_tool_config("web_fetch")
+    except Exception:
+        return _DEFAULT_MAX_OUTPUT_CHARS
+    if config is None:
+        return _DEFAULT_MAX_OUTPUT_CHARS
+    raw = config.model_extra.get("max_output_chars") if config.model_extra else None
+    if raw is None:
+        return _DEFAULT_MAX_OUTPUT_CHARS
+    try:
+        return max(256, min(int(raw), _MAX_MAX_OUTPUT_CHARS))
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_OUTPUT_CHARS
+
+
 async def _web_fetch_impl(url: str) -> str:
     jina_client = JinaClient()
     timeout = _resolve_fetch_timeout()
     https_proxy = get_tool_https_proxy("web_fetch")
-    html_content = await jina_client.crawl(url, return_format="html", timeout=timeout, https_proxy=https_proxy)
+    api_key = _resolve_jina_api_key()
+    html_content = await jina_client.crawl(url, return_format="html", timeout=timeout, https_proxy=https_proxy, api_key=api_key)
 
     jina_error: str | None = None
     if isinstance(html_content, str) and html_content.startswith("Error:"):
@@ -93,14 +128,13 @@ async def _web_fetch_impl(url: str) -> str:
 
     article = await asyncio.to_thread(readability_extractor.extract_article, html_content)
     markdown = article.to_markdown()
-    if len(markdown) > _MAX_OUTPUT_CHARS:
-        # Loud signal so operators notice when truncation routinely fires —
-        # otherwise downstream agents see partial pages with no indication.
+    max_output_chars = _resolve_max_output_chars()
+    if len(markdown) > max_output_chars:
         logger.info(
             "web_fetch truncated output for %s: %d -> %d chars",
-            url, len(markdown), _MAX_OUTPUT_CHARS,
+            url, len(markdown), max_output_chars,
         )
-    return markdown[:_MAX_OUTPUT_CHARS]
+    return markdown[:max_output_chars]
 
 
 def _create_web_fetch_tool() -> StructuredTool:

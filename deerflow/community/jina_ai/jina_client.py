@@ -1,5 +1,4 @@
 import logging
-import os
 import threading
 
 import httpx
@@ -34,6 +33,7 @@ class JinaClient:
         return_format: str = "html",
         timeout: int = 10,
         https_proxy: str | None = None,
+        api_key: str | None = None,
     ) -> str:
         # Clamp timeout to a sane range — non-positive values would otherwise
         # raise inside httpx and abort the request immediately.
@@ -47,7 +47,6 @@ class JinaClient:
             "X-Return-Format": return_format,
             "X-Timeout": str(timeout_int),
         }
-        api_key = os.getenv("JINA_API_KEY")
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         else:

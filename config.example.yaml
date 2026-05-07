@@ -63,6 +63,7 @@ tools:
     timeout: 10
     https_proxy: http://172.17.0.1:11055
   - name: image_search
+    api_key: "" # ????????
     group: web
     use: deerflow.community.image_search.tools:image_search_tool
     max_results: 5
