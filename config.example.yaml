@@ -3,6 +3,38 @@
 
 config_version: 11
 log_level: info
+
+# API service settings. Prefer putting operational configuration here instead
+# of .env. Environment variables are still supported as compatibility fallbacks
+# when a field is omitted.
+api:
+  host: 0.0.0.0
+  port: 8000
+  checkpointer_type: sqlite
+  checkpointer_path: ./data/checkpoints.db
+  model_name: null
+  thinking_enabled: true
+  subagent_enabled: true
+  plan_mode: true
+  max_concurrent_subagents: 3
+  data_dir: ./data
+  deerflow_home: ./data/deerflow
+  deerflow_host_base_dir: null
+  extensions_config_path: null
+  cors_allow_origins:
+    - http://localhost:3000
+    - http://127.0.0.1:3000
+  cors_allow_credentials: false
+  # Set api_keys to enable Bearer-token auth, or set auth_enabled explicitly.
+  api_keys: []
+  auth_enabled: false
+  chat_request_timeout: 600
+  max_upload_size_mb: 25
+  max_uploads_per_request: 10
+  # Empty list = allow any extension. Example: [.pdf, .txt, .md]
+  allowed_upload_extensions: []
+  allow_memory_fallback: false
+
 token_usage:
   enabled: false
 
@@ -105,3 +137,15 @@ summarization:
 
 tracing:
   enabled: false
+  langsmith:
+    enabled: false
+    # You can set a literal value here or keep credentials in env via $LANGSMITH_API_KEY.
+    api_key: null
+    project: deer-flow
+    endpoint: https://api.smith.langchain.com
+  langfuse:
+    enabled: false
+    # You can set literal values here or keep credentials in env via placeholders.
+    public_key: null
+    secret_key: null
+    host: https://cloud.langfuse.com

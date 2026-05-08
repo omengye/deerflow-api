@@ -1,12 +1,18 @@
 import unittest
+import tempfile
+import importlib
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import app.config as app_config
 from app.config import settings
 from app.dependencies import ClientManager
 from app.middleware import ApiKeyAuthMiddleware
+from deerflow.config.app_config import get_app_config, reset_app_config
+from deerflow.config.tracing_config import get_tracing_config, reset_tracing_config
 from deerflow.runtime import ConflictError, RunStatus
 
 
@@ -93,6 +99,168 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
             settings.checkpointer_type = original_type
             settings.checkpointer_path = original_path
             settings.allow_memory_fallback = original_fallback
+
+    async def test_settings_prefer_config_yaml_api_section_over_env(self) -> None:
+        original_api_config = dict(app_config._API_CONFIG)
+        try:
+            app_config._API_CONFIG = {
+                "host": "127.0.0.1",
+                "port": 9001,
+                "plan_mode": False,
+                "subagent_enabled": False,
+                "max_concurrent_subagents": 4,
+                "cors_allow_origins": ["https://example.test"],
+                "api_keys": ["from-config"],
+                "auth_enabled": True,
+                "chat_request_timeout": 12.5,
+                "max_upload_size_mb": 8,
+                "max_uploads_per_request": 2,
+                "allowed_upload_extensions": ["md", ".txt"],
+                "allow_memory_fallback": True,
+            }
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOST": "0.0.0.0",
+                    "PORT": "1234",
+                    "DEER_FLOW_PLAN_MODE": "true",
+                    "DEER_FLOW_API_KEYS": "from-env",
+                },
+                clear=False,
+            ):
+                loaded = app_config.Settings()
+
+            self.assertEqual(loaded.host, "127.0.0.1")
+            self.assertEqual(loaded.port, 9001)
+            self.assertFalse(loaded.plan_mode)
+            self.assertFalse(loaded.subagent_enabled)
+            self.assertEqual(loaded.max_concurrent_subagents, 4)
+            self.assertEqual(loaded.cors_allow_origins, ["https://example.test"])
+            self.assertEqual(loaded.api_keys, ["from-config"])
+            self.assertTrue(loaded.auth_enabled)
+            self.assertEqual(loaded.chat_request_timeout, 12.5)
+            self.assertEqual(loaded.max_upload_size_mb, 8)
+            self.assertEqual(loaded.max_uploads_per_request, 2)
+            self.assertEqual(loaded.allowed_upload_extensions, ["md", ".txt"])
+            self.assertTrue(loaded.allow_memory_fallback)
+        finally:
+            app_config._API_CONFIG = original_api_config
+
+    async def test_settings_fallback_to_environment_when_api_section_omits_value(self) -> None:
+        original_api_config = dict(app_config._API_CONFIG)
+        try:
+            app_config._API_CONFIG = {}
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOST": "127.0.0.2",
+                    "PORT": "9010",
+                    "DEER_FLOW_CORS_ORIGINS": "https://one.test, https://two.test",
+                    "DEER_FLOW_AUTH_ENABLED": "true",
+                    "DEER_FLOW_API_KEYS": "a,b",
+                },
+                clear=False,
+            ):
+                loaded = app_config.Settings()
+
+            self.assertEqual(loaded.host, "127.0.0.2")
+            self.assertEqual(loaded.port, 9010)
+            self.assertEqual(loaded.cors_allow_origins, ["https://one.test", "https://two.test"])
+            self.assertTrue(loaded.auth_enabled)
+            self.assertEqual(loaded.api_keys, ["a", "b"])
+        finally:
+            app_config._API_CONFIG = original_api_config
+
+    async def test_settings_support_legacy_and_short_subagent_env_names(self) -> None:
+        original_api_config = dict(app_config._API_CONFIG)
+        try:
+            app_config._API_CONFIG = {}
+            with patch.dict("os.environ", {"DEER_FLOW_MAX_CONCURRENT_SUBAGENTS": "4", "MAX_CONCURRENT_SUBAGENTS": "2"}, clear=False):
+                legacy = app_config.Settings()
+            self.assertEqual(legacy.max_concurrent_subagents, 4)
+
+            with patch.dict("os.environ", {"MAX_CONCURRENT_SUBAGENTS": "2"}, clear=True):
+                short = app_config.Settings()
+            self.assertEqual(short.max_concurrent_subagents, 2)
+        finally:
+            app_config._API_CONFIG = original_api_config
+
+    async def test_settings_custom_config_path_is_single_runtime_source(self) -> None:
+        original_env = dict(app_config.os.environ)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                config_path = Path(tmpdir) / "custom-config.yaml"
+                config_path.write_text(
+                    """
+config_version: 11
+api:
+  config_path: ./wrong-config.yaml
+  host: 127.0.0.9
+  port: 8123
+  max_concurrent_subagents: 4
+sandbox:
+  use: deerflow.sandbox.local:LocalSandboxProvider
+models: []
+tools: []
+tool_groups: []
+tracing:
+  langfuse:
+    enabled: true
+    public_key: file-public
+    secret_key: file-secret
+    host: https://file-langfuse.test
+""".strip(),
+                    encoding="utf-8",
+                )
+
+                with patch.dict("os.environ", {"DEER_FLOW_CONFIG_PATH": str(config_path)}, clear=True):
+                    reloaded_app_config = importlib.reload(app_config)
+                    reset_app_config()
+                    reset_tracing_config()
+
+                    loaded_settings = reloaded_app_config.Settings()
+                    runtime_config = get_app_config()
+                    tracing = get_tracing_config()
+
+                self.assertEqual(loaded_settings.config_path, str(config_path))
+                self.assertEqual(loaded_settings.host, "127.0.0.9")
+                self.assertEqual(loaded_settings.port, 8123)
+                self.assertEqual(runtime_config.sandbox.use, "deerflow.sandbox.local:LocalSandboxProvider")
+                self.assertTrue(tracing.langfuse.enabled)
+                self.assertEqual(tracing.langfuse.public_key, "file-public")
+                self.assertEqual(tracing.langfuse.secret_key, "file-secret")
+                self.assertEqual(tracing.langfuse.host, "https://file-langfuse.test")
+        finally:
+            app_config.os.environ.clear()
+            app_config.os.environ.update(original_env)
+            importlib.reload(app_config)
+            reset_tracing_config()
+            reset_app_config()
+
+    async def test_tracing_config_reads_from_config_yaml(self) -> None:
+        try:
+            reset_app_config()
+            reset_tracing_config()
+            config = get_app_config()
+            extra = config.model_extra or {}
+            tracing_section = dict(extra.get("tracing") or {})
+            tracing_section["langfuse"] = {
+                "enabled": True,
+                "public_key": "public-from-config",
+                "secret_key": "secret-from-config",
+                "host": "https://langfuse.test",
+            }
+            extra["tracing"] = tracing_section
+
+            loaded = get_tracing_config()
+
+            self.assertTrue(loaded.langfuse.enabled)
+            self.assertEqual(loaded.langfuse.public_key, "public-from-config")
+            self.assertEqual(loaded.langfuse.secret_key, "secret-from-config")
+            self.assertEqual(loaded.langfuse.host, "https://langfuse.test")
+        finally:
+            reset_tracing_config()
+            reset_app_config()
 
 
 if __name__ == "__main__":

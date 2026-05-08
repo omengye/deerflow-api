@@ -19,24 +19,38 @@ uv sync
 uv run uvicorn app:app --host 0.0.0.0 --port 8000 --app-dir app
 ```
 
-## 环境变量
+## 配置方式
 
-| 变量 | 说明 | 默认 |
-|------|------|------|
-| `DEER_FLOW_CONFIG_PATH` | config.yaml 路径 | `./config.yaml` |
-| `DEER_FLOW_HOME` | DeerFlow 记忆、线程工作区等持久状态目录 | `./data/deerflow` |
-| `DEER_FLOW_PLAN_MODE` | 默认是否启用自主规划 | `true` |
-| `DEER_FLOW_SUBAGENT_ENABLED` | 默认是否启用多 agent | `true` |
-| `DEER_FLOW_MAX_CONCURRENT_SUBAGENTS` | 默认并行子 agent 数 | `3` |
-| `DEER_FLOW_CHAT_TIMEOUT` | `/api/chat` 单次请求超时（秒） | `600` |
-| `DEER_FLOW_CORS_ORIGINS` | 允许的 CORS 来源（逗号分隔） | `http://localhost:3000,http://127.0.0.1:3000` |
-| `DEER_FLOW_CORS_ALLOW_CREDENTIALS` | CORS 是否携带凭据 | `false` |
-| `DEER_FLOW_MAX_UPLOAD_SIZE_MB` | 单个上传文件大小上限（MB） | `25` |
-| `DEER_FLOW_MAX_UPLOADS_PER_REQUEST` | 单次请求最多上传文件数 | `10` |
-| `DEER_FLOW_ALLOWED_UPLOAD_EXTENSIONS` | 允许的扩展名（逗号分隔，留空 = 全部允许） | （空） |
-| `HOST` | 监听地址 | `0.0.0.0` |
-| `PORT` | 服务端口 | `8000` |
-| `RELOAD` | 设置即启用热重载 | 未设置 |
+运行参数优先写入 `config.yaml` 的 `api:` 段，例如监听地址、端口、CORS、上传限制、默认 agent 模式、并发子 agent 数和 DeerFlow 数据目录。旧的 `DEER_FLOW_*`、`HOST`、`PORT` 环境变量仍作为兼容 fallback，但常规部署不再需要 `.env`。
+
+```yaml
+api:
+  host: 0.0.0.0
+  port: 8000
+  deerflow_home: ./data/deerflow
+  plan_mode: true
+  subagent_enabled: true
+  max_concurrent_subagents: 3
+  chat_request_timeout: 600
+  cors_allow_origins:
+    - http://localhost:3000
+    - http://127.0.0.1:3000
+  max_upload_size_mb: 25
+  max_uploads_per_request: 10
+```
+
+Tracing 也放在 `config.yaml.tracing` 下；密钥可以直接写入 YAML，也可以用 `$ENV_NAME` 占位符继续从环境变量读取：
+
+```yaml
+tracing:
+  langfuse:
+    enabled: false
+    public_key: $LANGFUSE_PUBLIC_KEY
+    secret_key: $LANGFUSE_SECRET_KEY
+    host: https://cloud.langfuse.com
+```
+
+仍建议保留在环境变量中的只有进程级或系统级凭据/变量，例如 `CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`、`ANTHROPIC_AUTH_TOKEN`、`HOME`、`SystemRoot` 等。
 
 ## 项目结构
 

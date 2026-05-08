@@ -1,5 +1,6 @@
 import os
 import threading
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -18,7 +19,7 @@ class LangSmithTracingConfig(BaseModel):
     def is_configured(self) -> bool:
         return self.enabled and bool(self.api_key)
 
-    def validate(self) -> None:
+    def validate_enabled(self) -> None:
         if self.enabled and not self.api_key:
             raise ValueError("LangSmith tracing is enabled but LANGSMITH_API_KEY (or LANGCHAIN_API_KEY) is not set.")
 
@@ -35,7 +36,7 @@ class LangfuseTracingConfig(BaseModel):
     def is_configured(self) -> bool:
         return self.enabled and bool(self.public_key) and bool(self.secret_key)
 
-    def validate(self) -> None:
+    def validate_enabled(self) -> None:
         if not self.enabled:
             return
         missing: list[str] = []
@@ -76,8 +77,8 @@ class TracingConfig(BaseModel):
         return enabled
 
     def validate_enabled(self) -> None:
-        self.langsmith.validate()
-        self.langfuse.validate()
+        self.langsmith.validate_enabled()
+        self.langfuse.validate_enabled()
 
 
 _tracing_config: TracingConfig | None = None
@@ -104,29 +105,79 @@ def _first_env_value(*names: str) -> str | None:
     return None
 
 
+def _config_section() -> dict[str, Any]:
+    """Return the tracing section from config.yaml, if it is available."""
+    try:
+        from deerflow.config.app_config import get_app_config
+
+        raw = getattr(get_app_config(), "tracing", None)
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return raw
+
+
+def _config_provider(section: dict[str, Any], name: str) -> dict[str, Any]:
+    raw = section.get(name) or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _flag_from_config(provider: dict[str, Any], key: str, *env_names: str) -> bool:
+    value = provider.get(key)
+    if value is None:
+        return _env_flag_preferred(*env_names)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in _TRUTHY_VALUES
+
+
+def _value_from_config(provider: dict[str, Any], key: str, *env_names: str, default: str | None = None) -> str | None:
+    value = provider.get(key)
+    if value is None:
+        return _first_env_value(*env_names) or default
+    if isinstance(value, str):
+        if value.startswith("$"):
+            return _first_env_value(value[1:], *env_names) or default
+        if value.strip():
+            return value.strip()
+        return default
+    return str(value)
+
+
 def get_tracing_config() -> TracingConfig:
-    """Get the current tracing configuration from environment variables."""
+    """Get the current tracing configuration from config.yaml with env fallback."""
     global _tracing_config
     if _tracing_config is not None:
         return _tracing_config
     with _config_lock:
         if _tracing_config is not None:
             return _tracing_config
+        section = _config_section()
+        langsmith = _config_provider(section, "langsmith")
+        langfuse = _config_provider(section, "langfuse")
         _tracing_config = TracingConfig(
             langsmith=LangSmithTracingConfig(
-                enabled=_env_flag_preferred("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING"),
-                api_key=_first_env_value("LANGSMITH_API_KEY", "LANGCHAIN_API_KEY"),
-                project=_first_env_value("LANGSMITH_PROJECT", "LANGCHAIN_PROJECT") or "deer-flow",
-                endpoint=_first_env_value("LANGSMITH_ENDPOINT", "LANGCHAIN_ENDPOINT") or "https://api.smith.langchain.com",
+                enabled=_flag_from_config(langsmith, "enabled", "LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING"),
+                api_key=_value_from_config(langsmith, "api_key", "LANGSMITH_API_KEY", "LANGCHAIN_API_KEY"),
+                project=_value_from_config(langsmith, "project", "LANGSMITH_PROJECT", "LANGCHAIN_PROJECT", default="deer-flow") or "deer-flow",
+                endpoint=_value_from_config(langsmith, "endpoint", "LANGSMITH_ENDPOINT", "LANGCHAIN_ENDPOINT", default="https://api.smith.langchain.com") or "https://api.smith.langchain.com",
             ),
             langfuse=LangfuseTracingConfig(
-                enabled=_env_flag_preferred("LANGFUSE_TRACING"),
-                public_key=_first_env_value("LANGFUSE_PUBLIC_KEY"),
-                secret_key=_first_env_value("LANGFUSE_SECRET_KEY"),
-                host=_first_env_value("LANGFUSE_BASE_URL") or "https://cloud.langfuse.com",
+                enabled=_flag_from_config(langfuse, "enabled", "LANGFUSE_TRACING"),
+                public_key=_value_from_config(langfuse, "public_key", "LANGFUSE_PUBLIC_KEY"),
+                secret_key=_value_from_config(langfuse, "secret_key", "LANGFUSE_SECRET_KEY"),
+                host=_value_from_config(langfuse, "host", "LANGFUSE_BASE_URL", default="https://cloud.langfuse.com") or "https://cloud.langfuse.com",
             ),
         )
         return _tracing_config
+
+
+def reset_tracing_config() -> None:
+    """Reset the cached tracing config instance. Useful for tests/reloads."""
+    global _tracing_config
+    with _config_lock:
+        _tracing_config = None
 
 
 def get_enabled_tracing_providers() -> list[str]:

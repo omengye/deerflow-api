@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Self
@@ -83,8 +84,8 @@ class AppConfig(BaseModel):
             if not Path.exists(path):
                 raise FileNotFoundError(f"Config file specified by param `config_path` not found at {path}")
             return path
-        elif os.getenv("DEER_FLOW_CONFIG_PATH"):
-            path = Path(os.getenv("DEER_FLOW_CONFIG_PATH"))
+        elif env_path := os.getenv("DEER_FLOW_CONFIG_PATH"):
+            path = Path(env_path)
             if not Path.exists(path):
                 raise FileNotFoundError(f"Config file specified by environment variable `DEER_FLOW_CONFIG_PATH` not found at {path}")
             return path
@@ -176,7 +177,7 @@ class AppConfig(BaseModel):
         return result
 
     @classmethod
-    def _check_config_version(cls, config_data: dict, config_path: Path) -> None:
+    def _check_config_version(cls, config_data: dict[str, Any], config_path: Path) -> None:
         """Check if the user's config.yaml is outdated compared to config.example.yaml.
 
         Emits a warning if the user's config_version is lower than the example's.
@@ -304,6 +305,13 @@ def _load_and_cache_app_config(config_path: str | None = None) -> AppConfig:
     _app_config_path = resolved_path
     _app_config_mtime = _get_config_mtime(resolved_path)
     _app_config_is_custom = False
+    tracing_config_module = sys.modules.get("deerflow.config.tracing_config")
+    reset_tracing_config = getattr(tracing_config_module, "reset_tracing_config", None)
+    if callable(reset_tracing_config):
+        try:
+            reset_tracing_config()
+        except Exception:
+            logger.debug("Failed to reset tracing config cache after app config reload", exc_info=True)
     return _app_config
 
 
@@ -335,7 +343,9 @@ def get_app_config() -> AppConfig:
                 _app_config_mtime,
                 current_mtime,
             )
-        _load_and_cache_app_config(str(resolved_path))
+        return _load_and_cache_app_config(str(resolved_path))
+    if _app_config is None:
+        return _load_and_cache_app_config(str(resolved_path))
     return _app_config
 
 

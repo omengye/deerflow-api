@@ -186,7 +186,24 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                     continue
                 if entry is END_SENTINEL:
                     break
-                if entry.event not in {"values", "messages-tuple", "custom", "end"}:
+                if entry.event not in {
+                    "values",
+                    "messages-tuple",
+                    "custom",
+                    "end",
+                    "tool_call_chunk",
+                    "tool_result_chunk",
+                    "task_started",
+                    "task_running",
+                    "task_completed",
+                    "task_failed",
+                    "task_cancelled",
+                    "task_timed_out",
+                    "subagent_started",
+                    "token_chunk",
+                    "thinking_chunk",
+                    "turn_complete",
+                }:
                     continue
                 event = StreamEvent(type=cast(StreamEventType, entry.event), data=entry.data)
                 if event.type == "end":
@@ -290,7 +307,8 @@ def _stream_event_to_agui(
     open_tool_call_ids: set[str],
     open_reasoning_message_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    if event.type == "messages-tuple":
+    event_type = str(event.type)
+    if event_type == "messages-tuple":
         # worker.py serializes messages-mode as [chunk_dict, metadata_dict].
         # Unwrap to the chunk dict before delegating.
         raw_data: Any = event.data
@@ -307,15 +325,32 @@ def _stream_event_to_agui(
         elif data.get("type") in ("ToolMessage", "ToolMessageChunk"):
             data = {**data, "type": "tool"}
         return _message_tuple_to_agui(data, open_text_message_id, tool_call_args_state, open_tool_call_ids, open_reasoning_message_id)
-    if event.type == "values":
+    if event_type == "values":
         messages = event.data.get("messages")
         if isinstance(messages, list):
             return [{"type": "MESSAGES_SNAPSHOT", "messages": [_message_to_agui(m) for m in messages if isinstance(m, dict)]}]
-    if event.type == "custom":
+    if event_type == "tool_call_chunk":
+        return _subagent_tool_call_chunk_to_agui(event.data, tool_call_args_state, open_tool_call_ids)
+    if event_type == "tool_result_chunk":
+        return _subagent_tool_result_chunk_to_agui(event.data, tool_call_args_state, open_tool_call_ids)
+    if event_type == "custom":
         return [{"type": "CUSTOM", "name": "deerflow.custom", "value": event.data}]
-    if event.type == "end":
+    if event_type in {
+        "task_started",
+        "task_running",
+        "task_completed",
+        "task_failed",
+        "task_cancelled",
+        "task_timed_out",
+        "subagent_started",
+        "token_chunk",
+        "thinking_chunk",
+        "turn_complete",
+    }:
+        return [{"type": "CUSTOM", "name": f"deerflow.subagent.{event_type}", "value": {"eventType": event_type, **event.data}}]
+    if event_type == "end":
         return [{"type": "CUSTOM", "name": "deerflow.usage", "value": event.data.get("usage", {})}]
-    return [{"type": "RAW", "source": "deerflow", "event": {"threadId": thread_id, "runId": run_id, "type": event.type, "data": event.data}}]
+    return [{"type": "RAW", "source": "deerflow", "event": {"threadId": thread_id, "runId": run_id, "type": event_type, "data": event.data}}]
 
 
 def _message_tuple_to_agui(
@@ -419,6 +454,53 @@ def _tool_calls_to_agui(
             # Subsequent chunk — keep the latest (most complete) serialized args.
             tool_call_args_state[tool_call_id] = full_json
     return events
+
+
+def _subagent_tool_call_chunk_to_agui(
+    data: dict[str, Any],
+    tool_call_args_state: dict[str, str],
+    open_tool_call_ids: set[str],
+) -> list[dict[str, Any]]:
+    tool_call = data.get("tool_call")
+    if not isinstance(tool_call, dict):
+        return []
+    task_id = str(data.get("task_id") or "subagent")
+    parent_message_id = f"subagent:{task_id}"
+    tool_name = str(tool_call.get("name") or "tool")
+    namespaced_tool_call = {**tool_call, "id": _subagent_tool_call_id(task_id, tool_call.get("id"), fallback_hint=tool_name)}
+    return _tool_calls_to_agui([namespaced_tool_call], parent_message_id, tool_call_args_state, open_tool_call_ids)
+
+
+def _subagent_tool_result_chunk_to_agui(
+    data: dict[str, Any],
+    tool_call_args_state: dict[str, str],
+    open_tool_call_ids: set[str],
+) -> list[dict[str, Any]]:
+    task_id = str(data.get("task_id") or "subagent")
+    tool_name = str(data.get("name") or "tool")
+    tool_call_id = _subagent_tool_call_id(task_id, data.get("tool_call_id"), fallback_hint=tool_name)
+    events: list[dict[str, Any]] = []
+    if tool_call_id in open_tool_call_ids:
+        events.append({"type": "TOOL_CALL_ARGS", "toolCallId": tool_call_id, "delta": tool_call_args_state.get(tool_call_id, "{}")})
+        events.append({"type": "TOOL_CALL_END", "toolCallId": tool_call_id})
+        open_tool_call_ids.discard(tool_call_id)
+    events.append(
+        {
+            "type": "TOOL_CALL_RESULT",
+            "messageId": f"subagent:{task_id}:tool-result:{tool_call_id}",
+            "toolCallId": tool_call_id,
+            "content": str(data.get("content") or ""),
+            "role": "tool",
+        }
+    )
+    return events
+
+
+def _subagent_tool_call_id(task_id: str, raw_tool_call_id: Any, *, fallback_hint: str = "tool") -> str:
+    raw_id = str(raw_tool_call_id or fallback_hint)
+    if raw_id.startswith(f"subagent:{task_id}:"):
+        return raw_id
+    return f"subagent:{task_id}:{raw_id}"
 
 
 def _message_to_agui(message: dict[str, Any]) -> dict[str, Any]:

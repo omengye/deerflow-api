@@ -5,11 +5,13 @@ from collections.abc import AsyncIterator, Iterable, Iterator
 from typing import cast
 from unittest.mock import patch
 
+from fastapi import Request
+
 from app.dependencies import ClientManager
 from app.routers import chat
 from app.schemas import AguiRunAgentInput, ChatRequest
-from deerflow.client import DeerFlowClient, StreamEvent
-from deerflow.runtime import MemoryStreamBridge, RunManager, RunStatus
+from deerflow.client import DeerFlowClient, StreamEvent, StreamEventType
+from deerflow.runtime import DisconnectMode, MemoryStreamBridge, RunManager, RunStatus
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import AIMessageChunk
 from langchain_core.runnables import RunnableConfig
@@ -50,6 +52,10 @@ class _FakeRequest:
         return False
 
 
+def _fake_request() -> Request:
+    return cast(Request, cast(object, _FakeRequest()))
+
+
 class _FakeManager:
     def __init__(self, client: _FakeClient) -> None:
         self.client: _FakeClient = client
@@ -79,7 +85,7 @@ class _FakeManager:
         record = await self.run_manager.create_or_reject(
             thread_id,
             run_id=run_id,
-            on_disconnect=on_disconnect,
+            on_disconnect=DisconnectMode.cancel if on_disconnect == "cancel" else DisconnectMode.continue_,
             multitask_strategy=multitask_strategy,
             metadata={"request_id": request_id, "entrypoint": entrypoint},
             kwargs=kwargs,
@@ -136,7 +142,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         original_get_client_manager = chat.get_client_manager
         chat.get_client_manager = lambda: fake_manager
         try:
-            response = await chat.chat_agui(_FakeRequest(), self._agui_request(parent_run_id=parent_run_id))
+            response = await chat.chat_agui(_fake_request(), self._agui_request(parent_run_id=parent_run_id))
             chunks = [str(chunk) async for chunk in response.body_iterator]
         finally:
             chat.get_client_manager = original_get_client_manager
@@ -169,7 +175,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         original_get_client_manager = chat.get_client_manager
         chat.get_client_manager = lambda: fake_manager
         try:
-            response = await chat.chat_stream(_FakeRequest(), ChatRequest(message="hello", thread_id="thread-1"))
+            response = await chat.chat_stream(_fake_request(), ChatRequest(message="hello", thread_id="thread-1"))
             chunks = [cast(dict[str, str], chunk) async for chunk in response.body_iterator]
         finally:
             chat.get_client_manager = original_get_client_manager
@@ -182,7 +188,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         chat.get_client_manager = lambda: fake_manager
         try:
             response = await chat.chat_stream(
-                _FakeRequest(),
+                _fake_request(),
                 ChatRequest(
                     message="hello",
                     thread_id="thread-1",
@@ -246,7 +252,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             "onDisconnect": "continue",
         }
         try:
-            response = await chat.chat_agui(_FakeRequest(), AguiRunAgentInput.model_validate(payload))
+            response = await chat.chat_agui(_fake_request(), AguiRunAgentInput.model_validate(payload))
             chunks = [str(chunk) async for chunk in response.body_iterator]
         finally:
             chat.get_client_manager = original_get_client_manager
@@ -404,6 +410,99 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[2], {"type": "TOOL_CALL_ARGS", "toolCallId": "call-1", "delta": '{"q": "x"}'})
         self.assertEqual(events[3], {"type": "TOOL_CALL_END", "toolCallId": "call-1"})
         self.assertEqual(events[4], {"type": "TOOL_CALL_RESULT", "messageId": "tool-msg-1", "toolCallId": "call-1", "content": "result", "role": "tool"})
+
+    async def test_chat_agui_maps_subagent_tool_calls_and_results(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type=cast(StreamEventType, "tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "websearch", "args": {"query": "deerflow"}, "id": "call-1"}}),
+                StreamEvent(type=cast(StreamEventType, "tool_result_chunk"), data={"task_id": "task-1", "tool_call_id": "call-1", "name": "websearch", "content": "result"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["RUN_STARTED", "TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT", "CUSTOM", "RUN_FINISHED"],
+        )
+        self.assertEqual(
+            events[1],
+            {
+                "type": "TOOL_CALL_START",
+                "toolCallId": "subagent:task-1:call-1",
+                "toolCallName": "websearch",
+                "parentMessageId": "subagent:task-1",
+            },
+        )
+        self.assertEqual(events[2], {"type": "TOOL_CALL_ARGS", "toolCallId": "subagent:task-1:call-1", "delta": '{"query": "deerflow"}'})
+        self.assertEqual(events[3], {"type": "TOOL_CALL_END", "toolCallId": "subagent:task-1:call-1"})
+        self.assertEqual(
+            events[4],
+            {
+                "type": "TOOL_CALL_RESULT",
+                "messageId": "subagent:task-1:tool-result:subagent:task-1:call-1",
+                "toolCallId": "subagent:task-1:call-1",
+                "content": "result",
+                "role": "tool",
+            },
+        )
+
+    async def test_chat_agui_updates_subagent_tool_args_until_result(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type=cast(StreamEventType, "tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "bash", "args": {"command": "echo"}, "id": "call-1"}}),
+                StreamEvent(type=cast(StreamEventType, "tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "bash", "args": {"command": "echo hi"}, "id": "call-1"}}),
+                StreamEvent(type=cast(StreamEventType, "tool_result_chunk"), data={"task_id": "task-1", "tool_call_id": "call-1", "name": "bash", "content": "hi"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual([event["type"] for event in events], ["RUN_STARTED", "TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT", "CUSTOM", "RUN_FINISHED"])
+        self.assertEqual(events[2], {"type": "TOOL_CALL_ARGS", "toolCallId": "subagent:task-1:call-1", "delta": '{"command": "echo hi"}'})
+
+    async def test_chat_agui_namespaces_same_subagent_tool_id_by_task(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type=cast(StreamEventType, "tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "read_file", "args": {"path": "a"}, "id": "call-1"}}),
+                StreamEvent(type=cast(StreamEventType, "tool_call_chunk"), data={"task_id": "task-2", "tool_call": {"name": "read_file", "args": {"path": "b"}, "id": "call-1"}}),
+                StreamEvent(type=cast(StreamEventType, "tool_result_chunk"), data={"task_id": "task-1", "tool_call_id": "call-1", "name": "read_file", "content": "a"}),
+                StreamEvent(type=cast(StreamEventType, "tool_result_chunk"), data={"task_id": "task-2", "tool_call_id": "call-1", "name": "read_file", "content": "b"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+        tool_call_ids = [event["toolCallId"] for event in events if event["type"] == "TOOL_CALL_START"]
+
+        self.assertEqual(tool_call_ids, ["subagent:task-1:call-1", "subagent:task-2:call-1"])
+
+    async def test_chat_agui_closes_open_subagent_tool_call_on_stream_end(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type=cast(StreamEventType, "tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "webfetch", "args": {"url": "https://example.com"}, "id": "call-1"}}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual([event["type"] for event in events], ["RUN_STARTED", "TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "CUSTOM", "RUN_FINISHED"])
+        self.assertEqual(events[2], {"type": "TOOL_CALL_ARGS", "toolCallId": "subagent:task-1:call-1", "delta": '{"url": "https://example.com"}'})
+
+    async def test_chat_agui_preserves_subagent_lifecycle_event_name(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type=cast(StreamEventType, "task_failed"), data={"task_id": "task-1", "error": "boom"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual(events[1], {"type": "CUSTOM", "name": "deerflow.subagent.task_failed", "value": {"eventType": "task_failed", "task_id": "task-1", "error": "boom"}})
 
     async def test_chat_agui_emits_run_error_on_failure(self) -> None:
         fake_client = _FakeClient(error_after_first=True)

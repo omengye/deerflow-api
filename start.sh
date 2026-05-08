@@ -22,8 +22,6 @@ fi
 
 # Check for config
 if [ -f "./config.yaml" ]; then
-    export DEER_FLOW_CONFIG_PATH="./config.yaml"
-    export DEER_FLOW_HOME="${DEER_FLOW_HOME:-./data/deerflow}"
     echo "📄 Using config: ./config.yaml"
 else
     echo "⚠️  No config.yaml found. Copy config.example.yaml and edit it."
@@ -31,8 +29,31 @@ else
     exit 1
 fi
 
+read_config_value() {
+    local key="$1"
+    local fallback="$2"
+    uv run python - "$key" "$fallback" <<'PY'
+import sys
+import yaml
+
+key, fallback = sys.argv[1], sys.argv[2]
+try:
+    with open("config.yaml", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    value = data.get("api", {}).get(key, fallback)
+    if value is None:
+        value = fallback
+    print(value)
+except Exception:
+    print(fallback)
+PY
+}
+
+APP_HOST="$(read_config_value host "${HOST:-0.0.0.0}")"
+APP_PORT="$(read_config_value port "${PORT:-8000}")"
+
 # Start uvicorn
-echo "🦌 Starting DeerFlow API on http://0.0.0.0:${PORT:-8000}"
+echo "🦌 Starting DeerFlow API on http://${APP_HOST}:${APP_PORT}"
 exec uv run uvicorn app:app \
-    --host "${HOST:-0.0.0.0}" \
-    --port "${PORT:-8000}"
+    --host "${APP_HOST}" \
+    --port "${APP_PORT}"
