@@ -56,6 +56,10 @@ def _fake_request() -> Request:
     return cast(Request, cast(object, _FakeRequest()))
 
 
+def _stream_event_type(value: str) -> StreamEventType:
+    return cast(StreamEventType, cast(object, value))
+
+
 class _FakeManager:
     def __init__(self, client: _FakeClient) -> None:
         self.client: _FakeClient = client
@@ -394,6 +398,94 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1], {"type": "RUN_FINISHED", "threadId": "thread-1", "runId": "run-1"})
         self.assertEqual(fake_manager.done, ["thread-1"])
 
+    async def test_chat_agui_keeps_reasoning_messages_separate_by_id(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "", "id": "msg-1", "reasoning_content": "think"}),
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "", "id": "msg-2", "reasoning_content": "plan"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+        reasoning_events = [event for event in events if str(event["type"]).startswith("REASONING_MESSAGE_")]
+
+        self.assertEqual(
+            reasoning_events,
+            [
+                {"type": "REASONING_MESSAGE_START", "messageId": "reasoning_msg-1", "role": "reasoning"},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "think"},
+                {"type": "REASONING_MESSAGE_START", "messageId": "reasoning_msg-2", "role": "reasoning"},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-2", "delta": "plan"},
+                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-1"},
+                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-2"},
+            ],
+        )
+
+    async def test_chat_agui_emits_incremental_reasoning_delta_for_cumulative_chunks(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "", "id": "msg-1", "reasoning_content": "think"}),
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "", "id": "msg-1", "reasoning_content": "thinking"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+        reasoning_content_events = [event for event in events if event["type"] == "REASONING_MESSAGE_CONTENT"]
+
+        self.assertEqual(
+            reasoning_content_events,
+            [
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "think"},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "ing"},
+            ],
+        )
+
+    async def test_chat_agui_closes_same_chunk_reasoning_before_text(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "answer", "id": "msg-1", "reasoning_content": "think"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual(
+            [event for event in events if event["type"] in {"REASONING_MESSAGE_START", "REASONING_MESSAGE_CONTENT", "REASONING_MESSAGE_END", "TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT"}],
+            [
+                {"type": "REASONING_MESSAGE_START", "messageId": "reasoning_msg-1", "role": "reasoning"},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "think"},
+                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-1"},
+                {"type": "TEXT_MESSAGE_START", "messageId": "msg-1", "role": "assistant"},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "delta": "answer"},
+            ],
+        )
+
+    async def test_chat_agui_closes_only_current_reasoning_id_before_text(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "", "id": "msg-1", "reasoning_content": "first"}),
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "", "id": "msg-2", "reasoning_content": "second"}),
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "done", "id": "msg-1"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+        reasoning_ends = [event for event in events if event["type"] == "REASONING_MESSAGE_END"]
+
+        self.assertEqual(
+            reasoning_ends,
+            [
+                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-1"},
+                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-2"},
+            ],
+        )
+        self.assertLess(events.index(reasoning_ends[0]), next(index for index, event in enumerate(events) if event["type"] == "TEXT_MESSAGE_START"))
+        self.assertGreater(events.index(reasoning_ends[1]), next(index for index, event in enumerate(events) if event["type"] == "TEXT_MESSAGE_CONTENT"))
+
     async def test_chat_agui_maps_tool_calls_and_results(self) -> None:
         fake_client = _FakeClient(
             [
@@ -414,8 +506,8 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_agui_maps_subagent_tool_calls_and_results(self) -> None:
         fake_client = _FakeClient(
             [
-                StreamEvent(type=cast(StreamEventType, "tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "websearch", "args": {"query": "deerflow"}, "id": "call-1"}}),
-                StreamEvent(type=cast(StreamEventType, "tool_result_chunk"), data={"task_id": "task-1", "tool_call_id": "call-1", "name": "websearch", "content": "result"}),
+                StreamEvent(type=_stream_event_type("tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "websearch", "args": {"query": "deerflow"}, "id": "call-1"}}),
+                StreamEvent(type=_stream_event_type("tool_result_chunk"), data={"task_id": "task-1", "tool_call_id": "call-1", "name": "websearch", "content": "result"}),
                 StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
             ]
         )
@@ -451,9 +543,9 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_agui_updates_subagent_tool_args_until_result(self) -> None:
         fake_client = _FakeClient(
             [
-                StreamEvent(type=cast(StreamEventType, "tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "bash", "args": {"command": "echo"}, "id": "call-1"}}),
-                StreamEvent(type=cast(StreamEventType, "tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "bash", "args": {"command": "echo hi"}, "id": "call-1"}}),
-                StreamEvent(type=cast(StreamEventType, "tool_result_chunk"), data={"task_id": "task-1", "tool_call_id": "call-1", "name": "bash", "content": "hi"}),
+                StreamEvent(type=_stream_event_type("tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "bash", "args": {"command": "echo"}, "id": "call-1"}}),
+                StreamEvent(type=_stream_event_type("tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "bash", "args": {"command": "echo hi"}, "id": "call-1"}}),
+                StreamEvent(type=_stream_event_type("tool_result_chunk"), data={"task_id": "task-1", "tool_call_id": "call-1", "name": "bash", "content": "hi"}),
                 StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
             ]
         )
@@ -466,10 +558,10 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_agui_namespaces_same_subagent_tool_id_by_task(self) -> None:
         fake_client = _FakeClient(
             [
-                StreamEvent(type=cast(StreamEventType, "tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "read_file", "args": {"path": "a"}, "id": "call-1"}}),
-                StreamEvent(type=cast(StreamEventType, "tool_call_chunk"), data={"task_id": "task-2", "tool_call": {"name": "read_file", "args": {"path": "b"}, "id": "call-1"}}),
-                StreamEvent(type=cast(StreamEventType, "tool_result_chunk"), data={"task_id": "task-1", "tool_call_id": "call-1", "name": "read_file", "content": "a"}),
-                StreamEvent(type=cast(StreamEventType, "tool_result_chunk"), data={"task_id": "task-2", "tool_call_id": "call-1", "name": "read_file", "content": "b"}),
+                StreamEvent(type=_stream_event_type("tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "read_file", "args": {"path": "a"}, "id": "call-1"}}),
+                StreamEvent(type=_stream_event_type("tool_call_chunk"), data={"task_id": "task-2", "tool_call": {"name": "read_file", "args": {"path": "b"}, "id": "call-1"}}),
+                StreamEvent(type=_stream_event_type("tool_result_chunk"), data={"task_id": "task-1", "tool_call_id": "call-1", "name": "read_file", "content": "a"}),
+                StreamEvent(type=_stream_event_type("tool_result_chunk"), data={"task_id": "task-2", "tool_call_id": "call-1", "name": "read_file", "content": "b"}),
                 StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
             ]
         )
@@ -482,7 +574,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_agui_closes_open_subagent_tool_call_on_stream_end(self) -> None:
         fake_client = _FakeClient(
             [
-                StreamEvent(type=cast(StreamEventType, "tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "webfetch", "args": {"url": "https://example.com"}, "id": "call-1"}}),
+                StreamEvent(type=_stream_event_type("tool_call_chunk"), data={"task_id": "task-1", "tool_call": {"name": "webfetch", "args": {"url": "https://example.com"}, "id": "call-1"}}),
                 StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
             ]
         )
@@ -495,7 +587,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_agui_preserves_subagent_lifecycle_event_name(self) -> None:
         fake_client = _FakeClient(
             [
-                StreamEvent(type=cast(StreamEventType, "task_failed"), data={"task_id": "task-1", "error": "boom"}),
+                StreamEvent(type=_stream_event_type("task_failed"), data={"task_id": "task-1", "error": "boom"}),
                 StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
             ]
         )
@@ -503,6 +595,239 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
 
         self.assertEqual(events[1], {"type": "CUSTOM", "name": "deerflow.subagent.task_failed", "value": {"eventType": "task_failed", "task_id": "task-1", "error": "boom"}})
+
+    async def test_chat_agui_maps_subagent_token_chunks_to_text_message_events(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type=_stream_event_type("subagent_started"), data={"task_id": "task-1", "name": "researcher", "trace_id": "trace-1"}),
+                StreamEvent(type=_stream_event_type("token_chunk"), data={"task_id": "task-1", "content": "hello"}),
+                StreamEvent(type=_stream_event_type("token_chunk"), data={"task_id": "task-1", "content": " world"}),
+                StreamEvent(type=_stream_event_type("task_completed"), data={"task_id": "task-1", "result": "hello world"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual(
+            [event for event in events if event["type"] in {"TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END"}],
+            [
+                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant", "name": "researcher"},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "hello"},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": " world"},
+                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message"},
+            ],
+        )
+        self.assertIn({"type": "CUSTOM", "name": "deerflow.subagent.token_chunk", "value": {"eventType": "token_chunk", "task_id": "task-1", "content": "hello"}}, events)
+
+    async def test_chat_agui_closes_open_subagent_text_message_on_stream_end(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type=_stream_event_type("token_chunk"), data={"task_id": "task-1", "content": "partial"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual(
+            [event for event in events if event["type"] in {"TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END"}],
+            [
+                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant"},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "partial"},
+                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message"},
+            ],
+        )
+
+    async def test_chat_agui_closes_subagent_text_on_terminal_task_events(self) -> None:
+        for terminal_type in ("task_failed", "task_cancelled", "task_timed_out"):
+            with self.subTest(terminal_type=terminal_type):
+                fake_client = _FakeClient(
+                    [
+                        StreamEvent(type=_stream_event_type("token_chunk"), data={"task_id": "task-1", "content": "partial"}),
+                        StreamEvent(type=_stream_event_type(terminal_type), data={"task_id": "task-1", "error": "stop"}),
+                        StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+                    ]
+                )
+
+                events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+                subagent_ends = [event for event in events if event == {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message"}]
+
+                self.assertEqual(len(subagent_ends), 1)
+
+    async def test_chat_agui_keeps_interleaved_subagent_text_messages_separate(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type=_stream_event_type("token_chunk"), data={"task_id": "task-1", "content": "a1"}),
+                StreamEvent(type=_stream_event_type("token_chunk"), data={"task_id": "task-2", "content": "b1"}),
+                StreamEvent(type=_stream_event_type("token_chunk"), data={"task_id": "task-1", "content": "a2"}),
+                StreamEvent(type=_stream_event_type("task_completed"), data={"task_id": "task-1", "result": "a"}),
+                StreamEvent(type=_stream_event_type("task_completed"), data={"task_id": "task-2", "result": "b"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual(
+            [event for event in events if event["type"] in {"TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END"}],
+            [
+                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant"},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "a1"},
+                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-2:message", "role": "assistant"},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-2:message", "delta": "b1"},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "a2"},
+                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message"},
+                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-2:message"},
+            ],
+        )
+
+    async def test_chat_agui_keeps_subagent_text_independent_from_main_text(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "main", "id": "msg-1"}),
+                StreamEvent(type=_stream_event_type("token_chunk"), data={"task_id": "task-1", "content": "sub"}),
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": " done", "id": "msg-1"}),
+                StreamEvent(type=_stream_event_type("task_completed"), data={"task_id": "task-1", "result": "sub"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual(
+            [event for event in events if event["type"] in {"TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END"}],
+            [
+                {"type": "TEXT_MESSAGE_START", "messageId": "msg-1", "role": "assistant"},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "delta": "main"},
+                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant"},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "sub"},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "delta": " done"},
+                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message"},
+                {"type": "TEXT_MESSAGE_END", "messageId": "msg-1"},
+            ],
+        )
+
+    async def test_chat_agui_maps_subagent_thinking_chunks_to_reasoning_events(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type=_stream_event_type("thinking_chunk"), data={"task_id": "task-1", "thinking": "think"}),
+                StreamEvent(type=_stream_event_type("thinking_chunk"), data={"task_id": "task-1", "thinking": " more"}),
+                StreamEvent(type=_stream_event_type("task_completed"), data={"task_id": "task-1", "result": "done"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual(
+            [event for event in events if str(event["type"]).startswith("REASONING_MESSAGE_")],
+            [
+                {"type": "REASONING_MESSAGE_START", "messageId": "subagent:task-1:reasoning", "role": "reasoning"},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": "think"},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": " more"},
+                {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning"},
+            ],
+        )
+        self.assertIn({"type": "CUSTOM", "name": "deerflow.subagent.thinking_chunk", "value": {"eventType": "thinking_chunk", "task_id": "task-1", "thinking": "think"}}, events)
+
+    async def test_chat_agui_closes_subagent_reasoning_before_token_text(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type=_stream_event_type("thinking_chunk"), data={"task_id": "task-1", "thinking": "think"}),
+                StreamEvent(type=_stream_event_type("token_chunk"), data={"task_id": "task-1", "content": "answer"}),
+                StreamEvent(type=_stream_event_type("task_completed"), data={"task_id": "task-1", "result": "answer"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual(
+            [event for event in events if event["type"] in {"REASONING_MESSAGE_START", "REASONING_MESSAGE_CONTENT", "REASONING_MESSAGE_END", "TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT"}],
+            [
+                {"type": "REASONING_MESSAGE_START", "messageId": "subagent:task-1:reasoning", "role": "reasoning"},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": "think"},
+                {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning"},
+                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant"},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "answer"},
+            ],
+        )
+
+    async def test_chat_agui_closes_subagent_reasoning_on_stream_end(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type=_stream_event_type("thinking_chunk"), data={"task_id": "task-1", "thinking": "partial"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual(
+            [event for event in events if str(event["type"]).startswith("REASONING_MESSAGE_")],
+            [
+                {"type": "REASONING_MESSAGE_START", "messageId": "subagent:task-1:reasoning", "role": "reasoning"},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": "partial"},
+                {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning"},
+            ],
+        )
+
+    async def test_chat_agui_closes_subagent_reasoning_before_terminal_custom_event(self) -> None:
+        for terminal_type in ("task_completed", "task_failed", "task_cancelled", "task_timed_out"):
+            with self.subTest(terminal_type=terminal_type):
+                terminal_data = {"task_id": "task-1", "result": "done"} if terminal_type == "task_completed" else {"task_id": "task-1", "error": "stop"}
+                fake_client = _FakeClient(
+                    [
+                        StreamEvent(type=_stream_event_type("thinking_chunk"), data={"task_id": "task-1", "thinking": "partial"}),
+                        StreamEvent(type=_stream_event_type(terminal_type), data=terminal_data),
+                        StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+                    ]
+                )
+
+                events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+                reasoning_end: dict[str, object] = {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning"}
+                terminal_custom = next(event for event in events if event["type"] == "CUSTOM" and event["name"] == f"deerflow.subagent.{terminal_type}")
+
+                self.assertEqual([event for event in events if event == reasoning_end], [reasoning_end])
+                self.assertLess(events.index(reasoning_end), events.index(terminal_custom))
+
+    async def test_chat_agui_closes_subagent_reasoning_before_run_error(self) -> None:
+        fake_client = _FakeClient(
+            [StreamEvent(type=_stream_event_type("thinking_chunk"), data={"task_id": "task-1", "thinking": "partial"})],
+            error_after_first=True,
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual(events[-2], {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning"})
+        self.assertEqual(events[-1], {"type": "RUN_ERROR", "message": "boom"})
+
+    async def test_chat_agui_keeps_main_and_subagent_reasoning_independent(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "", "id": "msg-1", "reasoning_content": "main-think"}),
+                StreamEvent(type=_stream_event_type("thinking_chunk"), data={"task_id": "task-1", "thinking": "sub-think"}),
+                StreamEvent(type=_stream_event_type("token_chunk"), data={"task_id": "task-1", "content": "sub-answer"}),
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "main-answer", "id": "msg-1"}),
+                StreamEvent(type=_stream_event_type("task_completed"), data={"task_id": "task-1", "result": "sub-answer"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
+            ]
+        )
+
+        events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
+
+        self.assertEqual(
+            [event for event in events if str(event["type"]).startswith("REASONING_MESSAGE_")],
+            [
+                {"type": "REASONING_MESSAGE_START", "messageId": "reasoning_msg-1", "role": "reasoning"},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "main-think"},
+                {"type": "REASONING_MESSAGE_START", "messageId": "subagent:task-1:reasoning", "role": "reasoning"},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": "sub-think"},
+                {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning"},
+                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-1"},
+            ],
+        )
 
     async def test_chat_agui_emits_run_error_on_failure(self) -> None:
         fake_client = _FakeClient(error_after_first=True)

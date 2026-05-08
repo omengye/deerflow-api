@@ -169,15 +169,22 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
         # Maps tool_call_id → serialized args JSON already sent as delta.
         # Used to compute incremental deltas across streaming chunks.
         tool_call_args_state: dict[str, str] = {}
+        subagent_names_by_id: dict[str, str] = {}
+        open_subagent_text_message_ids: set[str] = set()
+        open_subagent_reasoning_message_ids: set[str] = set()
         # Tool calls that have been started (TOOL_CALL_START emitted) but not yet ended.
         open_tool_call_ids: set[str] = set()
         # Signature of the last emitted MESSAGES_SNAPSHOT (list of message ids).
         # LangGraph fires a values event after every middleware node even when
         # messages haven't changed, so we deduplicate here.
         last_snapshot_sig: str | None = None
-        # Reasoning message that has been started but not yet ended.
-        # Same deduplication pattern as open_text_message_id.
-        open_reasoning_message_id: str | None = None
+        # Reasoning messages that have been started but not yet ended.
+        # Track by id because providers can stream separate reasoning blocks.
+        open_reasoning_message_ids: set[str] = set()
+        # Provider adapters may expose either raw reasoning deltas or cumulative
+        # reasoning text. Store what each id has already emitted so AG-UI always
+        # receives incremental REASONING_MESSAGE_CONTENT.delta values.
+        reasoning_content_state: dict[str, str] = {}
         try:
             yield _agui_sse({"type": "RUN_STARTED", "threadId": thread_id, "runId": run_id, **({"parentRunId": req.parent_run_id} if req.parent_run_id else {})})
             async for entry in manager.stream_bridge.subscribe(record.run_id, last_event_id=last_event_id):
@@ -207,17 +214,32 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                     continue
                 event = StreamEvent(type=cast(StreamEventType, entry.event), data=entry.data)
                 if event.type == "end":
-                    if open_reasoning_message_id:
-                        yield _agui_sse({"type": "REASONING_MESSAGE_END", "messageId": open_reasoning_message_id})
-                        open_reasoning_message_id = None
+                    for reasoning_event in _close_reasoning_messages(open_reasoning_message_ids):
+                        yield _agui_sse(reasoning_event)
+                    for reasoning_event in _close_subagent_reasoning_messages(open_subagent_reasoning_message_ids):
+                        yield _agui_sse(reasoning_event)
                     if open_text_message_id:
                         yield _agui_sse({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
                         open_text_message_id = None
+                    for text_event in _close_subagent_text_messages(open_subagent_text_message_ids):
+                        yield _agui_sse(text_event)
                     for tc_id in list(open_tool_call_ids):
                         yield _agui_sse({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")})
                         yield _agui_sse({"type": "TOOL_CALL_END", "toolCallId": tc_id})
                     open_tool_call_ids.clear()
-                for agui_event in _stream_event_to_agui(event, thread_id, run_id, open_text_message_id, tool_call_args_state, open_tool_call_ids, open_reasoning_message_id):
+                for agui_event in _stream_event_to_agui(
+                    event,
+                    thread_id,
+                    run_id,
+                    open_text_message_id,
+                    tool_call_args_state,
+                    open_tool_call_ids,
+                    open_reasoning_message_ids,
+                    reasoning_content_state,
+                    subagent_names_by_id,
+                    open_subagent_text_message_ids,
+                    open_subagent_reasoning_message_ids,
+                ):
                     event_type = agui_event.get("type")
                     if event_type == "MESSAGES_SNAPSHOT":
                         sig = ",".join(m.get("id", "") for m in agui_event.get("messages", []))
@@ -225,22 +247,42 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                             continue
                         last_snapshot_sig = sig
                     elif event_type == "TEXT_MESSAGE_START":
-                        open_text_message_id = str(agui_event["messageId"])
+                        message_id = str(agui_event["messageId"])
+                        if message_id.startswith("subagent:"):
+                            open_subagent_text_message_ids.add(message_id)
+                        else:
+                            open_text_message_id = message_id
                     elif event_type == "TEXT_MESSAGE_END":
-                        open_text_message_id = None
+                        message_id = str(agui_event["messageId"])
+                        if message_id.startswith("subagent:"):
+                            open_subagent_text_message_ids.discard(message_id)
+                        else:
+                            open_text_message_id = None
                     elif event_type == "REASONING_MESSAGE_START":
-                        open_reasoning_message_id = str(agui_event["messageId"])
+                        message_id = str(agui_event["messageId"])
+                        if message_id.startswith("subagent:"):
+                            open_subagent_reasoning_message_ids.add(message_id)
+                        else:
+                            open_reasoning_message_ids.add(message_id)
                     elif event_type == "REASONING_MESSAGE_END":
-                        open_reasoning_message_id = None
+                        message_id = str(agui_event["messageId"])
+                        if message_id.startswith("subagent:"):
+                            open_subagent_reasoning_message_ids.discard(message_id)
+                        else:
+                            open_reasoning_message_ids.discard(message_id)
                     yield _agui_sse(agui_event)
             for tc_id in list(open_tool_call_ids):
                 yield _agui_sse({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")})
                 yield _agui_sse({"type": "TOOL_CALL_END", "toolCallId": tc_id})
             open_tool_call_ids.clear()
-            if open_reasoning_message_id:
-                yield _agui_sse({"type": "REASONING_MESSAGE_END", "messageId": open_reasoning_message_id})
+            for reasoning_event in _close_reasoning_messages(open_reasoning_message_ids):
+                yield _agui_sse(reasoning_event)
+            for reasoning_event in _close_subagent_reasoning_messages(open_subagent_reasoning_message_ids):
+                yield _agui_sse(reasoning_event)
             if open_text_message_id:
                 yield _agui_sse({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
+            for text_event in _close_subagent_text_messages(open_subagent_text_message_ids):
+                yield _agui_sse(text_event)
             final_record = manager.run_manager.get(record.run_id)
             if final_record is not None and final_record.status in {RunStatus.error, RunStatus.timeout, RunStatus.interrupted}:
                 yield _agui_sse({"type": "RUN_ERROR", "message": final_record.error or final_record.status.value})
@@ -255,10 +297,14 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
             for tc_id in list(open_tool_call_ids):
                 yield _agui_sse({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")})
                 yield _agui_sse({"type": "TOOL_CALL_END", "toolCallId": tc_id})
-            if open_reasoning_message_id:
-                yield _agui_sse({"type": "REASONING_MESSAGE_END", "messageId": open_reasoning_message_id})
+            for reasoning_event in _close_reasoning_messages(open_reasoning_message_ids):
+                yield _agui_sse(reasoning_event)
+            for reasoning_event in _close_subagent_reasoning_messages(open_subagent_reasoning_message_ids):
+                yield _agui_sse(reasoning_event)
             if open_text_message_id:
                 yield _agui_sse({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
+            for text_event in _close_subagent_text_messages(open_subagent_text_message_ids):
+                yield _agui_sse(text_event)
             yield _agui_sse({"type": "RUN_ERROR", "message": "Internal server error"})
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -298,6 +344,48 @@ def _agui_sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
 
 
+def _close_reasoning_messages(open_reasoning_message_ids: set[str]) -> list[dict[str, Any]]:
+    events = [{"type": "REASONING_MESSAGE_END", "messageId": message_id} for message_id in sorted(open_reasoning_message_ids)]
+    open_reasoning_message_ids.clear()
+    return events
+
+
+def _close_subagent_text_messages(open_subagent_text_message_ids: set[str]) -> list[dict[str, Any]]:
+    events = [{"type": "TEXT_MESSAGE_END", "messageId": message_id} for message_id in sorted(open_subagent_text_message_ids)]
+    open_subagent_text_message_ids.clear()
+    return events
+
+
+def _close_subagent_reasoning_messages(open_subagent_reasoning_message_ids: set[str]) -> list[dict[str, Any]]:
+    events = [{"type": "REASONING_MESSAGE_END", "messageId": message_id} for message_id in sorted(open_subagent_reasoning_message_ids)]
+    open_subagent_reasoning_message_ids.clear()
+    return events
+
+
+def _close_subagent_reasoning_message(open_subagent_reasoning_message_ids: set[str], reasoning_id: str) -> list[dict[str, Any]]:
+    if reasoning_id not in open_subagent_reasoning_message_ids:
+        return []
+    open_subagent_reasoning_message_ids.discard(reasoning_id)
+    return [{"type": "REASONING_MESSAGE_END", "messageId": reasoning_id}]
+
+
+def _close_reasoning_message(open_reasoning_message_ids: set[str], reasoning_id: str) -> list[dict[str, Any]]:
+    if reasoning_id not in open_reasoning_message_ids:
+        return []
+    open_reasoning_message_ids.discard(reasoning_id)
+    return [{"type": "REASONING_MESSAGE_END", "messageId": reasoning_id}]
+
+
+def _reasoning_delta(reasoning_content_state: dict[str, str], reasoning_id: str, reasoning: str) -> str:
+    previous = reasoning_content_state.get(reasoning_id, "")
+    if previous and reasoning.startswith(previous):
+        delta = reasoning[len(previous):]
+    else:
+        delta = reasoning
+    reasoning_content_state[reasoning_id] = reasoning if reasoning.startswith(previous) else previous + delta
+    return delta
+
+
 def _stream_event_to_agui(
     event: StreamEvent,
     thread_id: str,
@@ -305,7 +393,11 @@ def _stream_event_to_agui(
     open_text_message_id: str | None,
     tool_call_args_state: dict[str, str],
     open_tool_call_ids: set[str],
-    open_reasoning_message_id: str | None = None,
+    open_reasoning_message_ids: set[str] | None = None,
+    reasoning_content_state: dict[str, str] | None = None,
+    subagent_names_by_id: dict[str, str] | None = None,
+    open_subagent_text_message_ids: set[str] | None = None,
+    open_subagent_reasoning_message_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     event_type = str(event.type)
     if event_type == "messages-tuple":
@@ -324,7 +416,14 @@ def _stream_event_to_agui(
             data = {**data, "type": "human"}
         elif data.get("type") in ("ToolMessage", "ToolMessageChunk"):
             data = {**data, "type": "tool"}
-        return _message_tuple_to_agui(data, open_text_message_id, tool_call_args_state, open_tool_call_ids, open_reasoning_message_id)
+        return _message_tuple_to_agui(
+            data,
+            open_text_message_id,
+            tool_call_args_state,
+            open_tool_call_ids,
+            open_reasoning_message_ids if open_reasoning_message_ids is not None else set(),
+            reasoning_content_state if reasoning_content_state is not None else {},
+        )
     if event_type == "values":
         messages = event.data.get("messages")
         if isinstance(messages, list):
@@ -335,16 +434,31 @@ def _stream_event_to_agui(
         return _subagent_tool_result_chunk_to_agui(event.data, tool_call_args_state, open_tool_call_ids)
     if event_type == "custom":
         return [{"type": "CUSTOM", "name": "deerflow.custom", "value": event.data}]
+    if event_type == "subagent_started":
+        return _subagent_started_to_agui(event.data, subagent_names_by_id if subagent_names_by_id is not None else {})
+    if event_type == "token_chunk":
+        return _subagent_token_chunk_to_agui(
+            event.data,
+            subagent_names_by_id if subagent_names_by_id is not None else {},
+            open_subagent_text_message_ids if open_subagent_text_message_ids is not None else set(),
+            open_subagent_reasoning_message_ids if open_subagent_reasoning_message_ids is not None else set(),
+        )
+    if event_type == "thinking_chunk":
+        return _subagent_thinking_chunk_to_agui(
+            event.data,
+            open_subagent_reasoning_message_ids if open_subagent_reasoning_message_ids is not None else set(),
+        )
+    if event_type in {"task_completed", "task_failed", "task_cancelled", "task_timed_out"}:
+        return _subagent_terminal_event_to_agui(
+            event_type,
+            event.data,
+            open_subagent_text_message_ids if open_subagent_text_message_ids is not None else set(),
+            open_subagent_reasoning_message_ids if open_subagent_reasoning_message_ids is not None else set(),
+            subagent_names_by_id if subagent_names_by_id is not None else {},
+        )
     if event_type in {
         "task_started",
         "task_running",
-        "task_completed",
-        "task_failed",
-        "task_cancelled",
-        "task_timed_out",
-        "subagent_started",
-        "token_chunk",
-        "thinking_chunk",
         "turn_complete",
     }:
         return [{"type": "CUSTOM", "name": f"deerflow.subagent.{event_type}", "value": {"eventType": event_type, **event.data}}]
@@ -358,18 +472,19 @@ def _message_tuple_to_agui(
     open_text_message_id: str | None,
     tool_call_args_state: dict[str, str],
     open_tool_call_ids: set[str],
-    open_reasoning_message_id: str | None = None,
+    open_reasoning_message_ids: set[str],
+    reasoning_content_state: dict[str, str],
 ) -> list[dict[str, Any]]:
     message_type = data.get("type")
     if message_type == "ai":
         tool_calls = data.get("tool_calls")
         if isinstance(tool_calls, list) and tool_calls:
             events: list[dict[str, Any]] = []
-            if open_reasoning_message_id:
-                events.append({"type": "REASONING_MESSAGE_END", "messageId": open_reasoning_message_id})
+            message_id = str(data.get("id") or uuid.uuid4())
+            events.extend(_close_reasoning_message(open_reasoning_message_ids, f"reasoning_{message_id}"))
             if open_text_message_id:
                 events.append({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
-            events.extend(_tool_calls_to_agui(tool_calls, str(data.get("id") or uuid.uuid4()), tool_call_args_state, open_tool_call_ids))
+            events.extend(_tool_calls_to_agui(tool_calls, message_id, tool_call_args_state, open_tool_call_ids))
             return events
 
         content = data.get("content")
@@ -380,21 +495,20 @@ def _message_tuple_to_agui(
 
         # --- Reasoning block ---
         if isinstance(reasoning, str) and reasoning:
-            if open_reasoning_message_id != reasoning_id:
-                # Close any open reasoning from a different message (shouldn't happen,
-                # but be defensive) then open the new one.
-                if open_reasoning_message_id:
-                    events.append({"type": "REASONING_MESSAGE_END", "messageId": open_reasoning_message_id})
-                events.append({"type": "REASONING_MESSAGE_START", "messageId": reasoning_id, "role": "assistant"})
-            events.append({"type": "REASONING_MESSAGE_CONTENT", "messageId": reasoning_id, "delta": reasoning})
+            reasoning_delta = _reasoning_delta(reasoning_content_state, reasoning_id, reasoning)
+            if reasoning_id not in open_reasoning_message_ids:
+                open_reasoning_message_ids.add(reasoning_id)
+                events.append({"type": "REASONING_MESSAGE_START", "messageId": reasoning_id, "role": "reasoning"})
+            if reasoning_delta:
+                events.append({"type": "REASONING_MESSAGE_CONTENT", "messageId": reasoning_id, "delta": reasoning_delta})
             # If this chunk is reasoning-only (no content), return now.
-            # The caller will track open_reasoning_message_id and send END later.
+            # The caller will track open_reasoning_message_ids and send END later.
             if not (isinstance(content, str) and content):
                 return events
 
-        # Close reasoning if we are about to emit a content chunk
-        if open_reasoning_message_id and isinstance(content, str) and content:
-            events.append({"type": "REASONING_MESSAGE_END", "messageId": open_reasoning_message_id})
+        # Close the reasoning block for this message if we are about to emit its content.
+        if isinstance(content, str) and content:
+            events.extend(_close_reasoning_message(open_reasoning_message_ids, reasoning_id))
 
         # --- Text content block ---
         if isinstance(content, str) and content:
@@ -424,6 +538,85 @@ def _message_tuple_to_agui(
             })
             return events
     return []
+
+
+def _subagent_started_to_agui(data: dict[str, Any], subagent_names_by_id: dict[str, str]) -> list[dict[str, Any]]:
+    task_id = str(data.get("task_id") or "")
+    name = data.get("name")
+    if task_id and isinstance(name, str) and name:
+        subagent_names_by_id[task_id] = name
+    return [{"type": "CUSTOM", "name": "deerflow.subagent.subagent_started", "value": {"eventType": "subagent_started", **data}}]
+
+
+def _subagent_text_message_id(task_id: str) -> str:
+    return f"subagent:{task_id}:message"
+
+
+def _subagent_reasoning_message_id(task_id: str) -> str:
+    return f"subagent:{task_id}:reasoning"
+
+
+def _subagent_token_chunk_to_agui(
+    data: dict[str, Any],
+    subagent_names_by_id: dict[str, str],
+    open_subagent_text_message_ids: set[str],
+    open_subagent_reasoning_message_ids: set[str],
+) -> list[dict[str, Any]]:
+    task_id = str(data.get("task_id") or "")
+    content = data.get("content")
+    events = [{"type": "CUSTOM", "name": "deerflow.subagent.token_chunk", "value": {"eventType": "token_chunk", **data}}]
+    if not task_id or not isinstance(content, str) or not content:
+        return events
+
+    events.extend(_close_subagent_reasoning_message(open_subagent_reasoning_message_ids, _subagent_reasoning_message_id(task_id)))
+    message_id = _subagent_text_message_id(task_id)
+    if message_id not in open_subagent_text_message_ids:
+        open_subagent_text_message_ids.add(message_id)
+        start_event: dict[str, Any] = {"type": "TEXT_MESSAGE_START", "messageId": message_id, "role": "assistant"}
+        if name := subagent_names_by_id.get(task_id):
+            start_event["name"] = name
+        events.append(start_event)
+    events.append({"type": "TEXT_MESSAGE_CONTENT", "messageId": message_id, "delta": content})
+    return events
+
+
+def _subagent_thinking_chunk_to_agui(
+    data: dict[str, Any],
+    open_subagent_reasoning_message_ids: set[str],
+) -> list[dict[str, Any]]:
+    task_id = str(data.get("task_id") or "")
+    thinking = data.get("thinking")
+    events = [{"type": "CUSTOM", "name": "deerflow.subagent.thinking_chunk", "value": {"eventType": "thinking_chunk", **data}}]
+    if not task_id or not isinstance(thinking, str) or not thinking:
+        return events
+
+    message_id = _subagent_reasoning_message_id(task_id)
+    if message_id not in open_subagent_reasoning_message_ids:
+        open_subagent_reasoning_message_ids.add(message_id)
+        events.append({"type": "REASONING_MESSAGE_START", "messageId": message_id, "role": "reasoning"})
+    events.append({"type": "REASONING_MESSAGE_CONTENT", "messageId": message_id, "delta": thinking})
+    return events
+
+
+def _subagent_terminal_event_to_agui(
+    event_type: str,
+    data: dict[str, Any],
+    open_subagent_text_message_ids: set[str],
+    open_subagent_reasoning_message_ids: set[str],
+    subagent_names_by_id: dict[str, str],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    task_id = str(data.get("task_id") or "")
+    if task_id:
+        subagent_names_by_id.pop(task_id, None)
+        reasoning_message_id = _subagent_reasoning_message_id(task_id)
+        if reasoning_message_id in open_subagent_reasoning_message_ids:
+            events.append({"type": "REASONING_MESSAGE_END", "messageId": reasoning_message_id})
+        message_id = _subagent_text_message_id(task_id)
+        if message_id in open_subagent_text_message_ids:
+            events.append({"type": "TEXT_MESSAGE_END", "messageId": message_id})
+    events.append({"type": "CUSTOM", "name": f"deerflow.subagent.{event_type}", "value": {"eventType": event_type, **data}})
+    return events
 
 
 def _tool_calls_to_agui(
