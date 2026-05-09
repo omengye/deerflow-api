@@ -347,11 +347,15 @@ class ClientManager:
                 await bridge.publish(run_id, event.get("type", "custom"), event)
 
             client = await self.get_async_client(**kwargs)
+            _agent_name = client.agent_name
             async with asyncio.timeout(settings.chat_request_timeout):
                 async for event in client.astream(message, thread_id=thread_id, live_event_callback=_live_event_callback):
                     if record.abort_event.is_set():
                         break
-                    await self.stream_bridge.publish(run_id, event.type, event.data)
+                    data = event.data
+                    if isinstance(data, dict):
+                        data = {**data, "_agent_name": _agent_name}
+                    await self.stream_bridge.publish(run_id, event.type, data)
 
             if record.abort_event.is_set():
                 await self.run_manager.set_status(run_id, RunStatus.interrupted)

@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 from collections.abc import AsyncIterator, Iterable, Iterator
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 from fastapi import Request
@@ -19,6 +19,7 @@ from langchain_core.runnables import RunnableConfig
 
 class _FakeClient:
     def __init__(self, events: Iterable[StreamEvent] | None = None, error_after_first: bool = False) -> None:
+        self.agent_name: str = "lead_agent"
         self.astream_called: bool = False
         self.stream_called: bool = False
         self.last_message: str | None = None
@@ -71,7 +72,7 @@ class _FakeManager:
     def get_client(self) -> _FakeClient:
         return self.client
 
-    async def get_async_client(self) -> _FakeClient:
+    async def get_async_client(self, **kwargs: Any) -> _FakeClient:
         return self.client
 
     async def start_client_stream_run(
@@ -262,7 +263,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             chat.get_client_manager = original_get_client_manager
 
         events = [json.loads(chunk.removeprefix("data: ").strip()) for chunk in chunks]
-        self.assertEqual(events[0], {"type": "RUN_STARTED", "threadId": "thread-1", "runId": "run-1"})
+        self.assertEqual(events[0], {"type": "RUN_STARTED", "threadId": "thread-1", "runId": "run-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
         record = fake_manager.run_manager.get("run-1")
         self.assertIsNotNone(record)
         assert record is not None
@@ -391,11 +392,11 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         events, fake_manager, _chunks = await self._collect_agui_stream(fake_client)
 
         self.assertEqual([event["type"] for event in events], ["RUN_STARTED", "TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END", "CUSTOM", "RUN_FINISHED"])
-        self.assertEqual(events[0], {"type": "RUN_STARTED", "threadId": "thread-1", "runId": "run-1"})
-        self.assertEqual(events[1], {"type": "TEXT_MESSAGE_START", "messageId": "msg-1", "role": "assistant"})
-        self.assertEqual(events[2], {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "delta": "hello"})
-        self.assertEqual(events[3], {"type": "TEXT_MESSAGE_END", "messageId": "msg-1"})
-        self.assertEqual(events[-1], {"type": "RUN_FINISHED", "threadId": "thread-1", "runId": "run-1"})
+        self.assertEqual(events[0], {"type": "RUN_STARTED", "threadId": "thread-1", "runId": "run-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
+        self.assertEqual(events[1], {"type": "TEXT_MESSAGE_START", "messageId": "msg-1", "role": "assistant", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
+        self.assertEqual(events[2], {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "delta": "hello", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
+        self.assertEqual(events[3], {"type": "TEXT_MESSAGE_END", "messageId": "msg-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
+        self.assertEqual(events[-1], {"type": "RUN_FINISHED", "threadId": "thread-1", "runId": "run-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
         self.assertEqual(fake_manager.done, ["thread-1"])
 
     async def test_chat_agui_keeps_reasoning_messages_separate_by_id(self) -> None:
@@ -413,12 +414,12 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             reasoning_events,
             [
-                {"type": "REASONING_MESSAGE_START", "messageId": "reasoning_msg-1", "role": "reasoning"},
-                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "think"},
-                {"type": "REASONING_MESSAGE_START", "messageId": "reasoning_msg-2", "role": "reasoning"},
-                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-2", "delta": "plan"},
-                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-1"},
-                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-2"},
+                {"type": "REASONING_MESSAGE_START", "messageId": "reasoning_msg-1", "role": "reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "think", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_START", "messageId": "reasoning_msg-2", "role": "reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-2", "delta": "plan", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-2", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
             ],
         )
 
@@ -437,8 +438,8 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             reasoning_content_events,
             [
-                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "think"},
-                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "ing"},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "think", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "ing", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
             ],
         )
 
@@ -455,11 +456,11 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [event for event in events if event["type"] in {"REASONING_MESSAGE_START", "REASONING_MESSAGE_CONTENT", "REASONING_MESSAGE_END", "TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT"}],
             [
-                {"type": "REASONING_MESSAGE_START", "messageId": "reasoning_msg-1", "role": "reasoning"},
-                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "think"},
-                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-1"},
-                {"type": "TEXT_MESSAGE_START", "messageId": "msg-1", "role": "assistant"},
-                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "delta": "answer"},
+                {"type": "REASONING_MESSAGE_START", "messageId": "reasoning_msg-1", "role": "reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "think", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_START", "messageId": "msg-1", "role": "assistant", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "delta": "answer", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
             ],
         )
 
@@ -479,8 +480,8 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             reasoning_ends,
             [
-                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-1"},
-                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-2"},
+                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-2", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
             ],
         )
         self.assertLess(events.index(reasoning_ends[0]), next(index for index, event in enumerate(events) if event["type"] == "TEXT_MESSAGE_START"))
@@ -498,10 +499,11 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
 
         self.assertEqual([event["type"] for event in events], ["RUN_STARTED", "TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT", "CUSTOM", "RUN_FINISHED"])
-        self.assertEqual(events[1], {"type": "TOOL_CALL_START", "toolCallId": "call-1", "toolCallName": "search", "parentMessageId": "msg-1"})
-        self.assertEqual(events[2], {"type": "TOOL_CALL_ARGS", "toolCallId": "call-1", "delta": '{"q": "x"}'})
-        self.assertEqual(events[3], {"type": "TOOL_CALL_END", "toolCallId": "call-1"})
-        self.assertEqual(events[4], {"type": "TOOL_CALL_RESULT", "messageId": "tool-msg-1", "toolCallId": "call-1", "content": "result", "role": "tool"})
+        self.assertEqual(events[1], {"type": "TOOL_CALL_START", "toolCallId": "call-1", "toolCallName": "search", "parentMessageId": "msg-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
+        self.assertEqual(events[2], {"type": "TOOL_CALL_ARGS", "toolCallId": "call-1", "delta": '{"q": "x"}', "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
+        self.assertEqual(events[3], {"type": "TOOL_CALL_END", "toolCallId": "call-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
+        self.assertEqual(events[4], {"type": "TOOL_CALL_RESULT", "messageId": "tool-msg-1", "toolCallId": "call-1", "content": "result", "role": "tool", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
+        self.assertEqual(events[5], {"type": "CUSTOM", "name": "deerflow.usage", "value": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, "rawEvent": {"name": "lead_agent"}})
 
     async def test_chat_agui_maps_subagent_tool_calls_and_results(self) -> None:
         fake_client = _FakeClient(
@@ -525,10 +527,12 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
                 "toolCallId": "subagent:task-1:call-1",
                 "toolCallName": "websearch",
                 "parentMessageId": "subagent:task-1",
+                "name": "lead_agent",
+                "rawEvent": {"name": "lead_agent"},
             },
         )
-        self.assertEqual(events[2], {"type": "TOOL_CALL_ARGS", "toolCallId": "subagent:task-1:call-1", "delta": '{"query": "deerflow"}'})
-        self.assertEqual(events[3], {"type": "TOOL_CALL_END", "toolCallId": "subagent:task-1:call-1"})
+        self.assertEqual(events[2], {"type": "TOOL_CALL_ARGS", "toolCallId": "subagent:task-1:call-1", "delta": '{"query": "deerflow"}', "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
+        self.assertEqual(events[3], {"type": "TOOL_CALL_END", "toolCallId": "subagent:task-1:call-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
         self.assertEqual(
             events[4],
             {
@@ -537,6 +541,8 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
                 "toolCallId": "subagent:task-1:call-1",
                 "content": "result",
                 "role": "tool",
+                "name": "lead_agent",
+                "rawEvent": {"name": "lead_agent"},
             },
         )
 
@@ -553,7 +559,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
 
         self.assertEqual([event["type"] for event in events], ["RUN_STARTED", "TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT", "CUSTOM", "RUN_FINISHED"])
-        self.assertEqual(events[2], {"type": "TOOL_CALL_ARGS", "toolCallId": "subagent:task-1:call-1", "delta": '{"command": "echo hi"}'})
+        self.assertEqual(events[2], {"type": "TOOL_CALL_ARGS", "toolCallId": "subagent:task-1:call-1", "delta": '{"command": "echo hi"}', "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
 
     async def test_chat_agui_namespaces_same_subagent_tool_id_by_task(self) -> None:
         fake_client = _FakeClient(
@@ -582,7 +588,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
 
         self.assertEqual([event["type"] for event in events], ["RUN_STARTED", "TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "CUSTOM", "RUN_FINISHED"])
-        self.assertEqual(events[2], {"type": "TOOL_CALL_ARGS", "toolCallId": "subagent:task-1:call-1", "delta": '{"url": "https://example.com"}'})
+        self.assertEqual(events[2], {"type": "TOOL_CALL_ARGS", "toolCallId": "subagent:task-1:call-1", "delta": '{"url": "https://example.com"}', "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
 
     async def test_chat_agui_preserves_subagent_lifecycle_event_name(self) -> None:
         fake_client = _FakeClient(
@@ -594,7 +600,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
 
-        self.assertEqual(events[1], {"type": "CUSTOM", "name": "deerflow.subagent.task_failed", "value": {"eventType": "task_failed", "task_id": "task-1", "error": "boom"}})
+        self.assertEqual(events[1], {"type": "CUSTOM", "name": "deerflow.subagent.task_failed", "value": {"eventType": "task_failed", "task_id": "task-1", "error": "boom"}, "rawEvent": {"name": "lead_agent"}})
 
     async def test_chat_agui_maps_subagent_token_chunks_to_text_message_events(self) -> None:
         fake_client = _FakeClient(
@@ -612,13 +618,13 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [event for event in events if event["type"] in {"TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END"}],
             [
-                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant", "name": "researcher"},
-                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "hello"},
-                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": " world"},
-                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message"},
+                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant", "name": "researcher", "rawEvent": {"name": "researcher"}},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "hello", "name": "researcher", "rawEvent": {"name": "researcher"}},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": " world", "name": "researcher", "rawEvent": {"name": "researcher"}},
+                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message", "name": "researcher", "rawEvent": {"name": "researcher"}},
             ],
         )
-        self.assertIn({"type": "CUSTOM", "name": "deerflow.subagent.token_chunk", "value": {"eventType": "token_chunk", "task_id": "task-1", "content": "hello"}}, events)
+        self.assertIn({"type": "CUSTOM", "name": "deerflow.subagent.token_chunk", "value": {"eventType": "token_chunk", "task_id": "task-1", "content": "hello"}, "rawEvent": {"name": "researcher"}}, events)
 
     async def test_chat_agui_closes_open_subagent_text_message_on_stream_end(self) -> None:
         fake_client = _FakeClient(
@@ -633,9 +639,9 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [event for event in events if event["type"] in {"TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END"}],
             [
-                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant"},
-                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "partial"},
-                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message"},
+                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "partial", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
             ],
         )
 
@@ -651,7 +657,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
-                subagent_ends = [event for event in events if event == {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message"}]
+                subagent_ends = [event for event in events if event["type"] == "TEXT_MESSAGE_END" and event["messageId"] == "subagent:task-1:message"]
 
                 self.assertEqual(len(subagent_ends), 1)
 
@@ -672,13 +678,13 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [event for event in events if event["type"] in {"TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END"}],
             [
-                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant"},
-                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "a1"},
-                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-2:message", "role": "assistant"},
-                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-2:message", "delta": "b1"},
-                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "a2"},
-                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message"},
-                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-2:message"},
+                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "a1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-2:message", "role": "assistant", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-2:message", "delta": "b1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "a2", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-2:message", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
             ],
         )
 
@@ -698,13 +704,13 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [event for event in events if event["type"] in {"TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END"}],
             [
-                {"type": "TEXT_MESSAGE_START", "messageId": "msg-1", "role": "assistant"},
-                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "delta": "main"},
-                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant"},
-                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "sub"},
-                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "delta": " done"},
-                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message"},
-                {"type": "TEXT_MESSAGE_END", "messageId": "msg-1"},
+                {"type": "TEXT_MESSAGE_START", "messageId": "msg-1", "role": "assistant", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "delta": "main", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "sub", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg-1", "delta": " done", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_END", "messageId": "msg-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
             ],
         )
 
@@ -723,13 +729,13 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [event for event in events if str(event["type"]).startswith("REASONING_MESSAGE_")],
             [
-                {"type": "REASONING_MESSAGE_START", "messageId": "subagent:task-1:reasoning", "role": "reasoning"},
-                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": "think"},
-                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": " more"},
-                {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning"},
+                {"type": "REASONING_MESSAGE_START", "messageId": "subagent:task-1:reasoning", "role": "reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": "think", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": " more", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
             ],
         )
-        self.assertIn({"type": "CUSTOM", "name": "deerflow.subagent.thinking_chunk", "value": {"eventType": "thinking_chunk", "task_id": "task-1", "thinking": "think"}}, events)
+        self.assertIn({"type": "CUSTOM", "name": "deerflow.subagent.thinking_chunk", "value": {"eventType": "thinking_chunk", "task_id": "task-1", "thinking": "think"}, "rawEvent": {"name": "lead_agent"}}, events)
 
     async def test_chat_agui_closes_subagent_reasoning_before_token_text(self) -> None:
         fake_client = _FakeClient(
@@ -746,11 +752,11 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [event for event in events if event["type"] in {"REASONING_MESSAGE_START", "REASONING_MESSAGE_CONTENT", "REASONING_MESSAGE_END", "TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT"}],
             [
-                {"type": "REASONING_MESSAGE_START", "messageId": "subagent:task-1:reasoning", "role": "reasoning"},
-                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": "think"},
-                {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning"},
-                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant"},
-                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "answer"},
+                {"type": "REASONING_MESSAGE_START", "messageId": "subagent:task-1:reasoning", "role": "reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": "think", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "answer", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
             ],
         )
 
@@ -767,9 +773,9 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [event for event in events if str(event["type"]).startswith("REASONING_MESSAGE_")],
             [
-                {"type": "REASONING_MESSAGE_START", "messageId": "subagent:task-1:reasoning", "role": "reasoning"},
-                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": "partial"},
-                {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning"},
+                {"type": "REASONING_MESSAGE_START", "messageId": "subagent:task-1:reasoning", "role": "reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": "partial", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
             ],
         )
 
@@ -786,7 +792,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
-                reasoning_end: dict[str, object] = {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning"}
+                reasoning_end: dict[str, object] = {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}}
                 terminal_custom = next(event for event in events if event["type"] == "CUSTOM" and event["name"] == f"deerflow.subagent.{terminal_type}")
 
                 self.assertEqual([event for event in events if event == reasoning_end], [reasoning_end])
@@ -800,8 +806,8 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
 
-        self.assertEqual(events[-2], {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning"})
-        self.assertEqual(events[-1], {"type": "RUN_ERROR", "message": "boom"})
+        self.assertEqual(events[-2], {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
+        self.assertEqual(events[-1], {"type": "RUN_ERROR", "message": "boom", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
 
     async def test_chat_agui_keeps_main_and_subagent_reasoning_independent(self) -> None:
         fake_client = _FakeClient(
@@ -820,12 +826,12 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [event for event in events if str(event["type"]).startswith("REASONING_MESSAGE_")],
             [
-                {"type": "REASONING_MESSAGE_START", "messageId": "reasoning_msg-1", "role": "reasoning"},
-                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "main-think"},
-                {"type": "REASONING_MESSAGE_START", "messageId": "subagent:task-1:reasoning", "role": "reasoning"},
-                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": "sub-think"},
-                {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning"},
-                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-1"},
+                {"type": "REASONING_MESSAGE_START", "messageId": "reasoning_msg-1", "role": "reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "reasoning_msg-1", "delta": "main-think", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_START", "messageId": "subagent:task-1:reasoning", "role": "reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_CONTENT", "messageId": "subagent:task-1:reasoning", "delta": "sub-think", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_END", "messageId": "subagent:task-1:reasoning", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
+                {"type": "REASONING_MESSAGE_END", "messageId": "reasoning_msg-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}},
             ],
         )
 
@@ -834,8 +840,8 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         events, fake_manager, _chunks = await self._collect_agui_stream(fake_client)
 
-        self.assertEqual(events[-2], {"type": "TEXT_MESSAGE_END", "messageId": "msg-1"})
-        self.assertEqual(events[-1], {"type": "RUN_ERROR", "message": "boom"})
+        self.assertEqual(events[-2], {"type": "TEXT_MESSAGE_END", "messageId": "msg-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
+        self.assertEqual(events[-1], {"type": "RUN_ERROR", "message": "boom", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
         self.assertEqual(fake_manager.done, ["thread-1"])
 
     async def test_chat_agui_preserves_parent_run_id_and_data_only_sse(self) -> None:
@@ -843,7 +849,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         events, _fake_manager, chunks = await self._collect_agui_stream(fake_client, parent_run_id="parent-1")
 
-        self.assertEqual(events[0], {"type": "RUN_STARTED", "threadId": "thread-1", "runId": "run-1", "parentRunId": "parent-1"})
+        self.assertEqual(events[0], {"type": "RUN_STARTED", "threadId": "thread-1", "runId": "run-1", "parentRunId": "parent-1", "name": "lead_agent", "rawEvent": {"name": "lead_agent"}})
         self.assertTrue(all(chunk.startswith("data: ") for chunk in chunks))
         self.assertTrue(all("event:" not in chunk for chunk in chunks))
 

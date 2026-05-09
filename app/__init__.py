@@ -1,6 +1,13 @@
 """DeerFlow API Service — FastAPI wrapper around DeerFlow harness."""
 import sys
+import asyncio
 from pathlib import Path
+
+# Python 3.14 on Windows: ProactorEventLoop transport.close() raises
+# RuntimeError('Event loop is closed') during async stream cleanup (anyio/httpx).
+# WindowsSelectorEventLoopPolicy avoids this entirely.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Load .env from project root before any config/settings are imported.
 try:
@@ -29,10 +36,33 @@ from app.middleware import ApiKeyAuthMiddleware, RequestContextMiddleware
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
-    # Initialize client manager
     manager = get_client_manager()
     await manager.startup()
+
+    feishu_channel = None
+    if settings.feishu and settings.feishu.enabled and settings.feishu.app_id:
+        try:
+            from app.channels.feishu import FeishuChannel
+            feishu_channel = FeishuChannel(
+                app_id=settings.feishu.app_id,
+                app_secret=settings.feishu.app_secret,
+                verification_token=settings.feishu.verification_token,
+            )
+            feishu_channel.start(asyncio.get_running_loop())
+        except ImportError:
+            import logging
+            logging.getLogger(__name__).warning(
+                "lark-oapi not installed; Feishu channel disabled. "
+                'Install with: uv pip install "deerflow-api[feishu]"'
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Failed to start Feishu channel")
+
     yield
+
+    if feishu_channel is not None:
+        feishu_channel.stop()
     await manager.shutdown()
 
 

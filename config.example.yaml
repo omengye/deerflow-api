@@ -91,10 +91,9 @@ tools:
     https_proxy: http://172.17.0.1:11055
   - name: web_fetch
     group: web
-    use: deerflow.community.jina_ai.tools:web_fetch_tool
+    use: deerflow.community.scrapling.tools:web_fetch_tool
     timeout: 10
     https_proxy: http://172.17.0.1:11055
-    api_key: "" # 新增，不配则不传
   - name: image_search
     group: web
     use: deerflow.community.image_search.tools:image_search_tool

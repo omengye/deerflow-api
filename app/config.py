@@ -204,6 +204,44 @@ def _auth_enabled_default() -> bool:
     return bool(_setting_list("api_keys", "DEER_FLOW_API_KEYS", []))
 
 
+class FeishuSettings(BaseModel):
+    """Feishu (Lark) channel settings."""
+
+    enabled: bool = False
+    app_id: str = ""
+    app_secret: str = ""
+    verification_token: str = ""
+
+
+def _load_feishu_settings() -> "FeishuSettings | None":
+    raw = _API_CONFIG.get("feishu")
+
+    def _val(key: str, env_names: list[str]) -> str:
+        if isinstance(raw, dict) and key in raw:
+            v = raw[key]
+            if v:
+                return str(_resolve_config_scalar(v))
+        for env in env_names:
+            v = os.environ.get(env)
+            if v:
+                return v
+        return ""
+
+    app_id = _val("app_id", ["FEISHU_APP_ID", "LARK_APP_ID"])
+    enabled_raw = raw.get("enabled", True) if isinstance(raw, dict) else False
+    enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).lower() in {"true", "1", "yes", "on"}
+
+    if not app_id and not enabled:
+        return None
+
+    return FeishuSettings(
+        enabled=enabled,
+        app_id=app_id,
+        app_secret=_val("app_secret", ["FEISHU_APP_SECRET", "LARK_APP_SECRET"]),
+        verification_token=_val("verification_token", ["FEISHU_VERIFICATION_TOKEN", "LARK_VERIFICATION_TOKEN"]),
+    )
+
+
 class Settings(BaseModel):
     """API service settings."""
 
@@ -287,6 +325,9 @@ class Settings(BaseModel):
     allow_memory_fallback: bool = Field(
         default_factory=lambda: _setting_bool("allow_memory_fallback", "DEER_FLOW_ALLOW_MEMORY_FALLBACK", False)
     )
+
+    # Feishu (Lark) channel — optional, disabled unless configured.
+    feishu: FeishuSettings | None = Field(default_factory=_load_feishu_settings)
 
 settings = Settings()
 

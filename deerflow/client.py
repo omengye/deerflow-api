@@ -178,6 +178,10 @@ class DeerFlowClient:
         self._agent = None
         self._agent_config_key: tuple | None = None
 
+    @property
+    def agent_name(self) -> str:
+        return self._agent_name or "agent"
+
     def reset_agent(self) -> None:
         """Force the internal agent to be recreated on the next call.
 
@@ -223,6 +227,15 @@ class DeerFlowClient:
         metadata: dict[str, Any] = {}
         if "live_event_callback" in overrides:
             metadata["live_event_callback"] = overrides["live_event_callback"]
+        # Mirror key context fields into metadata so tools (e.g. task_tool) can read
+        # parent-agent context from runtime.config["metadata"] at call time.
+        # _get_runnable_config puts model_name/thinking_enabled into configurable for
+        # LangGraph checkpoint keying, but ToolRuntime only exposes metadata to tools.
+        effective_model = overrides.get("model_name") or self._model_name
+        if effective_model:
+            metadata["model_name"] = effective_model
+        metadata["thinking_enabled"] = bool(overrides.get("thinking_enabled", self._thinking_enabled))
+        metadata["agent_name"] = self._agent_name or "agent"
         return RunnableConfig(
             configurable=configurable,
             metadata=metadata,
@@ -496,7 +509,9 @@ class DeerFlowClient:
                 if text or reasoning:
                     if msg_id:
                         stream_state.streamed_ids.add(msg_id)
-                    yield self._ai_text_event(msg_id, text, counted_usage, reasoning_content=reasoning)
+                    evt = self._ai_text_event(msg_id, text, counted_usage, reasoning_content=reasoning)
+                    evt.data["is_delta"] = True
+                    yield evt
 
                 # Tool calls are intentionally NOT emitted here. Individual streaming
                 # chunks have incomplete data: only the first chunk carries name/id

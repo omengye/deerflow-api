@@ -10,6 +10,7 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from sse_starlette.sse import EventSourceResponse
 
+from app.config import settings
 from app.dependencies import get_client_manager
 from app.middleware import get_request_id
 
@@ -127,8 +128,6 @@ def _chat_kwargs_from_request(req: ChatRequest) -> dict[str, Any]:
         kwargs["plan_mode"] = req.plan_mode
     if req.max_concurrent_subagents is not None:
         kwargs["max_concurrent_subagents"] = req.max_concurrent_subagents
-    if req.agent_name:
-        kwargs["agent_name"] = req.agent_name
     return kwargs
 
 
@@ -164,6 +163,9 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
 
     last_event_id = request.headers.get("last-event-id")
 
+    client = await manager.get_async_client(**kwargs)
+    agent_name: str = client.agent_name
+
     async def event_generator():
         open_text_message_id: str | None = None
         # Maps tool_call_id → serialized args JSON already sent as delta.
@@ -185,11 +187,15 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
         # reasoning text. Store what each id has already emitted so AG-UI always
         # receives incremental REASONING_MESSAGE_CONTENT.delta values.
         reasoning_content_state: dict[str, str] = {}
+
+        def emit(agui_event: dict[str, Any], name: str | None = None) -> str:
+            return _agui_sse(_annotate_event_name(agui_event, name if name is not None else agent_name, subagent_names_by_id))
+
         try:
-            yield _agui_sse({"type": "RUN_STARTED", "threadId": thread_id, "runId": run_id, **({"parentRunId": req.parent_run_id} if req.parent_run_id else {})})
+            yield emit({"type": "RUN_STARTED", "threadId": thread_id, "runId": run_id, **({"parentRunId": req.parent_run_id} if req.parent_run_id else {})})
             async for entry in manager.stream_bridge.subscribe(record.run_id, last_event_id=last_event_id):
                 if entry is HEARTBEAT_SENTINEL:
-                    yield _agui_sse({"type": "CUSTOM", "name": "deerflow.heartbeat", "value": {}})
+                    yield emit({"type": "CUSTOM", "name": "deerflow.heartbeat", "value": {}})
                     continue
                 if entry is END_SENTINEL:
                     break
@@ -212,20 +218,21 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                     "turn_complete",
                 }:
                     continue
+                event_agent_name = entry.data.get("_agent_name") if isinstance(entry.data, dict) else None
                 event = StreamEvent(type=cast(StreamEventType, entry.event), data=entry.data)
                 if event.type == "end":
                     for reasoning_event in _close_reasoning_messages(open_reasoning_message_ids):
-                        yield _agui_sse(reasoning_event)
+                        yield emit(reasoning_event, event_agent_name)
                     for reasoning_event in _close_subagent_reasoning_messages(open_subagent_reasoning_message_ids):
-                        yield _agui_sse(reasoning_event)
+                        yield emit(reasoning_event, event_agent_name)
                     if open_text_message_id:
-                        yield _agui_sse({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
+                        yield emit({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id}, event_agent_name)
                         open_text_message_id = None
                     for text_event in _close_subagent_text_messages(open_subagent_text_message_ids):
-                        yield _agui_sse(text_event)
+                        yield emit(text_event, event_agent_name)
                     for tc_id in list(open_tool_call_ids):
-                        yield _agui_sse({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")})
-                        yield _agui_sse({"type": "TOOL_CALL_END", "toolCallId": tc_id})
+                        yield emit({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")}, event_agent_name)
+                        yield emit({"type": "TOOL_CALL_END", "toolCallId": tc_id}, event_agent_name)
                     open_tool_call_ids.clear()
                 for agui_event in _stream_event_to_agui(
                     event,
@@ -270,24 +277,24 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                             open_subagent_reasoning_message_ids.discard(message_id)
                         else:
                             open_reasoning_message_ids.discard(message_id)
-                    yield _agui_sse(agui_event)
+                    yield emit(agui_event, event_agent_name)
             for tc_id in list(open_tool_call_ids):
-                yield _agui_sse({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")})
-                yield _agui_sse({"type": "TOOL_CALL_END", "toolCallId": tc_id})
+                yield emit({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")})
+                yield emit({"type": "TOOL_CALL_END", "toolCallId": tc_id})
             open_tool_call_ids.clear()
             for reasoning_event in _close_reasoning_messages(open_reasoning_message_ids):
-                yield _agui_sse(reasoning_event)
+                yield emit(reasoning_event)
             for reasoning_event in _close_subagent_reasoning_messages(open_subagent_reasoning_message_ids):
-                yield _agui_sse(reasoning_event)
+                yield emit(reasoning_event)
             if open_text_message_id:
-                yield _agui_sse({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
+                yield emit({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
             for text_event in _close_subagent_text_messages(open_subagent_text_message_ids):
-                yield _agui_sse(text_event)
+                yield emit(text_event)
             final_record = manager.run_manager.get(record.run_id)
             if final_record is not None and final_record.status in {RunStatus.error, RunStatus.timeout, RunStatus.interrupted}:
-                yield _agui_sse({"type": "RUN_ERROR", "message": final_record.error or final_record.status.value})
+                yield emit({"type": "RUN_ERROR", "message": final_record.error or final_record.status.value})
             else:
-                yield _agui_sse({"type": "RUN_FINISHED", "threadId": thread_id, "runId": run_id})
+                yield emit({"type": "RUN_FINISHED", "threadId": thread_id, "runId": run_id})
         except asyncio.CancelledError:
             if (req.on_disconnect or "cancel") == "cancel":
                 await manager.cancel_run(record.run_id)
@@ -295,17 +302,17 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
         except Exception:
             logger.exception("Unhandled error in /chat/agui (thread=%s)", thread_id)
             for tc_id in list(open_tool_call_ids):
-                yield _agui_sse({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")})
-                yield _agui_sse({"type": "TOOL_CALL_END", "toolCallId": tc_id})
+                yield emit({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")})
+                yield emit({"type": "TOOL_CALL_END", "toolCallId": tc_id})
             for reasoning_event in _close_reasoning_messages(open_reasoning_message_ids):
-                yield _agui_sse(reasoning_event)
+                yield emit(reasoning_event)
             for reasoning_event in _close_subagent_reasoning_messages(open_subagent_reasoning_message_ids):
-                yield _agui_sse(reasoning_event)
+                yield emit(reasoning_event)
             if open_text_message_id:
-                yield _agui_sse({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
+                yield emit({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id})
             for text_event in _close_subagent_text_messages(open_subagent_text_message_ids):
-                yield _agui_sse(text_event)
-            yield _agui_sse({"type": "RUN_ERROR", "message": "Internal server error"})
+                yield emit(text_event)
+            yield emit({"type": "RUN_ERROR", "message": "Internal server error"})
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -328,8 +335,6 @@ def _chat_kwargs_from_agui(req: AguiRunAgentInput) -> dict[str, Any]:
         kwargs["plan_mode"] = req.plan_mode
     if req.max_concurrent_subagents is not None:
         kwargs["max_concurrent_subagents"] = req.max_concurrent_subagents
-    if req.agent_name:
-        kwargs["agent_name"] = req.agent_name
     return kwargs
 
 
@@ -386,6 +391,49 @@ def _reasoning_delta(reasoning_content_state: dict[str, str], reasoning_id: str,
     return delta
 
 
+def _resolve_name_for_event(
+    event: dict[str, Any],
+    agent_name: str | None,
+    subagent_names_by_id: dict[str, str],
+) -> str | None:
+    for field in ("messageId", "toolCallId"):
+        value = event.get(field) or ""
+        if isinstance(value, str) and value.startswith("subagent:"):
+            parts = value.split(":", 3)
+            if len(parts) >= 2:
+                subagent_name = subagent_names_by_id.get(parts[1])
+                if subagent_name:
+                    return subagent_name
+
+    if event.get("type") == "CUSTOM":
+        value = event.get("value")
+        if isinstance(value, dict):
+            task_id = value.get("task_id")
+            if task_id:
+                subagent_name = subagent_names_by_id.get(str(task_id))
+                if subagent_name:
+                    return subagent_name
+
+    return agent_name
+
+
+def _annotate_event_name(
+    event: dict[str, Any],
+    agent_name: str | None,
+    subagent_names_by_id: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Inject agent/subagent name into an AG-UI event.
+
+    Standard AG-UI events get a top-level ``name`` field. All events get
+    the name injected into ``rawEvent.name``.
+    """
+    name = _resolve_name_for_event(event, agent_name, subagent_names_by_id or {})
+    if not name:
+        return event
+    raw_event = {**(event.get("rawEvent") or {}), "name": name}
+    return {**event, "rawEvent": raw_event}
+
+
 def _stream_event_to_agui(
     event: StreamEvent,
     thread_id: str,
@@ -429,7 +477,7 @@ def _stream_event_to_agui(
         if isinstance(messages, list):
             return [{"type": "MESSAGES_SNAPSHOT", "messages": [_message_to_agui(m) for m in messages if isinstance(m, dict)]}]
     if event_type == "tool_call_chunk":
-        return _subagent_tool_call_chunk_to_agui(event.data, tool_call_args_state, open_tool_call_ids)
+        return _subagent_tool_call_chunk_to_agui(event.data, tool_call_args_state, open_tool_call_ids, subagent_names_by_id)
     if event_type == "tool_result_chunk":
         return _subagent_tool_result_chunk_to_agui(event.data, tool_call_args_state, open_tool_call_ids)
     if event_type == "custom":
@@ -447,6 +495,7 @@ def _stream_event_to_agui(
         return _subagent_thinking_chunk_to_agui(
             event.data,
             open_subagent_reasoning_message_ids if open_subagent_reasoning_message_ids is not None else set(),
+            subagent_names_by_id,
         )
     if event_type in {"task_completed", "task_failed", "task_cancelled", "task_timed_out"}:
         return _subagent_terminal_event_to_agui(
@@ -572,10 +621,7 @@ def _subagent_token_chunk_to_agui(
     message_id = _subagent_text_message_id(task_id)
     if message_id not in open_subagent_text_message_ids:
         open_subagent_text_message_ids.add(message_id)
-        start_event: dict[str, Any] = {"type": "TEXT_MESSAGE_START", "messageId": message_id, "role": "assistant"}
-        if name := subagent_names_by_id.get(task_id):
-            start_event["name"] = name
-        events.append(start_event)
+        events.append({"type": "TEXT_MESSAGE_START", "messageId": message_id, "role": "assistant"})
     events.append({"type": "TEXT_MESSAGE_CONTENT", "messageId": message_id, "delta": content})
     return events
 
@@ -583,6 +629,7 @@ def _subagent_token_chunk_to_agui(
 def _subagent_thinking_chunk_to_agui(
     data: dict[str, Any],
     open_subagent_reasoning_message_ids: set[str],
+    subagent_names_by_id: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     task_id = str(data.get("task_id") or "")
     thinking = data.get("thinking")
@@ -653,6 +700,7 @@ def _subagent_tool_call_chunk_to_agui(
     data: dict[str, Any],
     tool_call_args_state: dict[str, str],
     open_tool_call_ids: set[str],
+    subagent_names_by_id: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     tool_call = data.get("tool_call")
     if not isinstance(tool_call, dict):
