@@ -70,6 +70,7 @@ class ClientManager:
             settings.subagent_enabled,
             settings.plan_mode,
             settings.max_concurrent_subagents,
+            settings.recursion_limit,
             frozenset(overrides.items()),
         )
 
@@ -82,6 +83,7 @@ class ClientManager:
                 "subagent_enabled": settings.subagent_enabled,
                 "plan_mode": settings.plan_mode,
                 "max_concurrent_subagents": settings.max_concurrent_subagents,
+                "recursion_limit": settings.recursion_limit,
             }
             kwargs.update(overrides)
             self._client_map[key] = DeerFlowClient(**kwargs)
@@ -100,6 +102,7 @@ class ClientManager:
             settings.subagent_enabled,
             settings.plan_mode,
             settings.max_concurrent_subagents,
+            settings.recursion_limit,
             frozenset(overrides.items()),
         )
 
@@ -114,6 +117,7 @@ class ClientManager:
                         "subagent_enabled": settings.subagent_enabled,
                         "plan_mode": settings.plan_mode,
                         "max_concurrent_subagents": settings.max_concurrent_subagents,
+                        "recursion_limit": settings.recursion_limit,
                     }
                     kwargs.update(overrides)
                     self._async_client_map[key] = DeerFlowClient(**kwargs)
@@ -370,15 +374,27 @@ class ClientManager:
             await self.stream_bridge.publish(run_id, "error", {"error": "Run cancelled"})
             await self.run_manager.set_status(run_id, RunStatus.interrupted)
             raise
-        except Exception:
-            logger.exception("Unhandled error in run producer (run=%s thread=%s)", run_id, thread_id)
-            await self.stream_bridge.publish(run_id, "error", {"error": "Internal server error"})
-            await self.run_manager.set_status(run_id, RunStatus.error, error="Internal server error")
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
+                logger.debug("Stream producer stopped: event loop closed (run=%s thread=%s)", run_id, thread_id)
+            else:
+                logger.exception("Unhandled error in run producer (run=%s thread=%s)", run_id, thread_id)
+                try:
+                    await self.stream_bridge.publish(run_id, "error", {"error": "Internal server error"})
+                    await self.run_manager.set_status(run_id, RunStatus.error, error="Internal server error")
+                except RuntimeError as bridge_err:
+                    if "Event loop is closed" not in str(bridge_err):
+                        raise
         finally:
             self.mark_thread_done(thread_id)
-            await self.stream_bridge.publish_end(run_id)
-            asyncio.create_task(self.stream_bridge.cleanup(run_id, delay=60))
-            asyncio.create_task(self.run_manager.cleanup(run_id, delay=300))
+            try:
+                await self.stream_bridge.publish_end(run_id)
+                asyncio.create_task(self.stream_bridge.cleanup(run_id, delay=60))
+                asyncio.create_task(self.run_manager.cleanup(run_id, delay=300))
+            except RuntimeError as exc:
+                if "Event loop is closed" not in str(exc):
+                    raise
+                logger.debug("Cleanup skipped: event loop closed (run=%s)", run_id)
 
     async def cancel_run(self, run_id: str, *, action: str = "interrupt") -> bool:
         """Cancel an in-flight run."""

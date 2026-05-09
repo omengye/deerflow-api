@@ -268,6 +268,7 @@ class Settings(BaseModel):
     subagent_enabled: bool = Field(default_factory=lambda: _setting_bool("subagent_enabled", "DEER_FLOW_SUBAGENT_ENABLED", True))
     plan_mode: bool = Field(default_factory=lambda: _setting_bool("plan_mode", "DEER_FLOW_PLAN_MODE", True))
     max_concurrent_subagents: int = Field(default_factory=lambda: _setting_int_preferred("max_concurrent_subagents", ("DEER_FLOW_MAX_CONCURRENT_SUBAGENTS", "MAX_CONCURRENT_SUBAGENTS"), 3), ge=2, le=4)
+    recursion_limit: int = Field(default_factory=lambda: _setting_int("recursion_limit", "DEER_FLOW_RECURSION_LIMIT", 200), ge=10, le=2000)
 
     # Data directory
     data_dir: str = Field(default_factory=lambda: _setting_str("data_dir", "DEER_FLOW_DATA_DIR", "./data"))

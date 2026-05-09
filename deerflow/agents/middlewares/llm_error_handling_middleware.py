@@ -301,6 +301,9 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                         self._circuit_probe_in_flight = False
                 raise
             except Exception as exc:
+                # asyncio shutdown — propagate instead of masking as a user-facing LLM error.
+                if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
+                    raise
                 retriable, reason = self._classify_error(exc)
                 if reason == "content_policy":
                     logger.warning(

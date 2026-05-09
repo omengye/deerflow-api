@@ -138,6 +138,7 @@ class DeerFlowClient:
         agent_name: str | None = None,
         available_skills: set[str] | None = None,
         middlewares: Sequence[AgentMiddleware] | None = None,
+        recursion_limit: int = 200,
     ):
         """Initialize the client.
 
@@ -173,6 +174,7 @@ class DeerFlowClient:
         self._agent_name = agent_name
         self._available_skills = set(available_skills) if available_skills is not None else None
         self._middlewares = list(middlewares) if middlewares else []
+        self._recursion_limit = recursion_limit
 
         # Lazy agent — created on first call, recreated when config changes.
         self._agent = None
@@ -239,7 +241,7 @@ class DeerFlowClient:
         return RunnableConfig(
             configurable=configurable,
             metadata=metadata,
-            recursion_limit=overrides.get("recursion_limit", 100),
+            recursion_limit=overrides.get("recursion_limit", self._recursion_limit),
         )
 
     @staticmethod
