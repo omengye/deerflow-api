@@ -11,10 +11,9 @@ from typing import Annotated, Any
 
 from langchain.tools import InjectedToolCallId, ToolRuntime
 from langchain_core.tools import StructuredTool
-from langgraph.typing import ContextT
 from pydantic import BaseModel, Field
 
-from deerflow.agents.thread_state import ThreadState
+from deerflow.agents.thread_state import AgentContext, ThreadState
 from deerflow.sandbox.security import LOCAL_BASH_SUBAGENT_DISABLED_MESSAGE, is_host_bash_allowed
 from deerflow.subagents import SubagentExecutor, get_available_subagent_names, get_subagent_config
 from deerflow.subagents.executor import SubagentStatus, cleanup_background_task, get_background_task_result, request_cancel_background_task
@@ -75,7 +74,7 @@ def _merge_skill_allowlists(parent: list[str] | None, child: list[str] | None) -
 
 # Core async implementation of the task tool.
 async def _task_tool_impl(
-    runtime: ToolRuntime[ContextT, ThreadState],
+    runtime: ToolRuntime[AgentContext, ThreadState],
     description: str,
     prompt: str,
     subagent_type: str,
@@ -339,7 +338,7 @@ def _create_task_tool() -> StructuredTool:
 
     @wraps(_task_tool_impl)
     def _sync_task_tool(
-        runtime: ToolRuntime[ContextT, ThreadState],
+        runtime: ToolRuntime[AgentContext, ThreadState],
         description: str,
         prompt: str,
         subagent_type: str,

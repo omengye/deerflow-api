@@ -9,10 +9,9 @@ from typing import Any
 from weakref import WeakValueDictionary
 
 from langchain.tools import ToolRuntime, tool
-from langgraph.typing import ContextT
 
 from deerflow.agents.lead_agent.prompt import refresh_skills_system_prompt_cache_async
-from deerflow.agents.thread_state import ThreadState
+from deerflow.agents.thread_state import AgentContext, ThreadState
 from deerflow.mcp.tools import _make_sync_tool_wrapper
 from deerflow.skills.manager import (
     append_history,
@@ -42,7 +41,7 @@ def _get_lock(name: str) -> asyncio.Lock:
     return lock
 
 
-def _get_thread_id(runtime: ToolRuntime[ContextT, ThreadState] | None) -> str | None:
+def _get_thread_id(runtime: ToolRuntime[AgentContext, ThreadState] | None) -> str | None:
     if runtime is None:
         return None
     if runtime.context and runtime.context.get("thread_id"):
@@ -76,7 +75,7 @@ async def _to_thread(func, /, *args, **kwargs):
 
 
 async def _skill_manage_impl(
-    runtime: ToolRuntime[ContextT, ThreadState],
+    runtime: ToolRuntime[AgentContext, ThreadState],
     action: str,
     name: str,
     content: str | None = None,
@@ -212,7 +211,7 @@ async def _skill_manage_impl(
 
 @tool("skill_manage", parse_docstring=True)
 async def skill_manage_tool(
-    runtime: ToolRuntime[ContextT, ThreadState],
+    runtime: ToolRuntime[AgentContext, ThreadState],
     action: str,
     name: str,
     content: str | None = None,

@@ -6,9 +6,8 @@ from typing import Annotated
 from langchain.tools import InjectedToolCallId, ToolRuntime, tool
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
-from langgraph.typing import ContextT
 
-from deerflow.agents.thread_state import ThreadDataState, ThreadState
+from deerflow.agents.thread_state import AgentContext, ThreadDataState, ThreadState
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
 
 _ALLOWED_IMAGE_VIRTUAL_ROOTS = (
@@ -48,7 +47,7 @@ def _sanitize_image_error(error: Exception, thread_data: ThreadDataState | None)
 
 @tool("view_image", parse_docstring=True)
 def view_image_tool(
-    runtime: ToolRuntime[ContextT, ThreadState],
+    runtime: ToolRuntime[AgentContext, ThreadState],
     image_path: str,
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> Command:
