@@ -71,7 +71,7 @@ class FeishuChannel:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self, main_loop: asyncio.AbstractEventLoop) -> None:
+    async def start(self, main_loop: asyncio.AbstractEventLoop) -> None:
         """Build the Feishu client, fetch bot info, and start the WS thread."""
         import lark_oapi as lark
 
@@ -82,7 +82,7 @@ class FeishuChannel:
             .app_secret(self._app_secret)
             .build()
         )
-        self._fetch_bot_info()
+        await self._fetch_bot_info()
         self._ws_thread = threading.Thread(
             target=self._run_ws, daemon=True, name="feishu-ws"
         )
@@ -103,13 +103,16 @@ class FeishuChannel:
     # Internal: WebSocket thread
     # ------------------------------------------------------------------
 
-    def _fetch_bot_info(self) -> None:
+    async def _fetch_bot_info(self) -> None:
+        # lark-oapi 1.6.x removed `lark_oapi.api.bot.v3`; the SDK now exposes
+        # bot identity via the channel helper, which calls /bot/v3/info on the
+        # raw transport (and falls back to /application/v6).
         try:
-            from lark_oapi.api.bot.v3 import BotGetRequest
+            from lark_oapi.channel.bot_identity import fetch_bot_identity
 
-            resp = self._lark_client.bot.v3.bot.get(BotGetRequest.builder().build())
-            if resp.success() and resp.data and resp.data.bot:
-                self._bot_open_id = resp.data.bot.open_id
+            identity = await fetch_bot_identity(self._lark_client.config)
+            if identity and identity.open_id:
+                self._bot_open_id = identity.open_id
         except Exception:
             logger.warning(
                 "Could not fetch Feishu bot open_id; group @-filter disabled",

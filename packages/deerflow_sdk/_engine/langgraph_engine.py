@@ -3,10 +3,20 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import AsyncIterator
-from typing import Any, cast
+from typing import Any, NotRequired, TypedDict, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
+
+
+class _SdkAgentContext(TypedDict, total=False):
+    """Runtime context schema for the SDK engine's compiled graph.
+
+    Declared so Pydantic does not warn ("Expected `none` ...") when the
+    ``context={"thread_id": ...}`` dict is serialized by LangGraph internals.
+    """
+
+    thread_id: NotRequired[str]
 
 from deerflow_sdk._config import HarnessConfig, ModelConfig
 from deerflow_sdk._errors import ModelError, PermissionDenied
@@ -181,6 +191,7 @@ class LangGraphEngine:
             tools=lc_tools,
             system_prompt=self._config.system_prompt,
             state_schema=AgentState,
+            context_schema=_SdkAgentContext,
             checkpointer=None,
             name="deerflow_sdk",
         )

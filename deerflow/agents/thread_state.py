@@ -7,6 +7,18 @@ class SandboxState(TypedDict):
     sandbox_id: NotRequired[str | None]
 
 
+class AgentContext(TypedDict, total=False):
+    """Runtime context schema passed to LangGraph ``create_agent``.
+
+    Declared so Pydantic does not warn when middlewares (e.g. sandbox tools)
+    mutate ``runtime.context`` to add ``sandbox_id`` alongside ``thread_id``.
+    """
+
+    thread_id: NotRequired[str]
+    sandbox_id: NotRequired[str]
+    agent_name: NotRequired[str]
+
+
 class ThreadDataState(TypedDict):
     workspace_path: NotRequired[str | None]
     uploads_path: NotRequired[str | None]

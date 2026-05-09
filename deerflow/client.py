@@ -37,7 +37,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from deerflow.agents.lead_agent.agent import _build_middlewares
 from deerflow.agents.middlewares.subagent_limit_middleware import clamp_subagent_limit
 from deerflow.agents.lead_agent.prompt import apply_prompt_template
-from deerflow.agents.thread_state import ThreadState
+from deerflow.agents.thread_state import AgentContext, ThreadState
 from deerflow.config.agents_config import AGENT_NAME_PATTERN
 from deerflow.config.app_config import get_app_config, reload_app_config
 from deerflow.config.extensions_config import ExtensionsConfig, SkillStateConfig, get_extensions_config, reload_extensions_config
@@ -297,6 +297,7 @@ class DeerFlowClient:
                 available_skills=self._available_skills,
             ),
             "state_schema": ThreadState,
+            "context_schema": AgentContext,
         }
         checkpointer = self._checkpointer
         if checkpointer is None:

@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, cast
 from langchain.agents.middleware import AgentMiddleware
 
 from deerflow.agents.features import RuntimeFeatures
-from deerflow.agents.thread_state import ThreadState
+from deerflow.agents.thread_state import AgentContext, ThreadState
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
@@ -148,6 +148,7 @@ def create_deerflow_agent(
         middleware=effective_middleware,
         system_prompt=system_prompt,
         state_schema=effective_state,
+        context_schema=AgentContext,
         checkpointer=checkpointer,
         name=name,
     )

@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI):
                 app_secret=settings.feishu.app_secret,
                 verification_token=settings.feishu.verification_token,
             )
-            feishu_channel.start(asyncio.get_running_loop())
+            await feishu_channel.start(asyncio.get_running_loop())
         except ImportError:
             import logging
             logging.getLogger(__name__).warning(
