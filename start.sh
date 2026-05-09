@@ -14,7 +14,7 @@ READABILIPY_JSDIR="$(uv run python -c "import readabilipy.simple_json as m, os; 
 if [ -n "$READABILIPY_JSDIR" ] && [ ! -d "$READABILIPY_JSDIR/node_modules" ]; then
     if command -v npm &>/dev/null; then
         echo "📦 Installing Readability.js dependencies..."
-        npm install --prefix "$READABILIPY_JSDIR" --no-audit --no-fund --loglevel=error
+        (cd "$READABILIPY_JSDIR" && npm install --no-audit --no-fund --loglevel=error)
     else
         echo "⚠️  npm not found — Readability.js unavailable, falling back to pure-Python extraction."
     fi

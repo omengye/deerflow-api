@@ -3,8 +3,8 @@
 Message flow per incoming text:
   1. Add "OK" emoji reaction to acknowledge receipt
   2. Send an interactive card with "Working on it..."
-  3. Stream agent response; patch the card every _PATCH_INTERVAL seconds
-  4. Final patch with complete text; add "DONE" reaction
+  3. Stream agent response; bind each AI message id to one card
+  4. Patch the matching card every _PATCH_INTERVAL seconds; add "DONE" reaction
 
 Only @bot mentions in group chats are handled.  P2P chats always respond.
 thread_id is prefixed as "feishu:{chat_id}" to isolate from HTTP API threads.
@@ -206,6 +206,10 @@ class FeishuChannel:
             if not text:
                 return
 
+            if self._main_loop is None:
+                logger.error("Feishu channel received a message before start() initialised the main loop")
+                return
+
             fut = asyncio.run_coroutine_threadsafe(
                 self._handle_message(
                     message_id=message_id,
@@ -251,13 +255,10 @@ class FeishuChannel:
             await self._add_reaction(message_id, "OK")
             card_id = await self._send_card(chat_id, "⏳ Working on it...")
             try:
-                final_text = await self._stream_to_card(text, thread_id, card_id)
+                _ = await self._stream_to_cards(text, thread_id, chat_id, card_id)
             except Exception:
                 logger.exception("Stream error (thread=%s)", thread_id)
                 await self._patch_card(card_id, "❌ An error occurred. Please try again.")
-            else:
-                if final_text:
-                    await self._patch_card(card_id, final_text)
             finally:
                 await self._add_reaction(message_id, "DONE")
 
@@ -287,12 +288,21 @@ class FeishuChannel:
             else:
                 await self._send_card(chat_id, "❌ 重置失败，请稍后再试。")
 
-    async def _stream_to_card(self, text: str, thread_id: str, card_id: str) -> str:
-        """Consume astream(), accumulate AI text, throttle-patch card at 1 s intervals.
+    async def _stream_to_cards(
+        self,
+        text: str,
+        thread_id: str,
+        chat_id: str,
+        initial_card_id: str,
+    ) -> str:
+        """Consume astream(), updating one Feishu card per AI message id.
 
-        Groups deltas by message id (mirrors client.chat()) so that historical
+        Groups deltas by AI message id (mirrors client.chat()) so that historical
         messages replayed in LangGraph values-mode snapshots are not re-appended
-        to the current response.  Only the last AI message id's text is shown.
+        to the current response.  Each streaming AI message id owns exactly one
+        Feishu card: chunks with the same id patch that card, while a new id gets
+        a new card.  The initial "Working on it..." card is reused for the first
+        streaming AI message so the acknowledgement card does not become stale.
 
         Card patches are fired as background tasks so they never suspend the LLM
         streaming loop.  Suspending astream() mid-iteration while waiting for an
@@ -304,9 +314,58 @@ class FeishuChannel:
 
         client = await get_client_manager().get_async_client()
         chunks: dict[str, list[str]] = {}
-        last_id: str = ""
-        last_patch_at = time.monotonic()
-        patch_task: asyncio.Task | None = None
+        card_ids: dict[str, str] = {}
+        card_tasks: dict[str, asyncio.Task[str]] = {}
+        patch_tasks: dict[str, asyncio.Task[None]] = {}
+        last_patch_at: dict[str, float] = {}
+        last_id = ""
+        initial_card_bound = False
+
+        def ensure_card_for_message(msg_id: str, initial_content: str) -> None:
+            """Bind msg_id to a Feishu card, creating one in the background if needed."""
+            nonlocal initial_card_bound
+            if msg_id in card_ids or msg_id in card_tasks:
+                return
+            if initial_card_id and not initial_card_bound:
+                card_ids[msg_id] = initial_card_id
+                initial_card_bound = True
+                return
+            card_tasks[msg_id] = asyncio.create_task(
+                self._send_card(chat_id, initial_content or "⏳ Working on it...")
+            )
+
+        async def resolve_card_id(msg_id: str) -> str:
+            if msg_id in card_ids:
+                return card_ids[msg_id]
+            task = card_tasks.get(msg_id)
+            if task is None:
+                return ""
+            try:
+                card_id = await task
+            except Exception:
+                logger.warning("send_card task failed for AI message %s", msg_id, exc_info=True)
+                return ""
+            card_ids[msg_id] = card_id
+            return card_id
+
+        async def patch_message_card(msg_id: str, content: str) -> None:
+            card_id = await resolve_card_id(msg_id)
+            if card_id:
+                await self._patch_card(card_id, content)
+
+        async def drain_patch_task(msg_id: str) -> None:
+            task = patch_tasks.get(msg_id)
+            if task is None:
+                return
+            try:
+                await task
+            except Exception:
+                logger.warning("patch_card task failed for AI message %s", msg_id, exc_info=True)
+
+        def schedule_patch(msg_id: str, content: str) -> None:
+            task = patch_tasks.get(msg_id)
+            if task is None or task.done():
+                patch_tasks[msg_id] = asyncio.create_task(patch_message_card(msg_id, content))
 
         async for event in client.astream(text, thread_id=thread_id):
             if event.type == "messages-tuple":
@@ -320,28 +379,34 @@ class FeishuChannel:
                         content = data.get("content", "")
                         msg_id = data.get("id") or ""
                         # Exclude tool-call chunks — they have no displayable text.
-                        if isinstance(content, str) and content and not data.get("tool_calls"):
+                        if (
+                            msg_id
+                            and data.get("is_delta")
+                            and isinstance(content, str)
+                            and content
+                            and not data.get("tool_calls")
+                        ):
                             chunks.setdefault(msg_id, []).append(content)
-                            # Only advance last_id for messages-mode streaming deltas.
-                            # values-mode replays of historical messages have no is_delta
-                            # flag and must not overwrite the pointer to the current reply.
-                            if msg_id and data.get("is_delta"):
-                                last_id = msg_id
+                            ensure_card_for_message(msg_id, content)
+                            last_id = msg_id
 
-            current = "".join(chunks.get(last_id, ()))
-            if current and (time.monotonic() - last_patch_at) >= _PATCH_INTERVAL:
-                # Fire patch as a background task — do NOT await here so the
-                # async-for loop is never suspended waiting for the Feishu API.
-                if patch_task is None or patch_task.done():
-                    patch_task = asyncio.create_task(self._patch_card(card_id, current))
-                last_patch_at = time.monotonic()
+                            current = "".join(chunks[msg_id])
+                            now = time.monotonic()
+                            if current and (now - last_patch_at.get(msg_id, 0.0)) >= _PATCH_INTERVAL:
+                                # Fire patch as a background task — do NOT await here so the
+                                # async-for loop is never suspended waiting for the Feishu API.
+                                schedule_patch(msg_id, current)
+                                last_patch_at[msg_id] = now
 
-        # Ensure the last in-flight patch finishes before we return the final text.
-        if patch_task is not None and not patch_task.done():
-            try:
-                await patch_task
-            except Exception:
-                logger.warning("patch_card task failed", exc_info=True)
+        # Ensure in-flight patches finish before final full-content patches.  This
+        # prevents an older partial patch from racing after a final patch.
+        for msg_id in list(patch_tasks):
+            await drain_patch_task(msg_id)
+
+        for msg_id, parts in chunks.items():
+            final_text = "".join(parts)
+            if final_text:
+                await patch_message_card(msg_id, final_text)
 
         return "".join(chunks.get(last_id, ()))
 

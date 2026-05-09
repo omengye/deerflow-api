@@ -15,7 +15,9 @@ if defined READABILIPY_JSDIR (
         where npm >nul 2>&1
         if not errorlevel 1 (
             echo Installing Readability.js dependencies...
-            npm install --prefix "%READABILIPY_JSDIR%" --no-audit --no-fund --loglevel=error
+            pushd "%READABILIPY_JSDIR%"
+            npm install --no-audit --no-fund --loglevel=error
+            popd
         ) else (
             echo Warning: npm not found - Readability.js unavailable, falling back to pure-Python extraction.
         )
