@@ -15,6 +15,8 @@ uv sync
 
 # 3. 启动
 ./start.sh
+# 停止
+./stop.sh
 # 或手动启动：
 uv run uvicorn app:app --host 0.0.0.0 --port 8000 --app-dir app
 ```
@@ -72,6 +74,7 @@ deerflow-api/
 ├── config.example.yaml      # 配置模板
 ├── skills/public/           # 21 个内置 skills
 ├── start.sh                 # 启动脚本
+├── stop.sh                  # 停止脚本
 └── pyproject.toml           # uv 项目定义
 ```
 
