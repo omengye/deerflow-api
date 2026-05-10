@@ -10,8 +10,12 @@ Only @bot mentions in group chats are handled.  P2P chats always respond.
 thread_id is prefixed as "feishu:{chat_id}" to isolate from HTTP API threads.
 """
 import asyncio
+from dataclasses import dataclass
 import json
 import logging
+import mimetypes
+from pathlib import Path
+import tempfile
 import threading
 import time
 from typing import Any
@@ -20,6 +24,111 @@ logger = logging.getLogger(__name__)
 
 _PATCH_INTERVAL = 1.0  # seconds between card patch calls
 _RESET_COMMANDS = frozenset({"/new", "/reset"})
+_MAX_FEISHU_IMAGE_BYTES = 10 * 1024 * 1024
+_MAX_FEISHU_FILE_BYTES = 30 * 1024 * 1024
+_FEISHU_IMAGE_EXTENSIONS = frozenset(
+    {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".ico", ".tiff", ".heic"}
+)
+
+
+@dataclass(frozen=True)
+class _IncomingResource:
+    resource_type: str
+    resource_key: str
+    filename: str
+    message_id: str
+
+
+def _feishu_file_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix in {".doc", ".docx"}:
+        return "doc"
+    if suffix in {".xls", ".xlsx"}:
+        return "xls"
+    if suffix in {".ppt", ".pptx"}:
+        return "ppt"
+    if suffix == ".mp4":
+        return "mp4"
+    if suffix == ".opus":
+        return "opus"
+    return "stream"
+
+
+def _is_feishu_image(path: Path) -> bool:
+    if path.suffix.lower() in _FEISHU_IMAGE_EXTENSIONS:
+        return True
+    mime_type, _ = mimetypes.guess_type(path)
+    return bool(mime_type and mime_type.startswith("image/"))
+
+
+def _content_dict(raw_content: str | None) -> dict[str, Any]:
+    try:
+        content = json.loads(raw_content or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return content if isinstance(content, dict) else {}
+
+
+def _incoming_resources(message_type: str, message_id: str, content: dict[str, Any]) -> list[_IncomingResource]:
+    if message_type == "image":
+        image_key = content.get("image_key") or content.get("file_key")
+        if not isinstance(image_key, str) or not image_key:
+            return []
+        filename = content.get("file_name")
+        if not isinstance(filename, str) or not filename:
+            filename = f"{image_key}.png"
+        return [
+            _IncomingResource(
+                resource_type="image",
+                resource_key=image_key,
+                filename=filename,
+                message_id=message_id,
+            )
+        ]
+
+    if message_type == "file":
+        file_key = content.get("file_key")
+        if not isinstance(file_key, str) or not file_key:
+            return []
+        filename = content.get("file_name")
+        if not isinstance(filename, str) or not filename:
+            filename = file_key
+        return [
+            _IncomingResource(
+                resource_type="file",
+                resource_key=file_key,
+                filename=filename,
+                message_id=message_id,
+            )
+        ]
+
+    return []
+
+
+def _build_prompt_with_uploads(text: str, uploaded_files: list[dict[str, Any]]) -> str:
+    if not uploaded_files:
+        return text
+
+    lines = [text] if text else ["请处理用户通过飞书上传的文件。"]
+    lines.append("用户通过飞书上传的文件已保存到本轮会话的 /mnt/user-data/uploads：")
+    for uploaded in uploaded_files:
+        filename = uploaded.get("filename")
+        virtual_path = uploaded.get("virtual_path")
+        if isinstance(filename, str) and isinstance(virtual_path, str):
+            line = f"- {filename}: {virtual_path}"
+        elif isinstance(virtual_path, str):
+            line = f"- {virtual_path}"
+        else:
+            continue
+
+        markdown_virtual_path = uploaded.get("markdown_virtual_path")
+        if isinstance(markdown_virtual_path, str):
+            line = f"{line}（已转换 Markdown: {markdown_virtual_path}）"
+        lines.append(line)
+    lines.append("如需查看图片，请使用 view_image；如需返回生成文件，请保存到 /mnt/user-data/outputs 并调用 present_files。")
+    return "\n\n".join(lines)
 
 
 def _shutdown_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -170,7 +279,8 @@ class FeishuChannel:
             msg = data.event.message
             sender = data.event.sender
 
-            if msg.message_type != "text":
+            message_type: str = msg.message_type
+            if message_type not in {"text", "image", "file"}:
                 return
             if getattr(sender, "sender_type", None) == "app":
                 return
@@ -179,10 +289,11 @@ class FeishuChannel:
             chat_type: str = msg.chat_type
             message_id: str = msg.message_id
 
-            try:
-                raw_text: str = json.loads(msg.content or "{}").get("text", "")
-            except (json.JSONDecodeError, AttributeError):
-                return
+            content = _content_dict(msg.content)
+            raw_text = content.get("text", "") if message_type == "text" else ""
+            if not isinstance(raw_text, str):
+                raw_text = ""
+            resources = _incoming_resources(message_type, message_id, content)
 
             mentions: list[Any] = list(msg.mentions or [])
 
@@ -206,7 +317,7 @@ class FeishuChannel:
                     raw_text = raw_text.replace(key, "")
             text = raw_text.strip()
 
-            if not text:
+            if not text and not resources:
                 return
 
             if self._main_loop is None:
@@ -218,6 +329,7 @@ class FeishuChannel:
                     message_id=message_id,
                     chat_id=chat_id,
                     text=text,
+                    resources=resources,
                     thread_id=f"feishu_{chat_id}",
                 ),
                 self._main_loop,
@@ -243,9 +355,11 @@ class FeishuChannel:
         chat_id: str,
         text: str,
         thread_id: str,
+        resources: list[_IncomingResource] | None = None,
     ) -> None:
         """Full pipeline for one incoming message; serialised per chat_id."""
-        if text.lower() in _RESET_COMMANDS:
+        resources = resources or []
+        if not resources and text.lower() in _RESET_COMMANDS:
             await self._handle_reset(message_id=message_id, chat_id=chat_id, thread_id=thread_id)
             return
 
@@ -258,7 +372,11 @@ class FeishuChannel:
             await self._add_reaction(message_id, "OK")
             card_id = await self._send_card(chat_id, "⏳ Working on it...")
             try:
-                _ = await self._stream_to_cards(text, thread_id, chat_id, card_id)
+                prompt = text
+                if resources:
+                    uploaded_files = await self._save_incoming_resources(thread_id, resources)
+                    prompt = _build_prompt_with_uploads(text, uploaded_files)
+                _ = await self._stream_to_cards(prompt, thread_id, chat_id, card_id)
             except Exception:
                 logger.exception("Stream error (thread=%s)", thread_id)
                 await self._patch_card(card_id, "❌ An error occurred. Please try again.")
@@ -321,6 +439,8 @@ class FeishuChannel:
         card_tasks: dict[str, asyncio.Task[str]] = {}
         patch_tasks: dict[str, asyncio.Task[None]] = {}
         last_patch_at: dict[str, float] = {}
+        artifacts: list[str] = []
+        seen_artifacts: set[str] = set()
         last_id = ""
         initial_card_bound = False
 
@@ -370,6 +490,17 @@ class FeishuChannel:
             if task is None or task.done():
                 patch_tasks[msg_id] = asyncio.create_task(patch_message_card(msg_id, content))
 
+        def collect_artifacts(data: Any) -> None:
+            if not isinstance(data, dict):
+                return
+            raw_artifacts = data.get("artifacts")
+            if not isinstance(raw_artifacts, list):
+                return
+            for artifact in raw_artifacts:
+                if isinstance(artifact, str) and artifact not in seen_artifacts:
+                    seen_artifacts.add(artifact)
+                    artifacts.append(artifact)
+
         async for event in client.astream(text, thread_id=thread_id):
             if event.type == "messages-tuple":
                 data = event.data
@@ -400,6 +531,8 @@ class FeishuChannel:
                                 # async-for loop is never suspended waiting for the Feishu API.
                                 schedule_patch(msg_id, current)
                                 last_patch_at[msg_id] = now
+            elif event.type == "values":
+                collect_artifacts(event.data)
 
         # Ensure in-flight patches finish before final full-content patches.  This
         # prevents an older partial patch from racing after a final patch.
@@ -411,11 +544,169 @@ class FeishuChannel:
             if final_text:
                 await patch_message_card(msg_id, final_text)
 
+        sent_artifacts = await self._send_artifacts(chat_id, thread_id, artifacts)
+        if sent_artifacts and not chunks and initial_card_id:
+            await self._patch_card(initial_card_id, f"✅ 已发送 {sent_artifacts} 个生成文件。")
+
         return "".join(chunks.get(last_id, ()))
 
     # ------------------------------------------------------------------
     # Internal: Feishu API helpers (sync SDK wrapped in asyncio.to_thread)
     # ------------------------------------------------------------------
+
+    async def _save_incoming_resources(self, thread_id: str, resources: list[_IncomingResource]) -> list[dict[str, Any]]:
+        """Download Feishu message resources and register them as thread uploads."""
+        if not resources:
+            return []
+
+        from app.dependencies import get_client_manager
+        from deerflow.uploads.manager import claim_unique_filename, normalize_filename
+
+        with tempfile.TemporaryDirectory(prefix="feishu-incoming-") as tmpdir:
+            tmp_paths: list[Path] = []
+            seen_names: set[str] = set()
+            for resource in resources:
+                data, response_filename = await self._download_message_resource(resource)
+                filename = normalize_filename(response_filename or resource.filename)
+                tmp_name = claim_unique_filename(filename, seen_names)
+                tmp_path = Path(tmpdir) / tmp_name
+                tmp_path.write_bytes(data)
+                tmp_paths.append(tmp_path)
+
+            result = get_client_manager().get_client().upload_files(thread_id, tmp_paths)
+        files = result.get("files", []) if isinstance(result, dict) else []
+        return [item for item in files if isinstance(item, dict)]
+
+    async def _download_message_resource(self, resource: _IncomingResource) -> tuple[bytes, str]:
+        """Download one image/file resource from a Feishu message."""
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+
+        req = (
+            GetMessageResourceRequest.builder()
+            .message_id(resource.message_id)
+            .file_key(resource.resource_key)
+            .type(resource.resource_type)
+            .build()
+        )
+        resp = await asyncio.to_thread(self._lark_client.im.v1.message_resource.get, req)
+        if not resp.success():
+            raise RuntimeError(
+                f"Feishu resource download failed: code={resp.code} msg={resp.msg}"
+            )
+        file_obj = getattr(resp, "file", None)
+        if file_obj is None:
+            raise RuntimeError("Feishu resource download did not return a file stream")
+        data = await asyncio.to_thread(file_obj.read)
+        filename = getattr(resp, "file_name", "") or resource.filename
+        return data, filename
+
+    async def _send_artifacts(self, chat_id: str, thread_id: str, artifacts: list[str]) -> int:
+        """Upload agent-presented artifacts to Feishu and send them to chat_id."""
+        if not artifacts:
+            return 0
+
+        from deerflow.config.paths import get_paths
+
+        sent = 0
+        paths = get_paths()
+        for artifact in artifacts:
+            try:
+                artifact_path = paths.resolve_virtual_path(thread_id, artifact)
+                if not artifact_path.is_file():
+                    logger.warning("Skipping non-file Feishu artifact: %s", artifact)
+                    continue
+                await self._send_artifact(chat_id, artifact_path)
+                sent += 1
+            except Exception as exc:
+                logger.warning("Failed to send Feishu artifact %s", artifact, exc_info=True)
+                await self._send_card(
+                    chat_id,
+                    f"⚠️ 生成文件发送失败：{artifact}\n{type(exc).__name__}: {exc}",
+                )
+        return sent
+
+    async def _send_artifact(self, chat_id: str, artifact_path: Path) -> None:
+        size = artifact_path.stat().st_size
+        if _is_feishu_image(artifact_path) and size <= _MAX_FEISHU_IMAGE_BYTES:
+            image_key = await self._upload_image(artifact_path)
+            await self._send_resource_message(chat_id, "image", "image_key", image_key)
+            return
+
+        if size > _MAX_FEISHU_FILE_BYTES:
+            raise ValueError(
+                f"{artifact_path.name} is {size} bytes, exceeding Feishu file limit {_MAX_FEISHU_FILE_BYTES} bytes"
+            )
+
+        file_key = await self._upload_file(artifact_path)
+        await self._send_resource_message(chat_id, "file", "file_key", file_key)
+
+    async def _upload_image(self, path: Path) -> str:
+        """Upload an image to Feishu and return its image_key."""
+        from lark_oapi.api.im.v1 import CreateImageRequest, CreateImageRequestBody
+
+        with path.open("rb") as file:
+            req = (
+                CreateImageRequest.builder()
+                .request_body(
+                    CreateImageRequestBody.builder()
+                    .image_type("message")
+                    .image(file)
+                    .build()
+                )
+                .build()
+            )
+            resp = await asyncio.to_thread(self._lark_client.im.v1.image.create, req)
+        if not resp.success():
+            raise RuntimeError(f"Feishu image upload failed: code={resp.code} msg={resp.msg}")
+        image_key = getattr(resp.data, "image_key", "") if resp.data else ""
+        if not image_key:
+            raise RuntimeError("Feishu image upload did not return image_key")
+        return image_key
+
+    async def _upload_file(self, path: Path) -> str:
+        """Upload a file to Feishu and return its file_key."""
+        from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
+
+        with path.open("rb") as file:
+            req = (
+                CreateFileRequest.builder()
+                .request_body(
+                    CreateFileRequestBody.builder()
+                    .file_type(_feishu_file_type(path))
+                    .file_name(path.name)
+                    .file(file)
+                    .build()
+                )
+                .build()
+            )
+            resp = await asyncio.to_thread(self._lark_client.im.v1.file.create, req)
+        if not resp.success():
+            raise RuntimeError(f"Feishu file upload failed: code={resp.code} msg={resp.msg}")
+        file_key = getattr(resp.data, "file_key", "") if resp.data else ""
+        if not file_key:
+            raise RuntimeError("Feishu file upload did not return file_key")
+        return file_key
+
+    async def _send_resource_message(self, chat_id: str, msg_type: str, key_name: str, key: str) -> str:
+        """Send an uploaded Feishu image/file resource to a chat."""
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+
+        req = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type(msg_type)
+                .content(json.dumps({key_name: key}, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        resp = await asyncio.to_thread(self._lark_client.im.v1.message.create, req)
+        if not resp.success():
+            raise RuntimeError(f"Feishu {msg_type} send failed: code={resp.code} msg={resp.msg}")
+        return (resp.data.message_id or "") if resp.data else ""
 
     async def _send_card(self, chat_id: str, content: str) -> str:
         """Send an interactive card to chat_id; return the Feishu message_id."""
