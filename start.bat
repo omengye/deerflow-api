@@ -36,7 +36,19 @@ if exist ".\config.yaml" (
 )
 
 REM Start uvicorn
-if not defined PORT set PORT=8000
-if not defined HOST set HOST=0.0.0.0
-echo Starting DeerFlow API on http://%HOST%:%PORT%
-uv run uvicorn app:app --host %HOST% --port %PORT%
+if defined HOST (
+    set APP_HOST=%HOST%
+) else (
+    for /f "delims=" %%h in ('uv run python scripts\read_api_config.py host 0.0.0.0 2^>nul') do set APP_HOST=%%h
+)
+if not defined APP_HOST set APP_HOST=0.0.0.0
+
+if defined PORT (
+    set APP_PORT=%PORT%
+) else (
+    for /f "delims=" %%p in ('uv run python scripts\read_api_config.py port 8000 2^>nul') do set APP_PORT=%%p
+)
+if not defined APP_PORT set APP_PORT=8000
+
+echo Starting DeerFlow API on http://%APP_HOST%:%APP_PORT%
+uv run uvicorn app:app --host %APP_HOST% --port %APP_PORT%
