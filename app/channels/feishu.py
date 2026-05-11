@@ -29,6 +29,7 @@ _MAX_FEISHU_FILE_BYTES = 30 * 1024 * 1024
 _FEISHU_IMAGE_EXTENSIONS = frozenset(
     {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".ico", ".tiff", ".heic"}
 )
+_VIEW_IMAGE_SUPPORTED_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,36 @@ def _is_feishu_image(path: Path) -> bool:
         return True
     mime_type, _ = mimetypes.guess_type(path)
     return bool(mime_type and mime_type.startswith("image/"))
+
+
+def _detect_supported_image_extension(data: bytes) -> str | None:
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def _filename_for_incoming_resource(resource: _IncomingResource, response_filename: str, data: bytes) -> str:
+    filename = response_filename or resource.filename
+    if resource.resource_type != "image":
+        return filename
+
+    detected_suffix = _detect_supported_image_extension(data)
+    if detected_suffix is None:
+        return filename
+
+    suffix = Path(filename).suffix.lower()
+    if suffix == detected_suffix or (detected_suffix == ".jpg" and suffix == ".jpeg"):
+        return filename
+
+    if suffix in _VIEW_IMAGE_SUPPORTED_EXTENSIONS:
+        return f"{Path(filename).stem}{detected_suffix}"
+    if not suffix:
+        return f"{filename}{detected_suffix}"
+    return filename
 
 
 def _content_dict(raw_content: str | None) -> dict[str, Any]:
@@ -127,7 +158,8 @@ def _build_prompt_with_uploads(text: str, uploaded_files: list[dict[str, Any]]) 
         if isinstance(markdown_virtual_path, str):
             line = f"{line}（已转换 Markdown: {markdown_virtual_path}）"
         lines.append(line)
-    lines.append("如需查看图片，请使用 view_image；如需返回生成文件，请保存到 /mnt/user-data/outputs 并调用 present_files。")
+    lines.append("如需查看图片，请使用 view_image；如需读取文档，请优先使用 read_file、grep 或 glob。")
+    lines.append("如需返回生成文件，请保存到 /mnt/user-data/outputs 并调用 present_files。")
     return "\n\n".join(lines)
 
 
@@ -175,6 +207,9 @@ class FeishuChannel:
         self._bot_open_id: str | None = None
         # Keyed by chat_id; values are asyncio.Lock used inside _main_loop.
         self._chat_locks: dict[str, asyncio.Lock] = {}
+        # Feishu receives full-state snapshots on every turn. Track artifacts
+        # already sent per thread so historical generated files are not resent.
+        self._sent_artifacts_by_thread: dict[str, set[str]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -374,7 +409,19 @@ class FeishuChannel:
             try:
                 prompt = text
                 if resources:
-                    uploaded_files = await self._save_incoming_resources(thread_id, resources)
+                    try:
+                        uploaded_files = await self._save_incoming_resources(thread_id, resources)
+                    except Exception as exc:
+                        logger.exception("Failed to save Feishu resources (thread=%s)", thread_id)
+                        await self._patch_card(
+                            card_id,
+                            f"⚠️ 文件下载或保存失败，请稍后重试。\n{type(exc).__name__}: {exc}",
+                        )
+                        return
+                    if not uploaded_files:
+                        logger.warning("Feishu resources produced no uploaded files (thread=%s)", thread_id)
+                        await self._patch_card(card_id, "⚠️ 没有成功保存飞书上传的文件，请稍后重试。")
+                        return
                     prompt = _build_prompt_with_uploads(text, uploaded_files)
                 _ = await self._stream_to_cards(prompt, thread_id, chat_id, card_id)
             except Exception:
@@ -401,6 +448,7 @@ class FeishuChannel:
             result = get_client_manager().delete_thread_completely(thread_id)
             # Remove the lock entry so the next message starts with a clean state.
             self._chat_locks.pop(chat_id, None)
+            self._sent_artifacts_by_thread.pop(thread_id, None)
             await self._add_reaction(message_id, "DONE")
             if result.get("success"):
                 await self._send_card(chat_id, "✅ 会话已重置，开始新对话吧！")
@@ -441,6 +489,7 @@ class FeishuChannel:
         last_patch_at: dict[str, float] = {}
         artifacts: list[str] = []
         seen_artifacts: set[str] = set()
+        sent_artifact_paths = self._sent_artifacts_by_thread.setdefault(thread_id, set())
         last_id = ""
         initial_card_bound = False
 
@@ -497,7 +546,11 @@ class FeishuChannel:
             if not isinstance(raw_artifacts, list):
                 return
             for artifact in raw_artifacts:
-                if isinstance(artifact, str) and artifact not in seen_artifacts:
+                if (
+                    isinstance(artifact, str)
+                    and artifact not in seen_artifacts
+                    and artifact not in sent_artifact_paths
+                ):
                     seen_artifacts.add(artifact)
                     artifacts.append(artifact)
 
@@ -544,9 +597,9 @@ class FeishuChannel:
             if final_text:
                 await patch_message_card(msg_id, final_text)
 
-        sent_artifacts = await self._send_artifacts(chat_id, thread_id, artifacts)
-        if sent_artifacts and not chunks and initial_card_id:
-            await self._patch_card(initial_card_id, f"✅ 已发送 {sent_artifacts} 个生成文件。")
+        sent_artifact_count = await self._send_artifacts(chat_id, thread_id, artifacts)
+        if sent_artifact_count and not chunks and initial_card_id:
+            await self._patch_card(initial_card_id, f"✅ 已发送 {sent_artifact_count} 个生成文件。")
 
         return "".join(chunks.get(last_id, ()))
 
@@ -567,13 +620,14 @@ class FeishuChannel:
             seen_names: set[str] = set()
             for resource in resources:
                 data, response_filename = await self._download_message_resource(resource)
-                filename = normalize_filename(response_filename or resource.filename)
+                filename = normalize_filename(_filename_for_incoming_resource(resource, response_filename, data))
                 tmp_name = claim_unique_filename(filename, seen_names)
                 tmp_path = Path(tmpdir) / tmp_name
                 tmp_path.write_bytes(data)
                 tmp_paths.append(tmp_path)
 
-            result = get_client_manager().get_client().upload_files(thread_id, tmp_paths)
+            client = get_client_manager().get_client()
+            result = await asyncio.to_thread(client.upload_files, thread_id, tmp_paths)
         files = result.get("files", []) if isinstance(result, dict) else []
         return [item for item in files if isinstance(item, dict)]
 
@@ -597,7 +651,9 @@ class FeishuChannel:
         if file_obj is None:
             raise RuntimeError("Feishu resource download did not return a file stream")
         data = await asyncio.to_thread(file_obj.read)
-        filename = getattr(resp, "file_name", "") or resource.filename
+        if not isinstance(data, bytes):
+            raise RuntimeError("Feishu resource download did not return bytes")
+        filename = getattr(resp, "file_name", "") or ""
         return data, filename
 
     async def _send_artifacts(self, chat_id: str, thread_id: str, artifacts: list[str]) -> int:
@@ -616,6 +672,7 @@ class FeishuChannel:
                     logger.warning("Skipping non-file Feishu artifact: %s", artifact)
                     continue
                 await self._send_artifact(chat_id, artifact_path)
+                self._sent_artifacts_by_thread.setdefault(thread_id, set()).add(artifact)
                 sent += 1
             except Exception as exc:
                 logger.warning("Failed to send Feishu artifact %s", artifact, exc_info=True)

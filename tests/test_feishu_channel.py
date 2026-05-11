@@ -4,7 +4,7 @@ from typing import Any, override
 import unittest
 
 from app import dependencies
-from app.channels.feishu import FeishuChannel, _IncomingResource, _incoming_resources
+from app.channels.feishu import FeishuChannel, _IncomingResource, _filename_for_incoming_resource, _incoming_resources
 from deerflow.client import StreamEvent
 
 
@@ -38,6 +38,7 @@ class _RecordingFeishuChannel(FeishuChannel):
         self.sent_artifacts: list[tuple[str, str, tuple[str, ...]]] = []
         self.saved_resources: list[tuple[str, tuple[str, ...]]] = []
         self.incoming_uploads: list[dict[str, Any]] = []
+        self.resource_save_error: Exception | None = None
         self.operation_log: list[str] = []
         self._next_card_number: int = 1
         self.release_send_card: asyncio.Event | None = None
@@ -88,11 +89,16 @@ class _RecordingFeishuChannel(FeishuChannel):
 
     @override
     async def _send_artifacts(self, chat_id: str, thread_id: str, artifacts: list[str]) -> int:
+        if not artifacts:
+            return 0
         self.sent_artifacts.append((chat_id, thread_id, tuple(artifacts)))
+        self._sent_artifacts_by_thread.setdefault(thread_id, set()).update(artifacts)
         return len(artifacts)
 
     @override
     async def _save_incoming_resources(self, thread_id: str, resources: list[_IncomingResource]) -> list[dict[str, Any]]:
+        if self.resource_save_error is not None:
+            raise self.resource_save_error
         self.saved_resources.append((thread_id, tuple(resource.resource_key for resource in resources)))
         return self.incoming_uploads
 
@@ -236,6 +242,29 @@ class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(channel.patched_cards, [("initial-card", "✅ 已发送 2 个生成文件。")])
 
+    async def test_stream_does_not_resend_artifacts_already_sent_for_thread(self) -> None:
+        channel = _RecordingFeishuChannel()
+        first_client = _FakeClient(
+            [
+                StreamEvent(type="values", data={"artifacts": ["/mnt/user-data/outputs/image.png"]}),
+                StreamEvent(type="end", data={}),
+            ]
+        )
+        second_client = _FakeClient(
+            [
+                StreamEvent(type="values", data={"artifacts": ["/mnt/user-data/outputs/image.png"]}),
+                StreamEvent(type="end", data={}),
+            ]
+        )
+
+        _ = await channel.stream_to_cards(first_client)
+        _ = await channel.stream_to_cards(second_client)
+
+        self.assertEqual(
+            channel.sent_artifacts,
+            [("chat-1", "thread-1", ("/mnt/user-data/outputs/image.png",))],
+        )
+
     async def test_incoming_resources_parse_image_and_file_content(self) -> None:
         image_resources = _incoming_resources("image", "message-1", {"image_key": "img-key"})
         file_resources = _incoming_resources("file", "message-2", {"file_key": "file-key", "file_name": "report.pdf"})
@@ -248,6 +277,18 @@ class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
             file_resources,
             [_IncomingResource(resource_type="file", resource_key="file-key", filename="report.pdf", message_id="message-2")],
         )
+
+    async def test_incoming_image_filename_matches_downloaded_bytes(self) -> None:
+        resource = _IncomingResource(
+            resource_type="image",
+            resource_key="img-key",
+            filename="img-key.png",
+            message_id="message-1",
+        )
+
+        filename = _filename_for_incoming_resource(resource, "", b"\xff\xd8\xff\x00")
+
+        self.assertEqual(filename, "img-key.jpg")
 
     async def test_handle_message_passes_downloaded_resource_paths_to_agent(self) -> None:
         fake_client = _FakeClient(
@@ -280,6 +321,63 @@ class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("分析这张图", fake_client.last_message or "")
         self.assertIn("/mnt/user-data/uploads/photo.png", fake_client.last_message or "")
         self.assertIn("view_image", fake_client.last_message or "")
+
+    async def test_handle_message_passes_file_markdown_path_to_agent(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "done", "id": "ai-1", "is_delta": True}),
+                StreamEvent(type="end", data={}),
+            ]
+        )
+        channel = _RecordingFeishuChannel()
+        channel.incoming_uploads = [
+            {
+                "filename": "report.pdf",
+                "virtual_path": "/mnt/user-data/uploads/report.pdf",
+                "markdown_virtual_path": "/mnt/user-data/uploads/report.md",
+            }
+        ]
+        resources = [
+            _IncomingResource(
+                resource_type="file",
+                resource_key="file-key",
+                filename="report.pdf",
+                message_id="user-message",
+            )
+        ]
+
+        await channel.handle_message_for_test(fake_client, text="", resources=resources)
+
+        self.assertEqual(channel.saved_resources, [("thread-1", ("file-key",))])
+        self.assertIsNotNone(fake_client.last_message)
+        self.assertIn("请处理用户通过飞书上传的文件。", fake_client.last_message or "")
+        self.assertIn("/mnt/user-data/uploads/report.pdf", fake_client.last_message or "")
+        self.assertIn("/mnt/user-data/uploads/report.md", fake_client.last_message or "")
+        self.assertIn("read_file", fake_client.last_message or "")
+
+    async def test_handle_message_reports_resource_save_error_without_streaming(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "should not run", "id": "ai-1", "is_delta": True}),
+                StreamEvent(type="end", data={}),
+            ]
+        )
+        channel = _RecordingFeishuChannel()
+        channel.resource_save_error = RuntimeError("download failed")
+        resources = [
+            _IncomingResource(
+                resource_type="image",
+                resource_key="img-key",
+                filename="photo.png",
+                message_id="user-message",
+            )
+        ]
+
+        await channel.handle_message_for_test(fake_client, text="分析这张图", resources=resources)
+
+        self.assertIsNone(fake_client.last_message)
+        self.assertEqual(channel.patched_cards, [("card-1", "⚠️ 文件下载或保存失败，请稍后重试。\nRuntimeError: download failed")])
+        self.assertEqual(channel.reactions, [("user-message", "OK"), ("user-message", "DONE")])
 
     async def test_handle_message_adds_done_reaction_after_stream_finishes(self) -> None:
         fake_client = _FakeClient(
