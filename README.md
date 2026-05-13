@@ -54,6 +54,52 @@ tracing:
 
 仍建议保留在环境变量中的只有进程级或系统级凭据/变量，例如 `CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`、`ANTHROPIC_AUTH_TOKEN`、`HOME`、`SystemRoot` 等。
 
+## Windows 沙箱（WSL 模式）
+
+Windows 上 `LocalSandboxProvider` 会回退到 PowerShell/cmd.exe，与上游 agent prompts 的 bash 语义不兼容；同时开启 `allow_host_bash: true` 后 LLM 命令直接在 Windows 主机权限下执行，没有任何隔离。
+
+为此提供 `LocalWslProvider`：**bash 跑进 WSL2，文件 I/O 仍在 Windows 上**——agent prompt 原生可用，进程层面有 VM 隔离，性能与现有线程目录全部沿用。
+
+### 前提
+- Windows 10/11 + 已安装 WSL2 与一个 Linux distro（推荐 `Ubuntu-22.04`）
+- WSL 版本 ≥ 0.64.0（启用 `WSL_UTF8` 环境变量支持，避免输出乱码）
+- 用 `wsl -l -v` 确认 distro 存在且为 Version 2
+
+### 启用方式
+编辑 `config.yaml` 的 `sandbox:` 段：
+
+```yaml
+sandbox:
+  use: deerflow.sandbox.local:LocalWslProvider   # 也可以写短别名 'wsl'
+  wsl_distro: Ubuntu-22.04       # 留空则使用默认 distro
+  wsl_user: null                 # 留空则使用 distro 的默认用户
+  wsl_shell: bash                # 也可以填 zsh
+  wsl_mount_prefix: /mnt         # 与 /etc/wsl.conf 的 automount.root 一致
+```
+
+不需要再开 `allow_host_bash`——非 local provider 默认放行 bash 工具与 bash 子代理。
+
+### 路径映射
+agent 看到的虚拟路径 → Windows 主机路径 → WSL 路径自动来回翻译：
+
+| Agent 视角 | Windows 实际位置 | WSL 视角 |
+|---|---|---|
+| `/mnt/user-data/workspace/x.py` | `D:\Tools\deerflow-api\data\threads\<tid>\user-data\workspace\x.py` | `/mnt/d/Tools/deerflow-api/data/threads/<tid>/user-data/workspace/x.py` |
+| `/mnt/skills/<name>` | `D:\Tools\deerflow-api\skills\<name>` | `/mnt/d/Tools/deerflow-api/skills/<name>` |
+
+bash 输出里的 `/mnt/<drive>/...` 会被自动还原成虚拟路径再返回给 agent，主机绝对路径不会泄漏。
+
+### 安全说明
+- **不是真"安全沙箱"**：WSL2 默认能读写 `/mnt/c/...`、能访问 `%USERPROFILE%`。比直跑 PowerShell 安全一个量级，但弱于 Docker/AioSandbox。
+- 启动失败有明确报错：未装 WSL、`wsl.exe` 不在 PATH、distro 未注册、非 Windows 主机都会在启动期硬失败。
+- 真要强隔离仍需后续移植 `AioSandboxProvider` + Docker Desktop。
+
+### 故障排查
+- `WslUnavailableError: wsl.exe was not found` → 安装 WSL：`wsl --install`
+- `WslDistroNotFoundError: ...is not registered` → 检查 `wsl -l -q` 输出，确认配置的 `wsl_distro` 拼写
+- bash 输出乱码 → 升级 WSL：`wsl --update`（需 ≥ 0.64.0 以支持 `WSL_UTF8`）
+- `bash` 工具返回 `Host bash execution is disabled` → 确认 `sandbox.use` 真的指向 `wsl` 而不是 local
+
 ## 项目结构
 
 ```

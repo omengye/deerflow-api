@@ -53,6 +53,16 @@ sandbox:
   use: deerflow.sandbox.local:LocalSandboxProvider
   allow_host_bash: false
 
+# WSL mode (Windows only): bash runs inside a WSL2 distro while file I/O
+# stays on the Windows filesystem. Host bash is auto-allowed for non-local
+# providers, so 'allow_host_bash' is not needed.
+# sandbox:
+#   use: deerflow.sandbox.local:LocalWslProvider   # short alias: 'wsl'
+#   wsl_distro: Ubuntu-22.04          # omit to use the default distro
+#   wsl_user: null                    # omit to use the distro's default user
+#   wsl_shell: bash
+#   wsl_mount_prefix: /mnt
+
 skills:
   enabled: true
   path: ./skills

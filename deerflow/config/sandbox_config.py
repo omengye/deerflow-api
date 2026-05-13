@@ -25,6 +25,18 @@ class SandboxConfig(BaseModel):
         idle_timeout: Idle timeout in seconds before sandbox is released (default: 600 = 10 minutes). Set to 0 to disable.
         mounts: List of volume mounts to share directories with the container
         environment: Environment variables to inject into the container (values starting with $ are resolved from host env)
+
+    LocalWslProvider specific options (Windows only):
+        wsl_distro: WSL distro name (e.g. "Ubuntu-22.04"). If None, the default
+            distro is used.
+        wsl_user: User to run commands as inside the WSL distro. If None, the
+            distro's default user is used.
+        wsl_shell: Shell executable inside the distro (default: "bash"). Always
+            invoked with the ``-lc`` flag so that PATH/venv setup in the user's
+            login shell rc files takes effect.
+        wsl_mount_prefix: Mount prefix used by WSL for Windows drives (default:
+            "/mnt"). Override if the distro's /etc/wsl.conf customizes
+            automount.root.
     """
 
     use: str = Field(
@@ -78,6 +90,23 @@ class SandboxConfig(BaseModel):
         default=20000,
         ge=0,
         description="Maximum characters to keep from ls tool output. Output exceeding this limit is head-truncated. Set to 0 to disable truncation.",
+    )
+
+    wsl_distro: str | None = Field(
+        default=None,
+        description="WSL distro name for LocalWslProvider (e.g. 'Ubuntu-22.04'). None uses the default distro.",
+    )
+    wsl_user: str | None = Field(
+        default=None,
+        description="User to run commands as inside the WSL distro. None uses the distro's default user.",
+    )
+    wsl_shell: str = Field(
+        default="bash",
+        description="Shell executable inside the WSL distro. Invoked with '-lc' for login-shell semantics.",
+    )
+    wsl_mount_prefix: str = Field(
+        default="/mnt",
+        description="Mount prefix used by WSL for Windows drives. Override if /etc/wsl.conf customizes automount.root.",
     )
 
     model_config = ConfigDict(extra="allow")

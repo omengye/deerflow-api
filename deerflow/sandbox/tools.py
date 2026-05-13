@@ -1001,11 +1001,17 @@ def get_thread_data(runtime: ToolRuntime[AgentContext, ThreadState] | None) -> T
     return runtime.state.get("thread_data")
 
 
-def is_local_sandbox(runtime: ToolRuntime[AgentContext, ThreadState] | None) -> bool:
-    """Check if the current sandbox is a local sandbox.
+_HOST_FS_SANDBOX_IDS: frozenset[str] = frozenset({"local", "wsl"})
 
-    Path replacement is only needed for local sandbox since aio sandbox
-    already has /mnt/user-data mounted in the container.
+
+def is_host_fs_sandbox(runtime: ToolRuntime[AgentContext, ThreadState] | None) -> bool:
+    """Check if the current sandbox stores files on the host filesystem.
+
+    Both LocalSandbox (host-direct) and WslSandbox (Windows host filesystem,
+    bash inside WSL VM) need virtual-path resolution, host-path masking, and
+    pre-execution path validation. AioSandbox-style providers (Docker, k8s)
+    already mount /mnt/user-data natively in the container, so the tool layer
+    skips translation for them.
     """
     if runtime is None:
         return False
@@ -1014,7 +1020,13 @@ def is_local_sandbox(runtime: ToolRuntime[AgentContext, ThreadState] | None) -> 
     sandbox_state = runtime.state.get("sandbox")
     if sandbox_state is None:
         return False
-    return sandbox_state.get("sandbox_id") == "local"
+    return sandbox_state.get("sandbox_id") in _HOST_FS_SANDBOX_IDS
+
+
+# Back-compat alias. The historical name implied "local-only" semantics; the
+# helper now also covers WslSandbox, since both share the host-filesystem
+# behaviour that gates path translation/validation in the tool layer.
+is_local_sandbox = is_host_fs_sandbox
 
 
 def sandbox_from_runtime(runtime: ToolRuntime[AgentContext, ThreadState] | None = None) -> Sandbox:

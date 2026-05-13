@@ -10,94 +10,97 @@ logger = logging.getLogger(__name__)
 _singleton: LocalSandbox | None = None
 
 
+def build_host_fs_path_mappings() -> list[PathMapping]:
+    """
+    Build path mappings for host-filesystem-backed sandboxes.
+
+    Maps container paths to actual local paths, including the skills directory
+    and any custom mounts configured in ``config.yaml``. Shared by
+    ``LocalSandboxProvider`` and ``LocalWslProvider`` because both store
+    files on the host filesystem and expose them through virtual container
+    paths to the agent.
+
+    Returns:
+        List of path mappings.
+    """
+    mappings: list[PathMapping] = []
+
+    try:
+        from deerflow.config import get_app_config
+
+        config = get_app_config()
+        skills_path = config.skills.get_skills_path()
+        container_path = config.skills.container_path
+
+        # Only add mapping if skills directory exists
+        if skills_path.exists():
+            mappings.append(
+                PathMapping(
+                    container_path=container_path,
+                    local_path=str(skills_path),
+                    read_only=True,  # Skills directory is always read-only
+                )
+            )
+
+        # Map custom mounts from sandbox config
+        _RESERVED_CONTAINER_PREFIXES = [container_path, "/mnt/acp-workspace", "/mnt/user-data"]
+        sandbox_config = config.sandbox
+        if sandbox_config and sandbox_config.mounts:
+            for mount in sandbox_config.mounts:
+                host_path = Path(mount.host_path)
+                container_path = mount.container_path.rstrip("/") or "/"
+
+                if not host_path.is_absolute():
+                    logger.warning(
+                        "Mount host_path must be absolute, skipping: %s -> %s",
+                        mount.host_path,
+                        mount.container_path,
+                    )
+                    continue
+
+                if not container_path.startswith("/"):
+                    logger.warning(
+                        "Mount container_path must be absolute, skipping: %s -> %s",
+                        mount.host_path,
+                        mount.container_path,
+                    )
+                    continue
+
+                # Reject mounts that conflict with reserved container paths
+                if any(container_path == p or container_path.startswith(p + "/") for p in _RESERVED_CONTAINER_PREFIXES):
+                    logger.warning(
+                        "Mount container_path conflicts with reserved prefix, skipping: %s",
+                        mount.container_path,
+                    )
+                    continue
+                # Ensure the host path exists before adding mapping
+                if host_path.exists():
+                    mappings.append(
+                        PathMapping(
+                            container_path=container_path,
+                            local_path=str(host_path.resolve()),
+                            read_only=mount.read_only,
+                        )
+                    )
+                else:
+                    logger.warning(
+                        "Mount host_path does not exist, skipping: %s -> %s",
+                        mount.host_path,
+                        mount.container_path,
+                    )
+    except Exception as e:
+        # Log but don't fail if config loading fails
+        logger.warning("Could not setup path mappings: %s", e, exc_info=True)
+
+    return mappings
+
+
 class LocalSandboxProvider(SandboxProvider):
     uses_thread_data_mounts = True
 
     def __init__(self):
         """Initialize the local sandbox provider with path mappings."""
-        self._path_mappings = self._setup_path_mappings()
-
-    def _setup_path_mappings(self) -> list[PathMapping]:
-        """
-        Setup path mappings for local sandbox.
-
-        Maps container paths to actual local paths, including skills directory
-        and any custom mounts configured in config.yaml.
-
-        Returns:
-            List of path mappings
-        """
-        mappings: list[PathMapping] = []
-
-        # Map skills container path to local skills directory
-        try:
-            from deerflow.config import get_app_config
-
-            config = get_app_config()
-            skills_path = config.skills.get_skills_path()
-            container_path = config.skills.container_path
-
-            # Only add mapping if skills directory exists
-            if skills_path.exists():
-                mappings.append(
-                    PathMapping(
-                        container_path=container_path,
-                        local_path=str(skills_path),
-                        read_only=True,  # Skills directory is always read-only
-                    )
-                )
-
-            # Map custom mounts from sandbox config
-            _RESERVED_CONTAINER_PREFIXES = [container_path, "/mnt/acp-workspace", "/mnt/user-data"]
-            sandbox_config = config.sandbox
-            if sandbox_config and sandbox_config.mounts:
-                for mount in sandbox_config.mounts:
-                    host_path = Path(mount.host_path)
-                    container_path = mount.container_path.rstrip("/") or "/"
-
-                    if not host_path.is_absolute():
-                        logger.warning(
-                            "Mount host_path must be absolute, skipping: %s -> %s",
-                            mount.host_path,
-                            mount.container_path,
-                        )
-                        continue
-
-                    if not container_path.startswith("/"):
-                        logger.warning(
-                            "Mount container_path must be absolute, skipping: %s -> %s",
-                            mount.host_path,
-                            mount.container_path,
-                        )
-                        continue
-
-                    # Reject mounts that conflict with reserved container paths
-                    if any(container_path == p or container_path.startswith(p + "/") for p in _RESERVED_CONTAINER_PREFIXES):
-                        logger.warning(
-                            "Mount container_path conflicts with reserved prefix, skipping: %s",
-                            mount.container_path,
-                        )
-                        continue
-                    # Ensure the host path exists before adding mapping
-                    if host_path.exists():
-                        mappings.append(
-                            PathMapping(
-                                container_path=container_path,
-                                local_path=str(host_path.resolve()),
-                                read_only=mount.read_only,
-                            )
-                        )
-                    else:
-                        logger.warning(
-                            "Mount host_path does not exist, skipping: %s -> %s",
-                            mount.host_path,
-                            mount.container_path,
-                        )
-        except Exception as e:
-            # Log but don't fail if config loading fails
-            logger.warning("Could not setup path mappings: %s", e, exc_info=True)
-
-        return mappings
+        self._path_mappings = build_host_fs_path_mappings()
 
     def acquire(self, thread_id: str | None = None) -> str:
         global _singleton
