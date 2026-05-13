@@ -56,6 +56,7 @@ def test_aio_provider_mounts_thread_data_and_skills(tmp_path, monkeypatch) -> No
             idle_timeout=600,
             environment={"TOKEN": "$TOKEN_VALUE", "STATIC": "x"},
             mounts=[],
+            security_opt=["seccomp:unconfined"],
         ),
         skills=SimpleNamespace(
             get_skills_path=lambda: skills_dir,
@@ -84,6 +85,8 @@ def test_aio_provider_mounts_thread_data_and_skills(tmp_path, monkeypatch) -> No
     assert f"{base_dir / 'threads' / 'thread_1' / 'user-data'}:/mnt/user-data:rw" in run_cmd
     assert f"{base_dir / 'threads' / 'thread_1' / 'acp-workspace'}:/mnt/acp-workspace:rw" in run_cmd
     assert f"{skills_dir}:/mnt/skills:ro" in run_cmd
+    assert "--security-opt" in run_cmd
+    assert "seccomp:unconfined" in run_cmd
     assert "TOKEN=secret" in run_cmd
     assert "STATIC=x" in run_cmd
 
@@ -101,6 +104,7 @@ def test_aio_provider_rejects_unsafe_thread_id(tmp_path, monkeypatch) -> None:
             idle_timeout=600,
             environment={},
             mounts=[],
+            security_opt=[],
         ),
         skills=SimpleNamespace(
             get_skills_path=lambda: Path("missing"),

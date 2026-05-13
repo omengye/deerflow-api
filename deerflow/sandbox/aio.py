@@ -361,6 +361,7 @@ class AioSandboxProvider(SandboxProvider):
         self.idle_timeout = DEFAULT_IDLE_TIMEOUT_SECONDS if sandbox_cfg.idle_timeout is None else sandbox_cfg.idle_timeout
         self.environment = sandbox_cfg.environment or {}
         self.mounts = sandbox_cfg.mounts or []
+        self.security_opt = getattr(sandbox_cfg, "security_opt", None) or []
         self.skills_path = config.skills.get_skills_path()
         self.skills_container_path = config.skills.container_path
         self._lock = threading.Lock()
@@ -417,6 +418,9 @@ class AioSandboxProvider(SandboxProvider):
                 continue
             mode = "ro" if mount.read_only else "rw"
             args.extend(["-v", f"{mount.host_path}:{mount.container_path}:{mode}"])
+        for opt in self.security_opt:
+            if opt:
+                args.extend(["--security-opt", opt])
         for key, value in self.environment.items():
             resolved = os.environ.get(value[1:], "") if isinstance(value, str) and value.startswith("$") else value
             args.extend(["-e", f"{key}={resolved}"])

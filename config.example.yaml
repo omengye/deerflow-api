@@ -70,6 +70,8 @@ sandbox:
 #   replicas: 3
 #   container_prefix: deer-flow-sandbox
 #   idle_timeout: 600
+#   security_opt:
+#     - seccomp:unconfined
 #   mounts:
 #     - host_path: /srv/shared/reference-data
 #       container_path: /mnt/reference-data
