@@ -2,6 +2,7 @@
 
 LOCAL_SANDBOX_PROVIDER_PATH = "deerflow.sandbox.local:LocalSandboxProvider"
 WSL_SANDBOX_PROVIDER_PATH = "deerflow.sandbox.local:LocalWslProvider"
+AIO_SANDBOX_PROVIDER_PATH = "deerflow.sandbox.aio:AioSandboxProvider"
 
 _SANDBOX_PROVIDER_ALIASES = {
     "local": LOCAL_SANDBOX_PROVIDER_PATH,
@@ -10,6 +11,10 @@ _SANDBOX_PROVIDER_ALIASES = {
     "wsl": WSL_SANDBOX_PROVIDER_PATH,
     "local-wsl": WSL_SANDBOX_PROVIDER_PATH,
     "local_wsl": WSL_SANDBOX_PROVIDER_PATH,
+    "aio": AIO_SANDBOX_PROVIDER_PATH,
+    "docker": AIO_SANDBOX_PROVIDER_PATH,
+    "docker-sandbox": AIO_SANDBOX_PROVIDER_PATH,
+    "docker_sandbox": AIO_SANDBOX_PROVIDER_PATH,
 }
 
 _LOCAL_SANDBOX_PROVIDER_PATHS = {

@@ -63,6 +63,18 @@ sandbox:
 #   wsl_shell: bash
 #   wsl_mount_prefix: /mnt
 
+# Docker sandbox mode (Linux/macOS hosts with Docker available):
+# sandbox:
+#   use: deerflow.sandbox.aio:AioSandboxProvider   # short alias: 'aio' or 'docker'
+#   image: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest
+#   replicas: 3
+#   container_prefix: deer-flow-sandbox
+#   idle_timeout: 600
+#   mounts:
+#     - host_path: /srv/shared/reference-data
+#       container_path: /mnt/reference-data
+#       read_only: true
+
 skills:
   enabled: true
   path: ./skills

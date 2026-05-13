@@ -516,6 +516,12 @@ class ClientManager:
 
         self._client_map.clear()
         self._async_client_map.clear()
+        try:
+            from deerflow.sandbox.sandbox_provider import shutdown_sandbox_provider
+
+            shutdown_sandbox_provider()
+        except Exception:
+            logger.warning("Error during sandbox provider cleanup", exc_info=True)
         if self._async_checkpointer_cm is not None:
             try:
                 await self._async_checkpointer_cm.__aexit__(None, None, None)
