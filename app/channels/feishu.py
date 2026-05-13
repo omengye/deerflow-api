@@ -203,6 +203,7 @@ class FeishuChannel:
         self._lark_client: Any = None
         self._ws_thread: threading.Thread | None = None
         self._ws_loop: asyncio.AbstractEventLoop | None = None
+        self._stopping = threading.Event()
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._bot_open_id: str | None = None
         # Keyed by chat_id; values are asyncio.Lock used inside _main_loop.
@@ -239,9 +240,14 @@ class FeishuChannel:
 
     def stop(self) -> None:
         """Signal the WS event loop to stop; the daemon thread will exit."""
+        self._stopping.set()
         loop = self._ws_loop
         if loop and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
+
+        thread = self._ws_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5)
 
     # ------------------------------------------------------------------
     # Internal: WebSocket thread
@@ -292,6 +298,11 @@ class FeishuChannel:
         )
         try:
             ws_client.start()
+        except RuntimeError as exc:
+            if self._stopping.is_set() and "Event loop stopped before Future completed" in str(exc):
+                logger.info("Feishu WebSocket stopped")
+            else:
+                logger.exception("Feishu WebSocket exited with error")
         except Exception:
             logger.exception("Feishu WebSocket exited with error")
         finally:
