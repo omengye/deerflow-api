@@ -11,7 +11,7 @@ import app.config as app_config
 from app.config import settings
 from app.dependencies import ClientManager
 from app.middleware import ApiKeyAuthMiddleware
-from deerflow.config.app_config import get_app_config, reset_app_config
+from deerflow.config.app_config import AppConfig, get_app_config, reset_app_config
 from deerflow.config.tracing_config import get_tracing_config, reset_tracing_config
 from deerflow.runtime import ConflictError, RunStatus
 
@@ -184,6 +184,29 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(short.max_concurrent_subagents, 2)
         finally:
             app_config._API_CONFIG = original_api_config
+
+    async def test_app_config_resolves_braced_env_variables_with_defaults(self) -> None:
+        config = {
+            "plain": "x",
+            "classic": "$API_TOKEN",
+            "braced": "${TZ}",
+            "defaulted": "${SANDBOX_LANG:-C.UTF-8}",
+            "nested": {"items": ["${MISSING_WITH_DEFAULT:-fallback}"]},
+        }
+
+        with patch.dict("os.environ", {"API_TOKEN": "secret", "TZ": "Asia/Shanghai"}, clear=True):
+            resolved = AppConfig.resolve_env_variables(config)
+
+        self.assertEqual(resolved["plain"], "x")
+        self.assertEqual(resolved["classic"], "secret")
+        self.assertEqual(resolved["braced"], "Asia/Shanghai")
+        self.assertEqual(resolved["defaulted"], "C.UTF-8")
+        self.assertEqual(resolved["nested"]["items"], ["fallback"])
+
+    async def test_app_config_rejects_missing_braced_env_variable_without_default(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "Environment variable TZ not found"):
+                AppConfig.resolve_env_variables("${TZ}")
 
     async def test_settings_custom_config_path_is_single_runtime_source(self) -> None:
         original_env = dict(app_config.os.environ)

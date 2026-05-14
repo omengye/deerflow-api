@@ -33,6 +33,29 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+def _resolve_env_scalar(value: str) -> str:
+    """Resolve supported whole-value environment variable references."""
+    if value.startswith("${") and value.endswith("}"):
+        expr = value[2:-1]
+        if ":-" in expr:
+            env_name, default = expr.split(":-", 1)
+            env_value = os.getenv(env_name)
+            return env_value if env_value else default
+        env_value = os.getenv(expr)
+        if env_value is None:
+            raise ValueError(f"Environment variable {expr} not found for config value {value}")
+        return env_value
+
+    if value.startswith("$"):
+        env_name = value[1:]
+        env_value = os.getenv(env_name)
+        if env_value is None:
+            raise ValueError(f"Environment variable {env_name} not found for config value {value}")
+        return env_value
+
+    return value
+
+
 class CircuitBreakerConfig(BaseModel):
     """Configuration for the LLM Circuit Breaker."""
 
@@ -225,7 +248,8 @@ class AppConfig(BaseModel):
     def resolve_env_variables(cls, config: Any) -> Any:
         """Recursively resolve environment variables in the config.
 
-        Environment variables are resolved using the `os.getenv` function. Example: $OPENAI_API_KEY
+        Environment variables are resolved using the `os.getenv` function.
+        Supported scalar forms: $OPENAI_API_KEY, ${OPENAI_API_KEY}, ${TZ:-Asia/Shanghai}
 
         Args:
             config: The config to resolve environment variables in.
@@ -234,12 +258,7 @@ class AppConfig(BaseModel):
             The config with environment variables resolved.
         """
         if isinstance(config, str):
-            if config.startswith("$"):
-                env_value = os.getenv(config[1:])
-                if env_value is None:
-                    raise ValueError(f"Environment variable {config[1:]} not found for config value {config}")
-                return env_value
-            return config
+            return _resolve_env_scalar(config)
         elif isinstance(config, dict):
             return {k: cls.resolve_env_variables(v) for k, v in config.items()}
         elif isinstance(config, list):
