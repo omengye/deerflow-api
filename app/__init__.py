@@ -62,7 +62,7 @@ async def lifespan(app: FastAPI):
     yield
 
     if feishu_channel is not None:
-        feishu_channel.stop()
+        await feishu_channel.astop()
     await manager.shutdown()
 
 

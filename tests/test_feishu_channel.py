@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator, Iterable
 import asyncio
+from concurrent.futures import Future
 from typing import Any, override
 import unittest
 
@@ -9,9 +10,16 @@ from deerflow.client import StreamEvent
 
 
 class _FakeClient:
-    def __init__(self, events: Iterable[StreamEvent], *, yield_between_events: bool = False) -> None:
+    def __init__(
+        self,
+        events: Iterable[StreamEvent],
+        *,
+        yield_between_events: bool = False,
+        error_after_events: Exception | None = None,
+    ) -> None:
         self.events: list[StreamEvent] = list(events)
         self.yield_between_events = yield_between_events
+        self.error_after_events = error_after_events
         self.last_message: str | None = None
         self.last_thread_id: str | None = None
 
@@ -22,6 +30,8 @@ class _FakeClient:
             yield event
             if self.yield_between_events:
                 await asyncio.sleep(0)
+        if self.error_after_events is not None:
+            raise self.error_after_events
 
 
 class _FakeManager:
@@ -193,6 +203,31 @@ class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(final_text, final)
         self.assertEqual(channel.patched_cards[-2:], [("initial-card", partial), ("initial-card", final)])
+
+    async def test_stream_cancels_background_patches_when_agent_stream_fails(self) -> None:
+        fake_client = _FakeClient(
+            [
+                StreamEvent(
+                    type="messages-tuple",
+                    data={
+                        "type": "ai",
+                        "content": "this partial chunk should be cancelled",
+                        "id": "ai-1",
+                        "is_delta": True,
+                    },
+                ),
+            ],
+            yield_between_events=True,
+            error_after_events=RuntimeError("stream failed"),
+        )
+        channel = _RecordingFeishuChannel()
+        channel.release_patch_card = asyncio.Event()
+
+        with self.assertRaises(RuntimeError):
+            await channel.stream_to_cards(fake_client)
+
+        self.assertEqual(channel.patched_cards, [])
+        channel.release_patch_card.set()
 
     async def test_stream_waits_for_slow_new_card_creation_before_final_patch(self) -> None:
         fake_client = _FakeClient(
@@ -411,6 +446,17 @@ class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(channel.reactions, [("user-message", "OK"), ("user-message", "DONE")])
         self.assertLess(channel.operation_log.index("patch:card-1:answer"), channel.operation_log.index("reaction:DONE"))
+
+    async def test_astop_cancels_inflight_message_handlers(self) -> None:
+        channel = _RecordingFeishuChannel()
+        future: Future[None] = Future()
+        with channel._handler_futures_lock:
+            channel._handler_futures.add(future)
+
+        await channel.astop()
+
+        self.assertTrue(future.cancelled())
+        self.assertEqual(channel._handler_futures, set())
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ Only @bot mentions in group chats are handled.  P2P chats always respond.
 thread_id is prefixed as "feishu:{chat_id}" to isolate from HTTP API threads.
 """
 import asyncio
+from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import Future
 from dataclasses import dataclass
 import json
 import logging
@@ -207,6 +209,8 @@ class FeishuChannel:
         self._stopping = threading.Event()
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._bot_open_id: str | None = None
+        self._handler_futures: set[Future[None]] = set()
+        self._handler_futures_lock = threading.Lock()
         # Keyed by chat_id; values are asyncio.Lock used inside _main_loop.
         self._chat_locks: dict[str, asyncio.Lock] = {}
         # Feishu receives full-state snapshots on every turn. Track artifacts
@@ -239,8 +243,7 @@ class FeishuChannel:
             self._bot_open_id,
         )
 
-    def stop(self) -> None:
-        """Signal the WS event loop to stop; the daemon thread will exit."""
+    def _stop_ws(self) -> None:
         self._stopping.set()
         loop = self._ws_loop
         if loop and loop.is_running():
@@ -249,6 +252,30 @@ class FeishuChannel:
         thread = self._ws_thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=5)
+
+    async def astop(self) -> None:
+        """Cancel in-flight Feishu handlers, then stop the WS event loop."""
+        with self._handler_futures_lock:
+            futures = list(self._handler_futures)
+
+        for fut in futures:
+            fut.cancel()
+
+        if futures:
+            wrapped = [asyncio.wrap_future(fut) for fut in futures]
+            await asyncio.gather(*wrapped, return_exceptions=True)
+            with self._handler_futures_lock:
+                self._handler_futures.difference_update(futures)
+
+        self._stop_ws()
+
+    def stop(self) -> None:
+        """Signal the WS event loop to stop; the daemon thread will exit."""
+        with self._handler_futures_lock:
+            futures = list(self._handler_futures)
+        for fut in futures:
+            fut.cancel()
+        self._stop_ws()
 
     # ------------------------------------------------------------------
     # Internal: WebSocket thread
@@ -381,13 +408,23 @@ class FeishuChannel:
                 ),
                 self._main_loop,
             )
-            fut.add_done_callback(
-                lambda f: logger.exception(
-                    "Feishu message handler error", exc_info=f.exception()
-                )
-                if f.exception()
-                else None
-            )
+            with self._handler_futures_lock:
+                self._handler_futures.add(fut)
+
+            def _on_done(done: Future[None]) -> None:
+                with self._handler_futures_lock:
+                    self._handler_futures.discard(done)
+                try:
+                    exc = done.exception()
+                except FutureCancelledError:
+                    return
+                if exc is not None:
+                    logger.error(
+                        "Feishu message handler error",
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+
+            fut.add_done_callback(_on_done)
         except Exception:
             logger.exception("Error in Feishu _on_message")
 
@@ -418,6 +455,7 @@ class FeishuChannel:
         async with lock:
             await self._add_reaction(message_id, "OK")
             card_id = await self._send_card(chat_id, "⏳ Working on it...")
+            cancelled = False
             try:
                 prompt = text
                 if resources:
@@ -436,11 +474,15 @@ class FeishuChannel:
                         return
                     prompt = _build_prompt_with_uploads(text, uploaded_files)
                 _ = await self._stream_to_cards(prompt, thread_id, chat_id, card_id)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
             except Exception:
                 logger.exception("Stream error (thread=%s)", thread_id)
                 await self._patch_card(card_id, "❌ An error occurred. Please try again.")
             finally:
-                await self._add_reaction(message_id, "DONE")
+                if not cancelled:
+                    await self._add_reaction(message_id, "DONE")
 
     async def _handle_reset(
         self,
@@ -576,6 +618,14 @@ class FeishuChannel:
                 return False
             return (time.monotonic() - last_patch_at.get(msg_id, 0.0)) >= _PATCH_INTERVAL
 
+        async def cancel_background_tasks() -> None:
+            tasks: list[asyncio.Task[Any]] = [*card_tasks.values(), *patch_tasks.values()]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
         def collect_artifacts(data: Any) -> None:
             if not isinstance(data, dict):
                 return
@@ -591,7 +641,15 @@ class FeishuChannel:
                     seen_artifacts.add(artifact)
                     artifacts.append(artifact)
 
-        async for event in client.astream(text, thread_id=thread_id):
+        async def stream_events():
+            try:
+                async for stream_event in client.astream(text, thread_id=thread_id):
+                    yield stream_event
+            except BaseException:
+                await cancel_background_tasks()
+                raise
+
+        async for event in stream_events():
             if event.type == "messages-tuple":
                 data = event.data
                 # LangGraph wraps stream items as [chunk_dict, metadata_dict].
