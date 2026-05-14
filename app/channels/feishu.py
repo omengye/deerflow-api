@@ -23,6 +23,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _PATCH_INTERVAL = 1.0  # seconds between card patch calls
+_INITIAL_PATCH_MIN_CHARS = 24
 _RESET_COMMANDS = frozenset({"/new", "/reset"})
 _MAX_FEISHU_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_FEISHU_FILE_BYTES = 30 * 1024 * 1024
@@ -497,6 +498,8 @@ class FeishuChannel:
         card_ids: dict[str, str] = {}
         card_tasks: dict[str, asyncio.Task[str]] = {}
         patch_tasks: dict[str, asyncio.Task[None]] = {}
+        pending_patch_content: dict[str, str] = {}
+        last_patched_content: dict[str, str] = {}
         last_patch_at: dict[str, float] = {}
         artifacts: list[str] = []
         seen_artifacts: set[str] = set()
@@ -536,6 +539,21 @@ class FeishuChannel:
             if card_id:
                 await self._patch_card(card_id, content)
 
+        async def run_patch_worker(msg_id: str) -> None:
+            while True:
+                content = pending_patch_content.get(msg_id, "")
+                if not content or content == last_patched_content.get(msg_id):
+                    return
+
+                await patch_message_card(msg_id, content)
+                last_patched_content[msg_id] = content
+                last_patch_at[msg_id] = time.monotonic()
+
+                if pending_patch_content.get(msg_id) == content:
+                    return
+
+                await asyncio.sleep(_PATCH_INTERVAL)
+
         async def drain_patch_task(msg_id: str) -> None:
             task = patch_tasks.get(msg_id)
             if task is None:
@@ -546,9 +564,17 @@ class FeishuChannel:
                 logger.warning("patch_card task failed for AI message %s", msg_id, exc_info=True)
 
         def schedule_patch(msg_id: str, content: str) -> None:
+            pending_patch_content[msg_id] = content
             task = patch_tasks.get(msg_id)
             if task is None or task.done():
-                patch_tasks[msg_id] = asyncio.create_task(patch_message_card(msg_id, content))
+                patch_tasks[msg_id] = asyncio.create_task(run_patch_worker(msg_id))
+
+        def should_patch_streaming(msg_id: str, content: str) -> bool:
+            if not content:
+                return False
+            if msg_id not in last_patch_at and len(content.strip()) < _INITIAL_PATCH_MIN_CHARS:
+                return False
+            return (time.monotonic() - last_patch_at.get(msg_id, 0.0)) >= _PATCH_INTERVAL
 
         def collect_artifacts(data: Any) -> None:
             if not isinstance(data, dict):
@@ -589,24 +615,23 @@ class FeishuChannel:
                             last_id = msg_id
 
                             current = "".join(chunks[msg_id])
-                            now = time.monotonic()
-                            if current and (now - last_patch_at.get(msg_id, 0.0)) >= _PATCH_INTERVAL:
+                            if should_patch_streaming(msg_id, current):
                                 # Fire patch as a background task — do NOT await here so the
                                 # async-for loop is never suspended waiting for the Feishu API.
                                 schedule_patch(msg_id, current)
-                                last_patch_at[msg_id] = now
             elif event.type == "values":
                 collect_artifacts(event.data)
-
-        # Ensure in-flight patches finish before final full-content patches.  This
-        # prevents an older partial patch from racing after a final patch.
-        for msg_id in list(patch_tasks):
-            await drain_patch_task(msg_id)
 
         for msg_id, parts in chunks.items():
             final_text = "".join(parts)
             if final_text:
-                await patch_message_card(msg_id, final_text)
+                schedule_patch(msg_id, final_text)
+
+        # Ensure in-flight patches finish after final full-content has been queued.
+        # The worker always sends the latest queued content before it exits, so a
+        # slow partial patch cannot drop newer text or race after the final patch.
+        for msg_id in list(patch_tasks):
+            await drain_patch_task(msg_id)
 
         sent_artifact_count = await self._send_artifacts(chat_id, thread_id, artifacts)
         if sent_artifact_count and not chunks and initial_card_id:

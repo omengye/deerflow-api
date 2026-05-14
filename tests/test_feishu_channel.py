@@ -9,8 +9,9 @@ from deerflow.client import StreamEvent
 
 
 class _FakeClient:
-    def __init__(self, events: Iterable[StreamEvent]) -> None:
+    def __init__(self, events: Iterable[StreamEvent], *, yield_between_events: bool = False) -> None:
         self.events: list[StreamEvent] = list(events)
+        self.yield_between_events = yield_between_events
         self.last_message: str | None = None
         self.last_thread_id: str | None = None
 
@@ -19,6 +20,8 @@ class _FakeClient:
         self.last_thread_id = thread_id
         for event in self.events:
             yield event
+            if self.yield_between_events:
+                await asyncio.sleep(0)
 
 
 class _FakeManager:
@@ -131,6 +134,7 @@ class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(final_text, "hello")
         self.assertEqual(channel.sent_cards, [])
+        self.assertEqual(channel.patched_cards, [("initial-card", "hello")])
         self.assertEqual(channel.patched_cards[-1], ("initial-card", "hello"))
         self.assertTrue(all(card_id == "initial-card" for card_id, _content in channel.patched_cards))
 
@@ -166,12 +170,15 @@ class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.patched_cards[-1], ("initial-card", "new"))
 
     async def test_stream_waits_for_slow_partial_patch_before_final_patch(self) -> None:
+        partial = "this is a slow partial chunk"
+        final = f"{partial} final"
         fake_client = _FakeClient(
             [
-                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "slow", "id": "ai-1", "is_delta": True}),
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": partial, "id": "ai-1", "is_delta": True}),
                 StreamEvent(type="messages-tuple", data={"type": "ai", "content": " final", "id": "ai-1", "is_delta": True}),
                 StreamEvent(type="end", data={}),
-            ]
+            ],
+            yield_between_events=True,
         )
         channel = _RecordingFeishuChannel()
         channel.release_patch_card = asyncio.Event()
@@ -184,8 +191,8 @@ class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
 
         final_text = await stream_task
 
-        self.assertEqual(final_text, "slow final")
-        self.assertEqual(channel.patched_cards[-2:], [("initial-card", "slow"), ("initial-card", "slow final")])
+        self.assertEqual(final_text, final)
+        self.assertEqual(channel.patched_cards[-2:], [("initial-card", partial), ("initial-card", final)])
 
     async def test_stream_waits_for_slow_new_card_creation_before_final_patch(self) -> None:
         fake_client = _FakeClient(
