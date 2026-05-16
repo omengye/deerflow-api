@@ -77,6 +77,37 @@ sandbox:
 #       container_path: /mnt/reference-data
 #       read_only: true
 
+# ACP (Agent Client Protocol) agents.
+# When one or more agents are configured here, DeerFlow exposes the
+# built-in `invoke_acp_agent` tool. The tool launches the configured ACP
+# subprocess, creates an ACP session, sends a prompt, and returns the
+# agent's final streamed text.
+#
+# Notes:
+# - The configured command must speak ACP. The plain `codex` or `claude`
+#   CLI is not enough unless wrapped by an ACP adapter.
+# - ACP agents run in an isolated per-thread workspace. Their output files
+#   are visible to DeerFlow at /mnt/acp-workspace/.
+# - Keep `auto_approve_permissions: false` unless you explicitly trust the
+#   adapter and the commands it may request.
+# - Install adapter CLIs separately, for example:
+#     npm install -g @zed-industries/codex-acp
+#     pipx install claude-code-acp
+#
+# acp_agents:
+#   codex:
+#     command: codex-acp
+#     args: []
+#     description: "Codex coding agent via ACP"
+#     model: null
+#     auto_approve_permissions: false
+#   claude_code:
+#     command: claude-code-acp
+#     args: []
+#     description: "Claude Code coding agent via ACP"
+#     model: null
+#     auto_approve_permissions: false
+
 skills:
   enabled: true
   path: ./skills

@@ -54,6 +54,48 @@ tracing:
 
 仍建议保留在环境变量中的只有进程级或系统级凭据/变量，例如 `CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`、`ANTHROPIC_AUTH_TOKEN`、`HOME`、`SystemRoot` 等。
 
+## ACP Agent 对接（Codex / Claude Code）
+
+项目支持作为 **ACP client** 调用外部 agent。配置 `config.yaml` 的 `acp_agents:` 后，DeerFlow 会自动暴露内置工具 `invoke_acp_agent`，主 agent 可以把编码、审查、重构等任务交给外部 ACP agent 执行。
+
+> ACP 这里指 Agent Client Protocol。被启动的外部命令必须实现 ACP 协议；裸 `codex` 或 `claude` CLI 通常不能直接作为 ACP agent 使用，需要对应的 ACP adapter。
+
+示例：
+
+```yaml
+acp_agents:
+  codex:
+    command: codex-acp
+    args: []
+    description: "Codex coding agent via ACP"
+    model: null
+    auto_approve_permissions: false
+
+  claude_code:
+    command: claude-code-acp
+    args: []
+    description: "Claude Code coding agent via ACP"
+    model: null
+    auto_approve_permissions: false
+```
+
+常见 adapter 安装方式：
+
+```bash
+# Codex ACP adapter
+npm install -g @zed-industries/codex-acp
+
+# Claude Code ACP adapter（如使用该 Python 包）
+pipx install claude-code-acp
+```
+
+运行机制与注意事项：
+
+- `command`/`args` 会作为子进程启动，并通过 ACP `initialize -> new_session -> prompt` 流程调用。
+- 每个会话线程有独立 ACP 工作目录；外部 agent 产物会映射到 DeerFlow 的 `/mnt/acp-workspace/`。
+- `auto_approve_permissions` 默认应保持 `false`。改为 `true` 后，DeerFlow 会自动批准 ACP agent 的权限请求，适合受信环境，不适合开放服务。
+- `acp_agents` 是“把 Codex/Claude Code 当外部 agent 调用”；项目也支持把 Codex/Claude Code 凭据配置成主模型 provider，这两种能力互相独立。
+
 ## Windows 沙箱（WSL 模式）
 
 Windows 上 `LocalSandboxProvider` 会回退到 PowerShell/cmd.exe，与上游 agent prompts 的 bash 语义不兼容；同时开启 `allow_host_bash: true` 后 LLM 命令直接在 Windows 主机权限下执行，没有任何隔离。
