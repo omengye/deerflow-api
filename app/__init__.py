@@ -84,7 +84,7 @@ app.add_middleware(ApiKeyAuthMiddleware)
 app.add_middleware(RequestContextMiddleware)
 
 # Import routers
-from app.routers import chat, threads, models, skills, mcp, uploads, runs  # noqa: E402
+from app.routers import chat, threads, models, skills, mcp, uploads, runs, openai_compatible  # noqa: E402
 
 app.include_router(chat.router, prefix="/api")
 app.include_router(threads.router, prefix="/api")
@@ -93,6 +93,7 @@ app.include_router(skills.router, prefix="/api")
 app.include_router(mcp.router, prefix="/api")
 app.include_router(uploads.router, prefix="/api")
 app.include_router(runs.router, prefix="/api")
+app.include_router(openai_compatible.router)
 
 
 @app.get("/health")

@@ -37,6 +37,12 @@ _AGUI_OPTIONS_HEADERS = {
     "Access-Control-Max-Age": "86400",
 }
 
+_SSE_RESPONSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
 
 @router.post("/chat/stream")
 async def chat_stream(request: Request, req: ChatRequest = Body()):
@@ -314,7 +320,7 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                 yield emit(text_event)
             yield emit({"type": "RUN_ERROR", "message": "Internal server error"})
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=_SSE_RESPONSE_HEADERS)
 
 
 @router.options("/chat/agui")

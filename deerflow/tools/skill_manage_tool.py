@@ -12,7 +12,6 @@ from langchain.tools import ToolRuntime, tool
 
 from deerflow.agents.lead_agent.prompt import refresh_skills_system_prompt_cache_async
 from deerflow.agents.thread_state import AgentContext, ThreadState
-from deerflow.mcp.tools import _make_sync_tool_wrapper
 from deerflow.skills.manager import (
     append_history,
     atomic_write,
@@ -27,6 +26,7 @@ from deerflow.skills.manager import (
     validate_skill_name,
 )
 from deerflow.skills.security_scanner import scan_skill_content
+from deerflow.tools.sync import make_sync_tool_wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -243,4 +243,4 @@ async def skill_manage_tool(
     )
 
 
-skill_manage_tool.func = _make_sync_tool_wrapper(_skill_manage_impl, "skill_manage")
+skill_manage_tool.func = make_sync_tool_wrapper(_skill_manage_impl, "skill_manage")

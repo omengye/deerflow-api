@@ -34,6 +34,10 @@ api:
   # Empty list = allow any extension. Example: [.pdf, .txt, .md]
   allowed_upload_extensions: []
   allow_memory_fallback: false
+  scheduler_enabled: true
+  scheduler_db_path: ./data/scheduled_tasks.db
+  scheduler_poll_interval_seconds: 5
+  scheduler_timezone: Asia/Shanghai
 
 token_usage:
   enabled: false

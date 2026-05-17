@@ -5,14 +5,16 @@ from langchain.tools import BaseTool
 from deerflow.config import get_app_config
 from deerflow.reflection import resolve_variable
 from deerflow.sandbox.security import is_host_bash_allowed
-from deerflow.tools.builtins import ask_clarification_tool, present_file_tool, task_tool, view_image_tool
-from deerflow.tools.builtins.tool_search import reset_deferred_registry
+from deerflow.tools.builtins import ask_clarification_tool, present_file_tool, scheduled_task_tools, task_tool, view_image_tool
+from deerflow.tools.builtins.tool_search import get_deferred_registry
+from deerflow.tools.sync import make_sync_tool_wrapper
 
 logger = logging.getLogger(__name__)
 
 BUILTIN_TOOLS = [
     present_file_tool,
     ask_clarification_tool,
+    *scheduled_task_tools,
 ]
 
 SUBAGENT_TOOLS = [
@@ -31,6 +33,13 @@ def _is_host_bash_tool(tool: object) -> bool:
     if use == "deerflow.sandbox.tools:bash_tool":
         return True
     return False
+
+
+def _ensure_sync_invocable_tool(tool: BaseTool) -> BaseTool:
+    """Attach a sync wrapper to async-only tools used by sync agent callers."""
+    if getattr(tool, "func", None) is None and getattr(tool, "coroutine", None) is not None:
+        tool.func = make_sync_tool_wrapper(tool.coroutine, tool.name)
+    return tool
 
 
 def get_available_tools(
@@ -75,7 +84,7 @@ def get_available_tools(
                 cfg.use,
             )
 
-    loaded_tools = [t for _, t in loaded_tools_raw]
+    loaded_tools = [_ensure_sync_invocable_tool(t) for _, t in loaded_tools_raw]
 
     # Conditionally add tools based on config
     builtin_tools = BUILTIN_TOOLS.copy()
@@ -106,8 +115,6 @@ def get_available_tools(
     # made through the Gateway API (which runs in a separate process) are immediately
     # reflected when loading MCP tools.
     mcp_tools = []
-    # Reset deferred registry upfront to prevent stale state from previous calls
-    reset_deferred_registry()
     if include_mcp:
         try:
             from deerflow.config.extensions_config import ExtensionsConfig
@@ -125,12 +132,19 @@ def get_available_tools(
                         from deerflow.tools.builtins.tool_search import DeferredToolRegistry, set_deferred_registry
                         from deerflow.tools.builtins.tool_search import tool_search as tool_search_tool
 
-                        registry = DeferredToolRegistry()
-                        for t in mcp_tools:
-                            registry.register(t)
-                        set_deferred_registry(registry)
+                        existing_registry = get_deferred_registry()
+                        if existing_registry is None:
+                            registry = DeferredToolRegistry()
+                            for t in mcp_tools:
+                                registry.register(t)
+                            set_deferred_registry(registry)
+                            logger.info(f"Tool search active: {len(mcp_tools)} tools deferred")
+                        else:
+                            mcp_tool_names = {t.name for t in mcp_tools}
+                            still_deferred = len(existing_registry)
+                            promoted_count = max(0, len(mcp_tool_names) - still_deferred)
+                            logger.info(f"Tool search active (preserved promotions): {still_deferred} tools deferred, {promoted_count} already promoted")
                         builtin_tools.append(tool_search_tool)
-                        logger.info(f"Tool search active: {len(mcp_tools)} tools deferred")
         except ImportError:
             logger.warning("MCP module not available. Install 'langchain-mcp-adapters' package to enable MCP tools.")
         except Exception as e:

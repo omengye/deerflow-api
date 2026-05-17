@@ -36,6 +36,7 @@ class ClientManager:
         self._thread_lock = threading.Lock()
         self.run_manager = RunManager()
         self.stream_bridge = MemoryStreamBridge(queue_maxsize=512)
+        self.scheduler_service = None
 
     async def startup(self):
         """Initialize the DeerFlowClient on startup."""
@@ -58,6 +59,21 @@ class ClientManager:
             ) from e
 
         self._assert_storage_ready()
+
+        if settings.scheduler_enabled:
+            from deerflow.runtime.scheduler import SchedulerService, SchedulerStore
+
+            scheduler_db_path = Path(settings.scheduler_db_path)
+            if not scheduler_db_path.is_absolute():
+                scheduler_db_path = Path(settings.config_path).parent / scheduler_db_path
+            store = SchedulerStore(scheduler_db_path)
+            self.scheduler_service = SchedulerService(
+                store=store,
+                manager=self,
+                poll_interval_seconds=settings.scheduler_poll_interval_seconds,
+                default_timezone=settings.scheduler_timezone,
+            )
+            await self.scheduler_service.start()
 
     def get_client(self, **overrides) -> Any:
         """Get or create a DeerFlowClient instance."""
@@ -505,6 +521,14 @@ class ClientManager:
 
     async def shutdown(self):
         """Cleanup on shutdown."""
+        if self.scheduler_service is not None:
+            try:
+                await self.scheduler_service.stop()
+            except Exception:
+                logger.warning("Error stopping scheduler service", exc_info=True)
+            finally:
+                self.scheduler_service = None
+
         try:
             from deerflow.agents.memory.queue import get_memory_queue
             from deerflow.config.memory_config import get_memory_config

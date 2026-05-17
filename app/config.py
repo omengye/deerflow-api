@@ -330,6 +330,27 @@ class Settings(BaseModel):
     # Feishu (Lark) channel — optional, disabled unless configured.
     feishu: FeishuSettings | None = Field(default_factory=_load_feishu_settings)
 
+    # Dynamic scheduled tasks. Tasks are created by agent tools and persisted
+    # in SQLite so they survive API restarts.
+    scheduler_enabled: bool = Field(
+        default_factory=lambda: _setting_bool("scheduler_enabled", "DEER_FLOW_SCHEDULER_ENABLED", True)
+    )
+    scheduler_db_path: str = Field(
+        default_factory=lambda: _setting_str("scheduler_db_path", "DEER_FLOW_SCHEDULER_DB_PATH", "./data/scheduled_tasks.db")
+    )
+    scheduler_poll_interval_seconds: float = Field(
+        default_factory=lambda: _setting_float(
+            "scheduler_poll_interval_seconds",
+            "DEER_FLOW_SCHEDULER_POLL_INTERVAL_SECONDS",
+            5.0,
+        ),
+        ge=0.5,
+        le=3600,
+    )
+    scheduler_timezone: str = Field(
+        default_factory=lambda: _setting_str("scheduler_timezone", "DEER_FLOW_SCHEDULER_TIMEZONE", "Asia/Shanghai")
+    )
+
 settings = Settings()
 
 

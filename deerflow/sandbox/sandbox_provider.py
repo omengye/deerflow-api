@@ -70,6 +70,8 @@ def reset_sandbox_provider() -> None:
     Use `shutdown_sandbox_provider()` for proper cleanup.
     """
     global _default_sandbox_provider
+    if _default_sandbox_provider is not None and hasattr(_default_sandbox_provider, "reset"):
+        _default_sandbox_provider.reset()
     _default_sandbox_provider = None
 
 

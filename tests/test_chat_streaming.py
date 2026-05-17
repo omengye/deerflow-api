@@ -175,6 +175,12 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["access-control-allow-methods"], "OPTIONS, POST")
         self.assertIn("Accept", response.headers["access-control-allow-headers"])
 
+    async def test_chat_agui_disables_sse_buffering(self) -> None:
+        response = await chat.chat_agui(_fake_request(), self._agui_request())
+
+        self.assertEqual(response.headers["cache-control"], "no-cache, no-transform")
+        self.assertEqual(response.headers["x-accel-buffering"], "no")
+
     async def _collect_chat_stream(self, fake_client: _FakeClient) -> tuple[list[dict[str, str]], _FakeManager]:
         fake_manager = _FakeManager(fake_client)
         original_get_client_manager = chat.get_client_manager

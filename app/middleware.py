@@ -61,7 +61,7 @@ def _should_authenticate(request: Request) -> bool:
         return False
     if request.url.path in ApiKeyAuthMiddleware._PUBLIC_PATHS:
         return False
-    if not request.url.path.startswith("/api"):
+    if not (request.url.path.startswith("/api") or request.url.path.startswith("/v1")):
         return False
     return settings.auth_enabled
 

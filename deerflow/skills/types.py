@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+SKILL_MD_FILE = "SKILL.md"
+
 
 @dataclass
 class Skill:
