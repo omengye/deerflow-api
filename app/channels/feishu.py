@@ -10,6 +10,7 @@ Only @bot mentions in group chats are handled.  P2P chats always respond.
 thread_id is prefixed as "feishu:{chat_id}" to isolate from HTTP API threads.
 """
 import asyncio
+from collections.abc import AsyncIterator
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -518,7 +519,56 @@ class FeishuChannel:
         chat_id: str,
         initial_card_id: str,
     ) -> str:
-        """Consume astream(), updating one Feishu card per AI message id.
+        """Run a client stream and render its events to Feishu cards."""
+        from app.dependencies import get_client_manager
+
+        client = await get_client_manager().get_async_client()
+
+        async def stream_events() -> AsyncIterator[Any]:
+            async for stream_event in client.astream(text, thread_id=thread_id):
+                yield stream_event
+
+        return await self._render_events_to_cards(
+            stream_events(),
+            thread_id=thread_id,
+            chat_id=chat_id,
+            initial_card_id=initial_card_id,
+        )
+
+    async def render_run_to_chat(
+        self,
+        *,
+        run_id: str,
+        thread_id: str,
+        chat_id: str,
+        initial_content: str = "Scheduled task started...",
+    ) -> str:
+        """Subscribe to a managed run's stream and render it to a Feishu chat."""
+        from app.dependencies import get_client_manager
+
+        manager = get_client_manager()
+        card_id = await self._send_card(chat_id, initial_content)
+
+        async def stream_events() -> AsyncIterator[Any]:
+            async for entry in manager.stream_bridge.subscribe(run_id):
+                yield entry
+
+        return await self._render_events_to_cards(
+            stream_events(),
+            thread_id=thread_id,
+            chat_id=chat_id,
+            initial_card_id=card_id,
+        )
+
+    async def _render_events_to_cards(
+        self,
+        events: AsyncIterator[Any],
+        *,
+        thread_id: str,
+        chat_id: str,
+        initial_card_id: str,
+    ) -> str:
+        """Consume run stream events, updating one Feishu card per AI message id.
 
         Groups deltas by AI message id (mirrors client.chat()) so that historical
         messages replayed in LangGraph values-mode snapshots are not re-appended
@@ -533,9 +583,6 @@ class FeishuChannel:
         state; on Python 3.14 this interacts with the GC-driven WS loop teardown
         and surfaces as RuntimeError('Event loop is closed') inside the LLM call.
         """
-        from app.dependencies import get_client_manager
-
-        client = await get_client_manager().get_async_client()
         chunks: dict[str, list[str]] = {}
         card_ids: dict[str, str] = {}
         card_tasks: dict[str, asyncio.Task[str]] = {}
@@ -641,17 +688,26 @@ class FeishuChannel:
                     seen_artifacts.add(artifact)
                     artifacts.append(artifact)
 
-        async def stream_events():
-            try:
-                async for stream_event in client.astream(text, thread_id=thread_id):
-                    yield stream_event
-            except BaseException:
-                await cancel_background_tasks()
-                raise
-
-        async for event in stream_events():
-            if event.type == "messages-tuple":
-                data = event.data
+        try:
+            async for event in events:
+                event_type = getattr(event, "type", None) or getattr(event, "event", "")
+                if event_type == "__heartbeat__":
+                    continue
+                if event_type == "__end__":
+                    break
+                if event_type == "error":
+                    data = getattr(event, "data", None)
+                    message = ""
+                    if isinstance(data, dict):
+                        message = str(data.get("error") or data.get("message") or "")
+                    await self._patch_card(initial_card_id, f"Error: {message}".strip())
+                    continue
+                if event_type == "messages-tuple":
+                    data = getattr(event, "data", None)
+                else:
+                    if event_type == "values":
+                        collect_artifacts(getattr(event, "data", None))
+                    continue
                 # LangGraph wraps stream items as [chunk_dict, metadata_dict].
                 if isinstance(data, list) and data:
                     data = data[0]
@@ -677,8 +733,9 @@ class FeishuChannel:
                                 # Fire patch as a background task — do NOT await here so the
                                 # async-for loop is never suspended waiting for the Feishu API.
                                 schedule_patch(msg_id, current)
-            elif event.type == "values":
-                collect_artifacts(event.data)
+        except BaseException:
+            await cancel_background_tasks()
+            raise
 
         for msg_id, parts in chunks.items():
             final_text = "".join(parts)

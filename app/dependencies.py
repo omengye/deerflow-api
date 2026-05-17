@@ -37,6 +37,7 @@ class ClientManager:
         self.run_manager = RunManager()
         self.stream_bridge = MemoryStreamBridge(queue_maxsize=512)
         self.scheduler_service = None
+        self.feishu_channel = None
 
     async def startup(self):
         """Initialize the DeerFlowClient on startup."""

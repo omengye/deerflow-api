@@ -31,6 +31,14 @@ def _json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+def _delivery_metadata_for_thread(thread_id: str) -> dict[str, Any]:
+    if thread_id.startswith("feishu_"):
+        chat_id = thread_id.removeprefix("feishu_")
+        if chat_id:
+            return {"delivery": {"channel": "feishu", "chat_id": chat_id}}
+    return {}
+
+
 @tool("create_scheduled_task", parse_docstring=True)
 async def create_scheduled_task_tool(
     runtime: ToolRuntime[AgentContext, ThreadState],
@@ -89,6 +97,7 @@ async def create_scheduled_task_tool(
         schedule_expr=schedule_expr,
         timezone=timezone or service.default_timezone,
         created_by="agent",
+        metadata=_delivery_metadata_for_thread(target_thread_id),
         multitask_strategy=multitask_strategy,
     )
     return _json({"created": task_to_dict(task)})

@@ -503,6 +503,7 @@ class SchedulerService:
                 multitask_strategy=task.multitask_strategy,
             )
             await self.store.mark_task_run_started(task_run_id, record.run_id)
+            delivery_task = self._start_delivery(task, record.run_id)
             if record.task is not None:
                 try:
                     await record.task
@@ -510,9 +511,21 @@ class SchedulerService:
                     raise
                 except Exception:
                     logger.warning("Scheduled run task raised unexpectedly", exc_info=True)
+            delivery_error: str | None = None
+            if delivery_task is not None:
+                try:
+                    await delivery_task
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    delivery_error = f"Delivery failed: {exc}"
+                    logger.warning("Scheduled task %s delivery failed", task.id, exc_info=True)
             current = self.manager.run_manager.get(record.run_id)
             status = current.status.value if current is not None else "unknown"
             error = current.error if current is not None else None
+            if delivery_error:
+                status = "error"
+                error = delivery_error
             await self.store.mark_task_run_finished(task_run_id, status, error)
             logger.info("Scheduled task %s fired at %s as run %s", task.id, scheduled_at, record.run_id)
         except asyncio.CancelledError:
@@ -521,6 +534,30 @@ class SchedulerService:
         except Exception as exc:
             logger.exception("Scheduled task %s dispatch failed", task.id)
             await self.store.mark_task_run_finished(task_run_id, "error", str(exc))
+
+    def _start_delivery(self, task: ScheduledTask, run_id: str) -> asyncio.Task | None:
+        delivery = task.metadata.get("delivery")
+        if not isinstance(delivery, dict) or delivery.get("channel") != "feishu":
+            return None
+
+        chat_id = delivery.get("chat_id")
+        if not isinstance(chat_id, str) or not chat_id:
+            logger.warning("Scheduled task %s has invalid Feishu delivery metadata", task.id)
+            return None
+
+        feishu_channel = getattr(self.manager, "feishu_channel", None)
+        if feishu_channel is None:
+            logger.warning("Scheduled task %s requested Feishu delivery but channel is unavailable", task.id)
+            return None
+
+        return asyncio.create_task(
+            feishu_channel.render_run_to_chat(
+                run_id=run_id,
+                thread_id=task.thread_id,
+                chat_id=chat_id,
+            ),
+            name=f"scheduled-feishu-delivery-{task.id}",
+        )
 
 
 def set_scheduler_service(service: SchedulerService | None) -> None:

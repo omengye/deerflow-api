@@ -7,6 +7,7 @@ import unittest
 from app import dependencies
 from app.channels.feishu import FeishuChannel, _IncomingResource, _filename_for_incoming_resource, _incoming_resources
 from deerflow.client import StreamEvent
+from deerflow.runtime import MemoryStreamBridge
 
 
 class _FakeClient:
@@ -35,8 +36,9 @@ class _FakeClient:
 
 
 class _FakeManager:
-    def __init__(self, client: _FakeClient) -> None:
+    def __init__(self, client: _FakeClient, stream_bridge: MemoryStreamBridge | None = None) -> None:
         self.client: _FakeClient = client
+        self.stream_bridge = stream_bridge
 
     async def get_async_client(self) -> _FakeClient:
         return self.client
@@ -129,8 +131,29 @@ class _RecordingFeishuChannel(FeishuChannel):
         finally:
             dependencies.get_client_manager = original_get_client_manager
 
+    async def render_run_to_chat_for_test(self, stream_bridge: MemoryStreamBridge) -> str:
+        original_get_client_manager = dependencies.get_client_manager
+        dependencies.get_client_manager = lambda: _FakeManager(_FakeClient([]), stream_bridge)
+        try:
+            return await self.render_run_to_chat(run_id="run-1", thread_id="thread-1", chat_id="chat-1")
+        finally:
+            dependencies.get_client_manager = original_get_client_manager
+
 
 class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_render_run_to_chat_consumes_stream_bridge_events(self) -> None:
+        stream_bridge = MemoryStreamBridge(queue_maxsize=32)
+        await stream_bridge.publish("run-1", "metadata", {"run_id": "run-1", "thread_id": "thread-1"})
+        await stream_bridge.publish("run-1", "messages-tuple", {"type": "ai", "content": "hello", "id": "ai-1", "is_delta": True})
+        await stream_bridge.publish_end("run-1")
+
+        channel = _RecordingFeishuChannel()
+        final_text = await channel.render_run_to_chat_for_test(stream_bridge)
+
+        self.assertEqual(final_text, "hello")
+        self.assertEqual(channel.sent_cards, [("chat-1", "Scheduled task started...", "card-1")])
+        self.assertEqual(channel.patched_cards, [("card-1", "hello")])
+
     async def test_stream_updates_same_card_for_same_ai_message_id(self) -> None:
         fake_client = _FakeClient(
             [
