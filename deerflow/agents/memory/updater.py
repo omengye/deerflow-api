@@ -311,7 +311,7 @@ class MemoryUpdater:
         """Get the model for memory updates."""
         config = get_memory_config()
         model_name = self._model_name or config.model_name
-        return create_chat_model(name=model_name, thinking_enabled=False)
+        return create_chat_model(name=model_name, thinking_enabled=False, disable_keepalive=True)
 
     def _build_correction_hint(
         self,
@@ -368,7 +368,6 @@ class MemoryUpdater:
 
     def _finalize_update(
         self,
-        current_memory: dict[str, Any],
         response_content: Any,
         thread_id: str | None,
         agent_name: str | None,
@@ -381,9 +380,13 @@ class MemoryUpdater:
             response_text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
 
         update_data = json.loads(response_text)
+        # Reload after the LLM call so we apply the generated patch to the
+        # freshest memory state. The model may have spent seconds generating;
+        # meanwhile manual edits or another worker may have persisted changes.
+        latest_memory = get_memory_storage().reload(agent_name)
         # Deep-copy before in-place mutation so a subsequent save() failure
         # cannot corrupt the still-cached original object reference.
-        updated_memory = self._apply_updates(copy.deepcopy(current_memory), update_data, thread_id)
+        updated_memory = self._apply_updates(copy.deepcopy(latest_memory), update_data, thread_id)
         updated_memory = _strip_upload_mentions_from_memory(updated_memory)
         return get_memory_storage().save(updated_memory, agent_name)
 
@@ -413,7 +416,6 @@ class MemoryUpdater:
             response = await model.ainvoke(prompt, config={"run_name": "memory_agent"})
             return await asyncio.to_thread(
                 self._finalize_update,
-                current_memory=current_memory,
                 response_content=response.content,
                 thread_id=thread_id,
                 agent_name=agent_name,

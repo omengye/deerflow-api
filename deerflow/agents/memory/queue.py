@@ -38,6 +38,7 @@ class MemoryUpdateQueue:
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
         self._processing = False
+        self._process_requested = False
 
     def add(
         self,
@@ -68,7 +69,10 @@ class MemoryUpdateQueue:
                 correction_detected=correction_detected,
                 reinforcement_detected=reinforcement_detected,
             )
-            self._reset_timer()
+            if self._processing:
+                self._process_requested = True
+            else:
+                self._reset_timer()
 
         logger.info("Memory update queued for thread %s, queue size: %d", thread_id, len(self._queue))
 
@@ -93,7 +97,10 @@ class MemoryUpdateQueue:
                 correction_detected=correction_detected,
                 reinforcement_detected=reinforcement_detected,
             )
-            self._schedule_timer(0)
+            if self._processing:
+                self._process_requested = True
+            else:
+                self._schedule_timer(0)
 
         logger.info("Memory update queued for immediate processing on thread %s, queue size: %d", thread_id, len(self._queue))
 
@@ -106,22 +113,34 @@ class MemoryUpdateQueue:
         correction_detected: bool,
         reinforcement_detected: bool,
     ) -> None:
-        existing_context = next(
-            (context for context in self._queue if context.thread_id == thread_id),
-            None,
-        )
+        existing_context = next((context for context in self._queue if context.thread_id == thread_id and context.agent_name == agent_name), None)
         merged_correction_detected = correction_detected or (existing_context.correction_detected if existing_context is not None else False)
         merged_reinforcement_detected = reinforcement_detected or (existing_context.reinforcement_detected if existing_context is not None else False)
+        merged_messages = self._merge_messages(existing_context.messages if existing_context is not None else [], messages)
         context = ConversationContext(
             thread_id=thread_id,
-            messages=messages,
+            messages=merged_messages,
             agent_name=agent_name,
             correction_detected=merged_correction_detected,
             reinforcement_detected=merged_reinforcement_detected,
         )
 
-        self._queue = [c for c in self._queue if c.thread_id != thread_id]
+        self._queue = [c for c in self._queue if not (c.thread_id == thread_id and c.agent_name == agent_name)]
         self._queue.append(context)
+
+    @staticmethod
+    def _merge_messages(existing: list[Any], new_messages: list[Any]) -> list[Any]:
+        """Merge queued message snapshots, de-duplicating messages with stable ids."""
+        merged = list(existing)
+        seen_ids = {message_id for message_id in (getattr(message, "id", None) for message in merged) if message_id}
+        for message in new_messages:
+            message_id = getattr(message, "id", None)
+            if message_id and message_id in seen_ids:
+                continue
+            merged.append(message)
+            if message_id:
+                seen_ids.add(message_id)
+        return merged
 
     def _reset_timer(self) -> None:
         """Reset the debounce timer."""
@@ -150,14 +169,15 @@ class MemoryUpdateQueue:
 
         with self._lock:
             if self._processing:
-                # Preserve immediate flush semantics even if another worker is active.
-                self._schedule_timer(0)
+                self._process_requested = True
                 return
 
             if not self._queue:
+                self._timer = None
                 return
 
             self._processing = True
+            self._process_requested = False
             contexts_to_process = self._queue.copy()
             self._queue.clear()
             self._timer = None
@@ -191,6 +211,10 @@ class MemoryUpdateQueue:
         finally:
             with self._lock:
                 self._processing = False
+                should_process_pending = bool(self._queue) and self._process_requested
+                self._process_requested = False
+                if should_process_pending:
+                    self._schedule_timer(0)
 
     def flush(self) -> None:
         """Force immediate processing of the queue.
@@ -222,6 +246,7 @@ class MemoryUpdateQueue:
                 self._timer = None
             self._queue.clear()
             self._processing = False
+            self._process_requested = False
 
     @property
     def pending_count(self) -> int:

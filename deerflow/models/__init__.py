@@ -28,7 +28,14 @@ async def aclose_chat_model(model: Any) -> None:
     # langchain_openai.ChatOpenAI: ``root_async_client`` is the
     # ``openai.AsyncOpenAI`` instance and ``http_async_client`` is a
     # user-supplied ``httpx.AsyncClient`` (when one was injected).
-    for attr in ("root_async_client", "http_async_client", "_async_client"):
+    #
+    # When we inject ``http_async_client`` we own that transport directly. Close
+    # it without marking the OpenAI root client as closed; some OpenAI-compatible
+    # wrappers/cache layers can otherwise surface "client has been closed" on a
+    # later model call that reuses the root client object.
+    explicit_http_client = getattr(model, "http_async_client", None)
+    attrs = ("http_async_client",) if explicit_http_client is not None else ("root_async_client", "_async_client")
+    for attr in attrs:
         client = getattr(model, attr, None)
         if client is None or id(client) in seen:
             continue

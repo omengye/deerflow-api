@@ -171,7 +171,11 @@ class SubagentExecutor:
             transports bound to the dying loop).
         """
         model_name = _get_model_name(self.config, self.parent_model)
-        model = create_chat_model(name=model_name, thinking_enabled=self.thinking_enabled)
+        model = create_chat_model(
+            name=model_name,
+            thinking_enabled=self.thinking_enabled,
+            disable_keepalive=True,
+        )
 
         from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware
         from deerflow.agents.middlewares.tool_error_handling_middleware import build_subagent_runtime_middlewares

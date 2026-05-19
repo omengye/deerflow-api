@@ -125,9 +125,9 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
         model = None
         try:
             if config.model_name:
-                model = create_chat_model(name=config.model_name, thinking_enabled=False)
+                model = create_chat_model(name=config.model_name, thinking_enabled=False, disable_keepalive=True)
             else:
-                model = create_chat_model(thinking_enabled=False)
+                model = create_chat_model(thinking_enabled=False, disable_keepalive=True)
             response = await model.ainvoke(prompt, config={"run_name": "title_agent"})
             title = self._parse_title(response.content)
             if title:
