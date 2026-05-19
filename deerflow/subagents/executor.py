@@ -18,7 +18,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.runnables import RunnableConfig
 
 from deerflow.agents.thread_state import AgentContext, SandboxState, ThreadDataState, ThreadState
-from deerflow.models import create_chat_model
+from deerflow.models import aclose_chat_model, create_chat_model
 from deerflow.subagents.config import SubagentConfig
 
 logger = logging.getLogger(__name__)
@@ -71,9 +71,6 @@ _scheduler_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="subagent
 # Thread pool for actual subagent execution (with timeout support)
 # Larger pool to avoid blocking when scheduler submits execution tasks
 _execution_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="subagent-exec-")
-
-# Dedicated pool for sync execute() calls made from an already-running event loop.
-_isolated_loop_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="subagent-isolated-")
 
 
 def _filter_tools(
@@ -165,7 +162,14 @@ class SubagentExecutor:
         logger.info(f"[trace={self.trace_id}] SubagentExecutor initialized: {config.name} with {len(self.tools)} tools")
 
     def _create_agent(self, stream_callback: Callable[[dict[str, Any]], None] | None = None):
-        """Create the agent instance."""
+        """Create the agent instance.
+
+        Returns:
+            (agent, model) tuple. The caller owns ``model`` and must close it
+            via :func:`aclose_chat_model` before the surrounding event loop
+            terminates (otherwise the openai httpx pool will leak SSL
+            transports bound to the dying loop).
+        """
         model_name = _get_model_name(self.config, self.parent_model)
         model = create_chat_model(name=model_name, thinking_enabled=self.thinking_enabled)
 
@@ -178,7 +182,7 @@ class SubagentExecutor:
         middlewares = build_subagent_runtime_middlewares(lazy_init=True, stream_callback=stream_callback)
         middlewares.append(LoopDetectionMiddleware(stream_callback=stream_callback))
 
-        return create_agent(
+        agent = create_agent(
             model=model,
             tools=self.tools,
             middleware=middlewares,
@@ -186,6 +190,7 @@ class SubagentExecutor:
             state_schema=ThreadState,
             context_schema=AgentContext,
         )
+        return agent, model
 
     async def _load_skill_messages(self) -> list[SystemMessage]:
         """Load skill content as conversation items based on config.skills.
@@ -306,8 +311,9 @@ class SubagentExecutor:
                 started_at=datetime.now(),
             )
 
+        chat_model: Any = None
         try:
-            agent = self._create_agent(stream_callback=stream_callback)
+            agent, chat_model = self._create_agent(stream_callback=stream_callback)
             state = await self._build_initial_state(task)
 
             # LangGraph recursion_limit counts individual node executions, not agent
@@ -522,51 +528,32 @@ class SubagentExecutor:
             result.status = SubagentStatus.FAILED
             result.error = str(e)
             result.completed_at = datetime.now()
+        finally:
+            # execute() runs us inside ``asyncio.run`` on a worker thread; the
+            # loop closes immediately after we return. Drain the model's httpx
+            # pool first so no SSL transport survives into the post-close GC
+            # sweep — that is the documented trigger for the
+            # ``RuntimeError: Event loop is closed`` chain seen during the
+            # parent agent's later LLM streaming on the main loop.
+            await aclose_chat_model(chat_model)
 
         return result
 
-    def _execute_in_isolated_loop(
+    async def aexecute(
         self,
         task: str,
         result_holder: SubagentResult | None = None,
         stream_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> SubagentResult:
-        """Execute the subagent in a completely fresh event loop.
+        """Execute the subagent on the caller's event loop.
 
-        This method is designed to run in a separate thread to ensure complete
-        isolation from any parent event loop, preventing conflicts with asyncio
-        primitives that may be bound to the parent loop (e.g., httpx clients).
+        Prefer this entry point from async code: it avoids the worker-thread
+        ``asyncio.run`` round-trip used by :meth:`execute`, which otherwise
+        leaves an isolated event loop on the stack and is the documented
+        trigger for cross-loop ``Event loop is closed`` failures in the
+        parent agent's httpx connection pool.
         """
-        try:
-            previous_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            previous_loop = None
-
-        # Create and set a new event loop for this thread
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(self._aexecute(task, result_holder, stream_callback))
-        finally:
-            try:
-                pending = asyncio.all_tasks(loop)
-                if pending:
-                    for task_obj in pending:
-                        task_obj.cancel()
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-
-                loop.run_until_complete(loop.shutdown_asyncgens())
-                loop.run_until_complete(loop.shutdown_default_executor())
-            except Exception:
-                logger.debug(
-                    f"[trace={self.trace_id}] Failed while cleaning up isolated event loop for subagent {self.config.name}",
-                    exc_info=True,
-                )
-            finally:
-                try:
-                    loop.close()
-                finally:
-                    asyncio.set_event_loop(previous_loop)
+        return await self._aexecute(task, result_holder, stream_callback)
 
     def execute(
         self,
@@ -574,36 +561,27 @@ class SubagentExecutor:
         result_holder: SubagentResult | None = None,
         stream_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> SubagentResult:
-        """Execute a task synchronously (wrapper around async execution).
+        """Execute synchronously via ``asyncio.run``.
 
-        This method runs the async execution in a new event loop, allowing
-        asynchronous tools (like MCP tools) to be used within the thread pool.
-
-        When called from within an already-running event loop (e.g., when the
-        parent agent is async), this method isolates the subagent execution in
-        a separate thread to avoid event loop conflicts with shared async
-        primitives like httpx clients.
-
-        Args:
-            task: The task description for the subagent.
-            result_holder: Optional pre-created result object to update during execution.
-            stream_callback: Optional callback for real-time LLM token chunks.
-
-        Returns:
-            SubagentResult with the execution result.
+        Intended for callers that have no running event loop (e.g. CLI
+        scripts and the ``_execution_pool`` worker invoked by
+        :meth:`execute_async`).  Async callers must use :meth:`aexecute`
+        instead — calling this from a running loop would either deadlock or
+        force a fresh isolated loop, which is precisely what previously
+        poisoned the parent's httpx pool.
         """
         try:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
 
-            if loop is not None and loop.is_running():
-                logger.debug(f"[trace={self.trace_id}] Subagent {self.config.name} detected running event loop, using isolated thread")
-                future = _isolated_loop_pool.submit(self._execute_in_isolated_loop, task, result_holder, stream_callback)
-                return future.result()
+        if running_loop is not None and running_loop.is_running():
+            raise RuntimeError(
+                "SubagentExecutor.execute() cannot be called from a running "
+                "event loop; use `await executor.aexecute(...)` instead."
+            )
 
-            # Standard path: no running event loop, use asyncio.run
+        try:
             return asyncio.run(self._aexecute(task, result_holder, stream_callback))
         except Exception as e:
             logger.exception(f"[trace={self.trace_id}] Subagent {self.config.name} execution failed")

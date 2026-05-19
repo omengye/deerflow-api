@@ -9,7 +9,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langgraph.runtime import Runtime
 
 from deerflow.config.title_config import get_title_config
-from deerflow.models import create_chat_model
+from deerflow.models import aclose_chat_model, create_chat_model
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +122,7 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
         config = get_title_config()
         prompt, user_msg = self._build_title_prompt(state)
 
+        model = None
         try:
             if config.model_name:
                 model = create_chat_model(name=config.model_name, thinking_enabled=False)
@@ -133,6 +134,11 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
                 return {"title": title}
         except Exception:
             logger.debug("Failed to generate async title; falling back to local title", exc_info=True)
+        finally:
+            # Drain the per-call httpx pool so connections don't outlive the
+            # short-lived ChatOpenAI; consistent with the cleanup pattern used
+            # by other one-shot LLM callers (MemoryUpdater, subagents).
+            await aclose_chat_model(model)
         return {"title": self._fallback_title(user_msg)}
 
     @override

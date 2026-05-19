@@ -22,7 +22,7 @@ from deerflow.agents.memory.storage import (
     utc_now_iso_z,
 )
 from deerflow.config.memory_config import get_memory_config
-from deerflow.models import create_chat_model
+from deerflow.models import aclose_chat_model, create_chat_model
 
 logger = logging.getLogger(__name__)
 
@@ -396,6 +396,7 @@ class MemoryUpdater:
         reinforcement_detected: bool = False,
     ) -> bool:
         """Update memory asynchronously based on conversation messages."""
+        model: Any = None
         try:
             prepared = await asyncio.to_thread(
                 self._prepare_update_prompt,
@@ -423,6 +424,12 @@ class MemoryUpdater:
         except Exception as e:
             logger.exception("Memory update failed: %s", e)
             return False
+        finally:
+            # _run_async_update_sync wraps this in asyncio.run() on a worker
+            # thread; the loop closes right after this coroutine returns.
+            # Drain the model's httpx pool first so no transport survives into
+            # the post-close GC sweep (root cause of `Event loop is closed`).
+            await aclose_chat_model(model)
 
     def update_memory(
         self,

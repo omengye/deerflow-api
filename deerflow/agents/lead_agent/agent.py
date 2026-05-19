@@ -69,12 +69,15 @@ def _create_summarization_middleware() -> DeerFlowSummarizationMiddleware | None
     keep = config.keep.to_tuple()
 
     # Prepare model parameter
+    # The summarization middleware is built once per lead-agent instance and
+    # reused for every summarisation turn — same long-lived-pool risk as the
+    # lead agent itself, so opt out of keep-alive consistently.
     if config.model_name:
-        model = create_chat_model(name=config.model_name, thinking_enabled=False)
+        model = create_chat_model(name=config.model_name, thinking_enabled=False, disable_keepalive=True)
     else:
         # Use a lightweight model for summarization to save costs
         # Falls back to default model if not explicitly specified
-        model = create_chat_model(thinking_enabled=False)
+        model = create_chat_model(thinking_enabled=False, disable_keepalive=True)
 
     # Prepare kwargs
     kwargs = {

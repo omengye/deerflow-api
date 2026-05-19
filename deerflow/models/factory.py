@@ -9,6 +9,27 @@ from deerflow.tracing import build_tracing_callbacks
 logger = logging.getLogger(__name__)
 
 
+def _build_no_keepalive_async_client():
+    """Build an httpx.AsyncClient with keep-alive disabled.
+
+    Used as the ``http_async_client`` for long-lived ChatOpenAI instances
+    on hot paths (lead agent, shared summarization middleware) so the
+    openai/httpx connection pool never retains SSL transports across LLM
+    calls — eliminating the residual `RuntimeError: Event loop is closed`
+    risk if any code path ever schedules a model call from a foreign loop.
+
+    ``timeout=None`` defers timeout enforcement to the openai SDK / chunk
+    timeout middleware, matching langchain_openai's default behaviour
+    when it builds its own httpx client.
+    """
+    import httpx
+
+    return httpx.AsyncClient(
+        limits=httpx.Limits(max_keepalive_connections=0),
+        timeout=httpx.Timeout(timeout=None),
+    )
+
+
 def _deep_merge_dicts(base: dict | None, override: dict) -> dict:
     """Recursively merge two dictionaries without mutating the inputs."""
     merged = dict(base or {})
@@ -46,11 +67,25 @@ def _enable_stream_usage_by_default(model_use_path: str, model_settings_from_con
         model_settings_from_config["stream_usage"] = True
 
 
-def create_chat_model(name: str | None = None, thinking_enabled: bool = False, **kwargs) -> BaseChatModel:
+def create_chat_model(
+    name: str | None = None,
+    thinking_enabled: bool = False,
+    *,
+    disable_keepalive: bool = False,
+    **kwargs,
+) -> BaseChatModel:
     """Create a chat model instance from the config.
 
     Args:
         name: The name of the model to create. If None, the first model in the config will be used.
+        thinking_enabled: Enable thinking-mode settings declared in the model config.
+        disable_keepalive: Inject an httpx.AsyncClient with keep-alive disabled
+            for ChatOpenAI subclasses. Opt in for long-lived shared models on
+            hot paths (lead agent, shared summarization middleware) so the
+            openai connection pool never carries SSL transports across LLM
+            calls. Adds a TCP+TLS handshake per request; do not enable for
+            short-lived per-call models — they already drain on close via
+            ``aclose_chat_model``.
 
     Returns:
         A chat model instance.
@@ -114,6 +149,15 @@ def create_chat_model(name: str | None = None, thinking_enabled: bool = False, *
         model_settings_from_config.pop("reasoning_effort", None)
 
     _enable_stream_usage_by_default(model_config.use, model_settings_from_config)
+
+    if disable_keepalive:
+        try:
+            from langchain_openai import ChatOpenAI
+
+            if issubclass(model_class, ChatOpenAI) and "http_async_client" not in model_settings_from_config and "http_async_client" not in kwargs:
+                model_settings_from_config["http_async_client"] = _build_no_keepalive_async_client()
+        except Exception:
+            logger.debug("Failed to inject no-keepalive http_async_client; falling back to default", exc_info=True)
 
     # For Codex Responses API models: map thinking mode to reasoning_effort
     from deerflow.models.openai_codex_provider import CodexChatModel

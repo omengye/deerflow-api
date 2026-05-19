@@ -287,7 +287,11 @@ class DeerFlowClient:
         max_concurrent_subagents = clamp_subagent_limit(cfg.get("max_concurrent_subagents", 3))
 
         kwargs: dict[str, Any] = {
-            "model": create_chat_model(name=model_name, thinking_enabled=thinking_enabled),
+            # disable_keepalive: the lead agent's ChatOpenAI is cached per
+            # config and reused across requests; opting out of keep-alive
+            # ensures the httpx pool never carries SSL transports that
+            # could later be torn down on a foreign loop.
+            "model": create_chat_model(name=model_name, thinking_enabled=thinking_enabled, disable_keepalive=True),
             "tools": self._get_tools(model_name=model_name, subagent_enabled=subagent_enabled),
             "middleware": _build_middlewares(config, model_name=model_name, agent_name=self._agent_name, custom_middlewares=self._middlewares),
             "system_prompt": apply_prompt_template(
