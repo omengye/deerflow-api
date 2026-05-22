@@ -903,6 +903,75 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             ["RUN_STARTED", "TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END", "TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "CUSTOM", "RUN_FINISHED"],
         )
 
+    async def test_values_event_skips_historical_tool_calls_when_seen_ids_prepopulated(self) -> None:
+        """Regression: pre-populated seen_ids must prevent historical tool calls from being re-emitted."""
+        from langchain_core.messages import AIMessage, ToolMessage
+        from deerflow.client import DeerFlowClient, _StreamProcessingState
+
+        # Simulate Turn 2: seen_ids pre-populated with Turn 1 message IDs (checkpoint pre-pop)
+        stream_state = _StreamProcessingState()
+        stream_state.seen_ids.update({"hist-ai-1", "hist-tm-1"})
+
+        hist_ai = AIMessage(
+            content="",
+            id="hist-ai-1",
+            tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "call-1", "type": "tool_call"}],
+        )
+        hist_tool = ToolMessage(content="result", tool_call_id="call-1", id="hist-tm-1")
+        current_ai = AIMessage(content="new answer", id="current-ai-1")
+
+        values_item = ("values", {
+            "title": None,
+            "messages": [hist_ai, hist_tool, current_ai],
+            "artifacts": [],
+        })
+
+        client = object.__new__(DeerFlowClient)
+        events = list(client._events_from_stream_item(values_item, stream_state))
+
+        # Historical messages must NOT produce messages-tuple streaming events
+        streaming = [e for e in events if e.type == "messages-tuple"]
+        self.assertEqual(len(streaming), 1, "Only the current-turn AI message should produce a streaming event")
+        self.assertEqual(streaming[0].data["id"], "current-ai-1")
+
+        # Full snapshot must still include all messages (for MESSAGES_SNAPSHOT)
+        snapshots = [e for e in events if e.type == "values"]
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(len(snapshots[0].data["messages"]), 3)
+
+    async def test_values_event_replays_historical_tool_calls_without_prepopulation(self) -> None:
+        """Document the bug: without seen_ids pre-population, historical tool calls ARE re-emitted."""
+        from langchain_core.messages import AIMessage, ToolMessage
+        from deerflow.client import DeerFlowClient, _StreamProcessingState
+
+        stream_state = _StreamProcessingState()  # Fresh, no pre-population
+
+        hist_ai = AIMessage(
+            content="",
+            id="hist-ai-1",
+            tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "call-1", "type": "tool_call"}],
+        )
+        hist_tool = ToolMessage(content="result", tool_call_id="call-1", id="hist-tm-1")
+
+        values_item = ("values", {
+            "title": None,
+            "messages": [hist_ai, hist_tool],
+            "artifacts": [],
+        })
+
+        client = object.__new__(DeerFlowClient)
+        events = list(client._events_from_stream_item(values_item, stream_state))
+
+        # Without pre-population, historical messages DO produce streaming events (the bug)
+        streaming_tool_calls = [
+            e for e in events if e.type == "messages-tuple" and e.data.get("tool_calls")
+        ]
+        streaming_tool_results = [
+            e for e in events if e.type == "messages-tuple" and e.data.get("type") == "tool"
+        ]
+        self.assertEqual(len(streaming_tool_calls), 1, "Bug: historical AI tool calls re-emitted")
+        self.assertEqual(len(streaming_tool_results), 1, "Bug: historical tool results re-emitted")
+
     async def test_client_manager_async_client_uses_async_checkpointer(self) -> None:
         manager = ClientManager()
         async_checkpointer = InMemorySaver()
