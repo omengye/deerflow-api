@@ -41,10 +41,11 @@ class _SandboxRecord:
 class AioSandbox(Sandbox):
     """Docker-backed sandbox that exposes mounted paths directly in-container."""
 
-    def __init__(self, id: str, container_name: str, *, timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS) -> None:
+    def __init__(self, id: str, container_name: str, *, timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS, container_user: str | None = None) -> None:
         super().__init__(id)
         self.container_name = container_name
         self.timeout = timeout
+        self._container_user = container_user
 
     def _docker_exec(
         self,
@@ -54,7 +55,7 @@ class AioSandbox(Sandbox):
         text: bool = True,
         check: bool = False,
     ) -> subprocess.CompletedProcess:
-        cmd = ["docker", "exec", "-i", self.container_name, *args]
+        cmd = ["docker", "exec", "-i", *(["-u", self._container_user] if self._container_user else []), self.container_name, *args]
         return subprocess.run(
             cmd,
             input=input_data,
@@ -399,6 +400,11 @@ class AioSandboxProvider(SandboxProvider):
         self.environment = sandbox_cfg.environment or {}
         self.mounts = sandbox_cfg.mounts or []
         self.security_opt = getattr(sandbox_cfg, "security_opt", None) or []
+        raw_user = getattr(sandbox_cfg, "container_user", "auto")
+        if raw_user == "auto":
+            self.container_user: str | None = f"{os.getuid()}:{os.getgid()}"
+        else:
+            self.container_user = raw_user or None
         self.skills_path = config.skills.get_skills_path()
         self.skills_container_path = config.skills.container_path
         self._lock = threading.Lock()
@@ -458,6 +464,8 @@ class AioSandboxProvider(SandboxProvider):
         for opt in self.security_opt:
             if opt:
                 args.extend(["--security-opt", opt])
+        if self.container_user:
+            args.extend(["--user", self.container_user])
         for key, value in self.environment.items():
             resolved = os.environ.get(value[1:], "") if isinstance(value, str) and value.startswith("$") else value
             args.extend(["-e", f"{key}={resolved}"])
@@ -472,7 +480,7 @@ class AioSandboxProvider(SandboxProvider):
         except subprocess.CalledProcessError as exc:
             diagnostic = (exc.stderr or exc.stdout or "").strip()
             raise RuntimeError(f"Failed to start sandbox container {name}: {diagnostic}") from exc
-        return AioSandbox(sandbox_id, name)
+        return AioSandbox(sandbox_id, name, container_user=self.container_user)
 
     def _evict_if_needed(self) -> None:
         while len(self._records) >= self.replicas and self._records:

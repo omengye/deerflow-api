@@ -26,6 +26,7 @@ class SandboxConfig(BaseModel):
         mounts: List of volume mounts to share directories with the container
         environment: Environment variables to inject into the container (values starting with $ are resolved from host env)
         security_opt: List of Docker --security-opt values to apply to the sandbox container
+        container_user: User for docker run/exec ('auto' uses host UID:GID, null omits --user, 'UID:GID' sets explicit value)
 
     LocalWslProvider specific options (Windows only):
         wsl_distro: WSL distro name (e.g. "Ubuntu-22.04"). If None, the default
@@ -79,6 +80,16 @@ class SandboxConfig(BaseModel):
     security_opt: list[str] = Field(
         default_factory=list,
         description="List of Docker --security-opt values to apply to the sandbox container.",
+    )
+    container_user: str | None = Field(
+        default="auto",
+        description=(
+            "User to run inside the sandbox container (docker run --user / docker exec -u). "
+            "'auto' (default) uses the host process UID:GID so that files written to volume-mounted "
+            "thread directories are owned by the current user rather than root. "
+            "Set to an explicit 'UID:GID' string to override, or null/empty to omit --user entirely "
+            "(reverts to the image's default user, typically root)."
+        ),
     )
 
     bash_output_max_chars: int = Field(
