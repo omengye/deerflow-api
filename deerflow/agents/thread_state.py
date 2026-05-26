@@ -57,12 +57,25 @@ def merge_viewed_images(existing: dict[str, ViewedImageData] | None, new: dict[s
     return {**existing, **new}
 
 
+def merge_todos(existing: list | None, new: list | None) -> list | None:
+    """Reducer for todos list - keeps the last non-None value.
+
+    Without this reducer, downstream nodes that return partial state updates
+    omitting ``todos`` would cause LangGraph to implicitly set the field to
+    ``None``, wiping previously streamed values. An explicit empty list still
+    represents a deliberate clear and wins over ``existing``.
+    """
+    if new is None:
+        return existing
+    return new
+
+
 class ThreadState(AgentState):
     sandbox: NotRequired[SandboxState | None]
     thread_data: NotRequired[ThreadDataState | None]
     title: NotRequired[str | None]
     artifacts: Annotated[list[str], merge_artifacts]
-    todos: NotRequired[list | None]
+    todos: Annotated[list | None, merge_todos]
     uploaded_files: NotRequired[list[dict] | None]
     viewed_images: Annotated[dict[str, ViewedImageData], merge_viewed_images]  # image_path -> {base64, mime_type}
     thread_directories_created: NotRequired[bool]
