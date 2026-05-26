@@ -6,9 +6,14 @@ arguments indefinitely until the recursion limit kills the run.
 Detection strategy:
   1. After each model response, hash the tool calls (name + args).
   2. Track recent hashes in a sliding window.
-  3. If the same hash appears >= warn_threshold times, inject a
-     "you are repeating yourself — wrap up" system message (once per hash).
-  4. If it appears >= hard_limit times, strip all tool_calls from the
+  3. If the same hash appears >= warn_threshold times, queue a
+     "you are repeating yourself — wrap up" warning to be injected as a
+     plain HumanMessage at the END of the next outgoing message list
+     (during ``wrap_model_call``). Queuing — rather than returning the
+     warning from ``after_model`` — avoids splitting an ``AIMessage``
+     tool_calls from its ToolMessage responses, which would otherwise
+     trigger 400s on strict provider validators (OpenAI / Moonshot).
+  4. If a hash appears >= hard_limit times, strip all tool_calls from the
      response so the agent is forced to produce a final text answer.
 """
 
@@ -17,12 +22,13 @@ import json
 import logging
 import threading
 from collections import OrderedDict, defaultdict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from typing import Any, override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
 from langchain_core.messages import HumanMessage
 from langgraph.runtime import Runtime
 
@@ -35,6 +41,7 @@ _DEFAULT_WINDOW_SIZE = 20  # track last N tool calls
 _DEFAULT_MAX_TRACKED_THREADS = 100  # LRU eviction limit
 _DEFAULT_TOOL_FREQ_WARN = 30  # warn after 30 calls to the same tool type
 _DEFAULT_TOOL_FREQ_HARD_LIMIT = 50  # force-stop after 50 calls to the same tool type
+_MAX_PENDING_WARNINGS_PER_RUN = 4
 
 
 def _normalize_tool_call_args(raw_args: object) -> tuple[dict, str | None]:
@@ -112,7 +119,6 @@ def _hash_tool_calls(tool_calls: list[dict]) -> str:
     This is intended to be order-independent: the same multiset of tool calls
     should always produce the same hash, regardless of their input order.
     """
-    # Normalize each tool call to a stable (name, key) structure.
     normalized: list[str] = []
     for tc in tool_calls:
         name = tc.get("name", "")
@@ -121,7 +127,6 @@ def _hash_tool_calls(tool_calls: list[dict]) -> str:
 
         normalized.append(f"{name}:{key}")
 
-    # Sort so permutations of the same multiset of calls yield the same ordering.
     normalized.sort()
     blob = json.dumps(normalized, sort_keys=True, default=str)
     return hashlib.md5(blob.encode()).hexdigest()[:12]
@@ -156,6 +161,9 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             Default: 30.
         tool_freq_hard_limit: Number of calls to the same tool type before
             forcing a stop. Default: 50.
+        stream_callback: Optional callback that receives ``{"type": ..., "message": ...}``
+            events for ``loop_warning`` / ``loop_hard_stop``. When ``None``,
+            falls back to LangGraph's ``get_stream_writer()``.
     """
 
     def __init__(
@@ -183,6 +191,13 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         # Per-thread, per-tool-type cumulative call counts
         self._tool_freq: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self._tool_freq_warned: dict[str, set[str]] = defaultdict(set)
+        # Deferred warnings: queued in ``after_model`` and drained in
+        # ``wrap_model_call`` so they land at the end of the message list
+        # rather than between an AIMessage tool_calls and its ToolMessage
+        # responses. Keyed by (thread_id, run_id).
+        self._pending_warnings: dict[tuple[str, str], list[str]] = defaultdict(list)
+        self._pending_warning_touch_order: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self._max_pending_warning_keys = max(1, self.max_tracked_threads * 2)
 
     def _get_thread_id(self, runtime: Runtime) -> str:
         """Extract the loop-detection scope from runtime context.
@@ -195,8 +210,19 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         context = runtime.context or {}
         thread_id = context.get("loop_detection_scope_id") or context.get("thread_id")
         if thread_id:
-            return thread_id
+            return str(thread_id)
         return "default"
+
+    def _get_run_id(self, runtime: Runtime) -> str:
+        """Extract run_id from runtime context for per-run warning scoping."""
+        context = runtime.context or {}
+        run_id = context.get("run_id")
+        if run_id:
+            return str(run_id)
+        return "default"
+
+    def _pending_key(self, runtime: Runtime) -> tuple[str, str]:
+        return self._get_thread_id(runtime), self._get_run_id(runtime)
 
     def _evict_if_needed(self) -> None:
         """Evict least recently used threads if over the limit.
@@ -208,14 +234,58 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             self._warned.pop(evicted_id, None)
             self._tool_freq.pop(evicted_id, None)
             self._tool_freq_warned.pop(evicted_id, None)
+            for key in list(self._pending_warnings):
+                if key[0] == evicted_id:
+                    self._drop_pending_warning_key_locked(key)
             logger.debug("Evicted loop tracking for thread %s (LRU)", evicted_id)
+
+    def _drop_pending_warning_key_locked(self, key: tuple[str, str]) -> None:
+        """Drop all pending-warning bookkeeping for one (thread, run) key.
+
+        Must be called while holding self._lock.
+        """
+        self._pending_warnings.pop(key, None)
+        self._pending_warning_touch_order.pop(key, None)
+
+    def _touch_pending_warning_key_locked(self, key: tuple[str, str]) -> None:
+        """Mark a pending-warning key as recently used.
+
+        Must be called while holding self._lock.
+        """
+        self._pending_warning_touch_order[key] = None
+        self._pending_warning_touch_order.move_to_end(key)
+
+    def _prune_pending_warning_state_locked(self, protected_key: tuple[str, str]) -> None:
+        """Cap pending-warning state across abnormal or concurrent runs.
+
+        Must be called while holding self._lock.
+        """
+        overflow = len(self._pending_warning_touch_order) - self._max_pending_warning_keys
+        if overflow <= 0:
+            return
+
+        candidates = [key for key in self._pending_warning_touch_order if key != protected_key]
+        for key in candidates[:overflow]:
+            self._drop_pending_warning_key_locked(key)
+
+    def _queue_pending_warning(self, runtime: Runtime, warning: str) -> None:
+        """Queue one transient warning for current (thread, run) with caps."""
+        pending_key = self._pending_key(runtime)
+        with self._lock:
+            warnings = self._pending_warnings[pending_key]
+            if warning not in warnings:
+                warnings.append(warning)
+            if len(warnings) > _MAX_PENDING_WARNINGS_PER_RUN:
+                del warnings[: len(warnings) - _MAX_PENDING_WARNINGS_PER_RUN]
+            self._touch_pending_warning_key_locked(pending_key)
+            self._prune_pending_warning_state_locked(protected_key=pending_key)
 
     def _track_and_check(self, state: AgentState, runtime: Runtime) -> tuple[str | None, bool]:
         """Track tool calls and check for loops.
 
         Two detection layers:
-          1. **Hash-based** (existing): catches identical tool call sets.
-          2. **Frequency-based** (new): catches the same *tool type* being
+          1. **Hash-based**: catches identical tool call sets.
+          2. **Frequency-based**: catches the same *tool type* being
              called many times with varying arguments (e.g. ``read_file``
              on 40 different files).
 
@@ -249,6 +319,14 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             history.append(call_hash)
             if len(history) > self.window_size:
                 history[:] = history[-self.window_size :]
+
+            # Hashes that fall out of the window should be eligible to warn
+            # again if they reappear later. Mirror the upstream behavior.
+            warned_hashes = self._warned.get(thread_id)
+            if warned_hashes is not None:
+                warned_hashes.intersection_update(history)
+                if not warned_hashes:
+                    self._warned.pop(thread_id, None)
 
             count = history.count(call_hash)
             tool_names = [tc.get("name", "?") for tc in tool_calls]
@@ -384,15 +462,69 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
 
         if warning:
             self._emit({"type": "loop_warning", "message": warning})
+            # Defer injection to ``wrap_model_call`` so the HumanMessage is
+            # appended at the end of the message list rather than between an
+            # AIMessage tool_calls and its corresponding ToolMessages.
+            self._queue_pending_warning(runtime, warning)
+            return None
 
-            # Inject as HumanMessage instead of SystemMessage to avoid
-            # Anthropic's "multiple non-consecutive system messages" error.
-            # Anthropic models require system messages only at the start of
-            # the conversation; injecting one mid-conversation crashes
-            # langchain_anthropic's _format_messages(). HumanMessage works
-            # with all providers. See #1299.
-            return {"messages": [HumanMessage(content=warning)]}
+        return None
 
+    def _clear_other_run_pending_warnings(self, runtime: Runtime) -> None:
+        """Drop stale pending warnings for previous runs in this thread."""
+        thread_id, current_run_id = self._pending_key(runtime)
+        with self._lock:
+            for key in list(self._pending_warnings):
+                if key[0] == thread_id and key[1] != current_run_id:
+                    self._drop_pending_warning_key_locked(key)
+
+    def _clear_current_run_pending_warnings(self, runtime: Runtime) -> None:
+        """Drop pending warnings owned by current (thread, run)."""
+        pending_key = self._pending_key(runtime)
+        with self._lock:
+            self._drop_pending_warning_key_locked(pending_key)
+
+    @staticmethod
+    def _format_warning_message(warnings: list[str]) -> str:
+        """Merge pending warnings into one prompt message."""
+        deduped = list(dict.fromkeys(warnings))
+        return "\n\n".join(deduped)
+
+    def _drain_pending_warnings(self, runtime: Runtime) -> list[str]:
+        pending_key = self._pending_key(runtime)
+        with self._lock:
+            warnings = self._pending_warnings.pop(pending_key, [])
+            self._pending_warning_touch_order.pop(pending_key, None)
+        return warnings
+
+    def _augment_request(self, request: ModelRequest) -> ModelRequest:
+        """Append queued loop warnings (if any) to the outgoing message list.
+
+        The warning lands after every existing message — including the
+        ToolMessage responses to the previous AIMessage(tool_calls). That
+        preserves the assistant tool_calls -> tool_messages pairing required
+        by OpenAI/Moonshot, avoids Anthropic's mid-stream SystemMessage
+        restriction (we use HumanMessage), and never mutates an existing
+        AIMessage.
+        """
+        warnings = self._drain_pending_warnings(request.runtime)
+        if not warnings:
+            return request
+        new_messages = [
+            *request.messages,
+            HumanMessage(content=self._format_warning_message(warnings), name="loop_warning"),
+        ]
+        return request.override(messages=new_messages)
+
+    @override
+    def before_agent(self, state: AgentState, runtime: Runtime) -> dict | None:
+        """Clear stale pending warnings from previous runs on this thread."""
+        self._clear_other_run_pending_warnings(runtime)
+        return None
+
+    @override
+    async def abefore_agent(self, state: AgentState, runtime: Runtime) -> dict | None:
+        self._clear_other_run_pending_warnings(runtime)
         return None
 
     @override
@@ -403,6 +535,33 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
     async def aafter_model(self, state: AgentState, runtime: Runtime) -> dict | None:
         return self._apply(state, runtime)
 
+    @override
+    def after_agent(self, state: AgentState, runtime: Runtime) -> dict | None:
+        """Clear undrained pending warnings at run end."""
+        self._clear_current_run_pending_warnings(runtime)
+        return None
+
+    @override
+    async def aafter_agent(self, state: AgentState, runtime: Runtime) -> dict | None:
+        self._clear_current_run_pending_warnings(runtime)
+        return None
+
+    @override
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelCallResult:
+        return handler(self._augment_request(request))
+
+    @override
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelCallResult:
+        return await handler(self._augment_request(request))
+
     def reset(self, thread_id: str | None = None) -> None:
         """Clear tracking state. If thread_id given, clear only that thread."""
         with self._lock:
@@ -411,8 +570,13 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                 self._warned.pop(thread_id, None)
                 self._tool_freq.pop(thread_id, None)
                 self._tool_freq_warned.pop(thread_id, None)
+                for key in list(self._pending_warnings):
+                    if key[0] == thread_id:
+                        self._drop_pending_warning_key_locked(key)
             else:
                 self._history.clear()
                 self._warned.clear()
                 self._tool_freq.clear()
                 self._tool_freq_warned.clear()
+                self._pending_warnings.clear()
+                self._pending_warning_touch_order.clear()

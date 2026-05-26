@@ -15,6 +15,7 @@ class AgentContext(TypedDict, total=False):
     """
 
     thread_id: NotRequired[str]
+    run_id: NotRequired[str]
     sandbox_id: NotRequired[str]
     agent_name: NotRequired[str]
 
