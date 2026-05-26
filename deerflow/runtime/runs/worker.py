@@ -23,6 +23,8 @@ from typing import Any, Literal
 
 from deerflow.runtime.serialization import serialize
 from deerflow.runtime.stream_bridge import StreamBridge
+from deerflow.tracing.metadata import inject_langfuse_metadata
+from deerflow.tracing.naming import resolve_root_run_name
 
 from .manager import RunManager, RunRecord
 from .schemas import RunStatus
@@ -113,6 +115,22 @@ async def run_agent(
             config["context"].setdefault("thread_id", thread_id)
             config["context"].setdefault("run_id", run_id)
         config.setdefault("configurable", {})["__pregel_runtime"] = runtime
+
+        # Tag the run for Langfuse: session_id == thread_id, user_id is pulled
+        # from record.metadata when the caller supplied it, and run_name is
+        # resolved to a human-readable agent name when configured.
+        record_metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        user_id_value = record_metadata.get("user_id") if record_metadata else None
+        user_id = str(user_id_value) if user_id_value is not None else None
+        environment = record_metadata.get("environment") if record_metadata else None
+        inject_langfuse_metadata(
+            config,
+            thread_id=thread_id,
+            user_id=user_id,
+            assistant_id=record.assistant_id,
+            environment=str(environment) if environment is not None else None,
+        )
+        config.setdefault("run_name", resolve_root_run_name(config, record.assistant_id))
 
         runnable_config = RunnableConfig(**config)
         agent = agent_factory(config=runnable_config)
