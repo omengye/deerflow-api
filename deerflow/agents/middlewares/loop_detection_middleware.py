@@ -185,8 +185,15 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         self._tool_freq_warned: dict[str, set[str]] = defaultdict(set)
 
     def _get_thread_id(self, runtime: Runtime) -> str:
-        """Extract thread_id from runtime context for per-thread tracking."""
-        thread_id = runtime.context.get("thread_id") if runtime.context else None
+        """Extract the loop-detection scope from runtime context.
+
+        ``thread_id`` is conversation-scoped and can live across many user
+        requests. Prefer a per-run scope when the caller provides one so
+        normal long conversations do not accumulate tool-frequency counts
+        until they trip the hard limit.
+        """
+        context = runtime.context or {}
+        thread_id = context.get("loop_detection_scope_id") or context.get("thread_id")
         if thread_id:
             return thread_id
         return "default"

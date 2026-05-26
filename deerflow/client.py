@@ -444,7 +444,10 @@ class DeerFlowClient:
             raise RuntimeError("Agent was not initialized")
 
         state: dict[str, Any] = {"messages": [HumanMessage(content=message)]}
-        context = {"thread_id": thread_id}
+        context = {
+            "thread_id": thread_id,
+            "loop_detection_scope_id": f"{thread_id}:{uuid.uuid4().hex}",
+        }
         if self._agent_name:
             context["agent_name"] = self._agent_name
         return config, state, context
