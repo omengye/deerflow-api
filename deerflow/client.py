@@ -179,6 +179,9 @@ class DeerFlowClient:
         # Lazy agent — created on first call, recreated when config changes.
         self._agent = None
         self._agent_config_key: tuple | None = None
+        # Effective checkpointer used by the current agent (may differ from
+        # self._checkpointer when get_checkpointer() was called as fallback).
+        self._effective_checkpointer: Any = None
 
     @property
     def agent_name(self) -> str:
@@ -312,6 +315,7 @@ class DeerFlowClient:
             kwargs["checkpointer"] = checkpointer
 
         self._agent = create_agent(**kwargs)
+        self._effective_checkpointer = checkpointer
         self._agent_config_key = key
         logger.info("Agent created: agent_name=%s, model=%s, thinking=%s", self._agent_name, model_name, thinking_enabled)
 
@@ -427,6 +431,55 @@ class DeerFlowClient:
             flush_pending_str_parts()
             return "\n".join(pieces) if pieces else ""
         return str(content)
+
+    async def _seed_seen_ids_from_checkpoint(
+        self, stream_state: "_StreamProcessingState", thread_id: str
+    ) -> None:
+        """Pre-populate seen_ids with historical message IDs from the checkpoint.
+
+        Prevents re-emitting AI text / tool calls / tool results from previous
+        conversation turns when LangGraph fires a values snapshot that includes
+        the full thread state loaded from the checkpointer.
+        """
+        checkpointer = self._effective_checkpointer
+        if checkpointer is None:
+            return
+        try:
+            check_config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            aget_tuple = getattr(checkpointer, "aget_tuple", None)
+            if aget_tuple is not None:
+                cp_tuple = await aget_tuple(check_config)
+            else:
+                get_tuple = getattr(checkpointer, "get_tuple", None)
+                cp_tuple = get_tuple(check_config) if get_tuple is not None else None
+            if cp_tuple is None:
+                return
+            for msg in cp_tuple.checkpoint.get("channel_values", {}).get("messages", []):
+                if (msg_id := getattr(msg, "id", None)):
+                    stream_state.seen_ids.add(msg_id)
+        except Exception:
+            logger.debug("Failed to seed seen_ids from checkpoint (thread=%s)", thread_id, exc_info=True)
+
+    def _seed_seen_ids_from_checkpoint_sync(
+        self, stream_state: "_StreamProcessingState", thread_id: str
+    ) -> None:
+        """Sync variant of _seed_seen_ids_from_checkpoint for the sync stream() path."""
+        checkpointer = self._effective_checkpointer
+        if checkpointer is None:
+            return
+        try:
+            check_config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            get_tuple = getattr(checkpointer, "get_tuple", None)
+            if get_tuple is None:
+                return
+            cp_tuple = get_tuple(check_config)
+            if cp_tuple is None:
+                return
+            for msg in cp_tuple.checkpoint.get("channel_values", {}).get("messages", []):
+                if (msg_id := getattr(msg, "id", None)):
+                    stream_state.seen_ids.add(msg_id)
+        except Exception:
+            logger.debug("Failed to seed seen_ids from checkpoint (thread=%s)", thread_id, exc_info=True)
 
     def _prepare_stream_invocation(
         self,
@@ -781,6 +834,10 @@ class DeerFlowClient:
             raise RuntimeError("Agent was not initialized")
         stream_state = _StreamProcessingState()
 
+        actual_thread_id = config.get("configurable", {}).get("thread_id")
+        if actual_thread_id:
+            self._seed_seen_ids_from_checkpoint_sync(stream_state, actual_thread_id)
+
         for item in agent.stream(
             state,
             config=config,
@@ -811,6 +868,10 @@ class DeerFlowClient:
         if agent is None:
             raise RuntimeError("Agent was not initialized")
         stream_state = _StreamProcessingState()
+
+        actual_thread_id = config.get("configurable", {}).get("thread_id")
+        if actual_thread_id:
+            await self._seed_seen_ids_from_checkpoint(stream_state, actual_thread_id)
 
         async for item in agent.astream(
             state,
