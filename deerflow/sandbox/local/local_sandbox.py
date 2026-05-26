@@ -1,4 +1,5 @@
 import errno
+import logging
 import ntpath
 import os
 import shutil
@@ -7,9 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
+from deerflow.config.paths import VIRTUAL_PATH_PREFIX
 from deerflow.sandbox.local.list_dir import list_dir
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.search import GrepMatch, find_glob_matches, find_grep_matches
+
+logger = logging.getLogger(__name__)
+
+_MAX_DOWNLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
 
 
 @dataclass(frozen=True)
@@ -431,6 +437,31 @@ class LocalSandbox(Sandbox):
                 os.makedirs(dir_path, exist_ok=True)
             with open(resolved_path, "wb") as f:
                 f.write(content)
+        except OSError as e:
+            # Re-raise with the original path for clearer error messages, hiding internal resolved paths
+            raise type(e)(e.errno, e.strerror, path) from None
+
+    def download_file(self, path: str) -> bytes:
+        """Return raw bytes for *path* under ``/mnt/user-data``.
+
+        Paths outside the virtual user-data prefix are rejected to prevent
+        clients from exfiltrating arbitrary host files. Downloads are capped
+        at 100 MB so a runaway agent cannot OOM the server.
+        """
+        normalised = path.replace("\\", "/")
+        stripped_path = normalised.lstrip("/")
+        allowed_prefix = VIRTUAL_PATH_PREFIX.lstrip("/")
+        if stripped_path != allowed_prefix and not stripped_path.startswith(f"{allowed_prefix}/"):
+            logger.error("Refused download outside allowed directory: path=%s, allowed_prefix=%s", path, VIRTUAL_PATH_PREFIX)
+            raise PermissionError(errno.EACCES, f"Access denied: path must be under '{VIRTUAL_PATH_PREFIX}'", path)
+
+        resolved_path = self._resolve_path(path)
+        try:
+            file_size = os.path.getsize(resolved_path)
+            if file_size > _MAX_DOWNLOAD_SIZE:
+                raise OSError(errno.EFBIG, f"File exceeds maximum download size of {_MAX_DOWNLOAD_SIZE} bytes", path)
+            with open(resolved_path, "rb") as f:
+                return f.read()
         except OSError as e:
             # Re-raise with the original path for clearer error messages, hiding internal resolved paths
             raise type(e)(e.errno, e.strerror, path) from None

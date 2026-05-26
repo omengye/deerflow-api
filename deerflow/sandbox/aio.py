@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import fnmatch
+import logging
 import os
 import re
 import shlex
@@ -11,10 +13,14 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from deerflow.config.paths import get_paths
+from deerflow.config.paths import VIRTUAL_PATH_PREFIX, get_paths
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import SandboxProvider
 from deerflow.sandbox.search import GrepMatch
+
+logger = logging.getLogger(__name__)
+
+_MAX_DOWNLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
 
 DEFAULT_IMAGE = "enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest"
 DEFAULT_REPLICAS = 3
@@ -338,6 +344,37 @@ print(json.dumps({"truncated": truncated, "matches": matches}))
         )
         if result.returncode != 0:
             raise OSError(f"Failed to update file {path}: {self._output_from_result(result)}")
+
+    def download_file(self, path: str) -> bytes:
+        """Return raw bytes for *path* from the container under ``/mnt/user-data``.
+
+        Paths outside the virtual user-data prefix are rejected before
+        spawning the docker exec to prevent agents from exfiltrating
+        arbitrary container files. Output is capped at 100 MB.
+        """
+        normalised = path.replace("\\", "/")
+        stripped_path = normalised.lstrip("/")
+        allowed_prefix = VIRTUAL_PATH_PREFIX.lstrip("/")
+        if stripped_path != allowed_prefix and not stripped_path.startswith(f"{allowed_prefix}/"):
+            logger.error("Refused download outside allowed directory: path=%s, allowed_prefix=%s", path, VIRTUAL_PATH_PREFIX)
+            raise PermissionError(errno.EACCES, f"Access denied: path must be under '{VIRTUAL_PATH_PREFIX}'", path)
+
+        # ``cat -- path`` ensures paths starting with '-' are treated literally.
+        result = self._docker_exec(["cat", "--", path], text=False)
+        if result.returncode != 0:
+            stderr = result.stderr or b""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
+            if "No such file" in stderr or result.returncode == 1:
+                raise FileNotFoundError(errno.ENOENT, stderr.strip() or "File not found", path)
+            raise OSError(errno.EIO, stderr.strip() or "docker cat failed", path)
+
+        data = result.stdout or b""
+        if isinstance(data, str):
+            data = data.encode("utf-8", errors="replace")
+        if len(data) > _MAX_DOWNLOAD_SIZE:
+            raise OSError(errno.EFBIG, f"File exceeds maximum download size of {_MAX_DOWNLOAD_SIZE} bytes", path)
+        return data
 
 
 class AioSandboxProvider(SandboxProvider):

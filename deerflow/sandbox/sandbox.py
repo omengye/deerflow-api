@@ -91,3 +91,22 @@ class Sandbox(ABC):
             content: The binary content to write to the file.
         """
         pass
+
+    @abstractmethod
+    def download_file(self, path: str) -> bytes:
+        """Download the binary content of a file.
+
+        Args:
+            path: The absolute path of the file to download.
+
+        Returns:
+            Raw file bytes.
+
+        Raises:
+            PermissionError: If path traversal is detected or the path is
+                outside the allowed virtual prefix.
+            OSError: If the file cannot be read or does not exist. Both local
+                and remote implementations must raise ``OSError`` so callers
+                have a single exception type to handle.
+        """
+        pass

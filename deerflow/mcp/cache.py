@@ -128,10 +128,24 @@ def get_cached_mcp_tools() -> list[BaseTool]:
 def reset_mcp_tools_cache() -> None:
     """Reset the MCP tools cache.
 
-    This is useful for testing or when you want to reload MCP tools.
+    Also tears down persistent MCP sessions so they are recreated on the next
+    tool load — important when configuration changes (e.g. through the
+    Gateway API in a separate process) require fresh connections.
     """
     global _mcp_tools_cache, _cache_initialized, _config_mtime
     _mcp_tools_cache = None
     _cache_initialized = False
     _config_mtime = None
+
+    # Tear down any persistent MCP sessions before the next load picks up the
+    # refreshed configuration. Best-effort: errors here must not block reset.
+    try:
+        from deerflow.mcp.session_pool import get_session_pool, reset_session_pool
+
+        pool = get_session_pool()
+        pool.close_all_sync()
+        reset_session_pool()
+    except Exception:
+        logger.debug("MCP session pool cleanup during cache reset failed", exc_info=True)
+
     logger.info("MCP tools cache reset")
