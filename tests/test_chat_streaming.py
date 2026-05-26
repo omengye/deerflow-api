@@ -275,6 +275,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.on_disconnect, "continue")
         self.assertEqual(record.multitask_strategy, "rollback")
         self.assertEqual(record.kwargs["model_name"], "model-a")
+        self.assertEqual(record.kwargs["agent_name"], "agent-a")
         self.assertEqual(record.kwargs["subagent_enabled"], True)
         self.assertTrue(fake_client.astream_called)
         self.assertEqual(fake_client.last_message, "newest")
@@ -595,6 +596,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_agui_preserves_subagent_lifecycle_event_name(self) -> None:
         fake_client = _FakeClient(
             [
+                StreamEvent(type=_stream_event_type("subagent_started"), data={"task_id": "task-1", "name": "researcher"}),
                 StreamEvent(type=_stream_event_type("task_failed"), data={"task_id": "task-1", "error": "boom"}),
                 StreamEvent(type="end", data={"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}),
             ]
@@ -602,7 +604,8 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         events, _fake_manager, _chunks = await self._collect_agui_stream(fake_client)
 
-        self.assertEqual(events[1], {"type": "CUSTOM", "name": "deerflow.subagent.task_failed", "value": {"eventType": "task_failed", "task_id": "task-1", "error": "boom"}, "rawEvent": {"name": "lead_agent"}})
+        self.assertEqual(events[1], {"type": "CUSTOM", "name": "deerflow.subagent.subagent_started", "value": {"eventType": "subagent_started", "task_id": "task-1", "name": "researcher"}, "rawEvent": {"name": "researcher"}})
+        self.assertEqual(events[2], {"type": "CUSTOM", "name": "deerflow.subagent.task_failed", "value": {"eventType": "task_failed", "task_id": "task-1", "error": "boom"}, "rawEvent": {"name": "researcher"}})
 
     async def test_chat_agui_maps_subagent_token_chunks_to_text_message_events(self) -> None:
         fake_client = _FakeClient(
@@ -623,7 +626,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "TEXT_MESSAGE_START", "messageId": "subagent:task-1:message", "role": "assistant", "rawEvent": {"name": "researcher"}},
                 {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": "hello", "rawEvent": {"name": "researcher"}},
                 {"type": "TEXT_MESSAGE_CONTENT", "messageId": "subagent:task-1:message", "delta": " world", "rawEvent": {"name": "researcher"}},
-                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message", "rawEvent": {"name": "lead_agent"}},
+                {"type": "TEXT_MESSAGE_END", "messageId": "subagent:task-1:message", "rawEvent": {"name": "researcher"}},
             ],
         )
         self.assertIn({"type": "CUSTOM", "name": "deerflow.subagent.token_chunk", "value": {"eventType": "token_chunk", "task_id": "task-1", "content": "hello"}, "rawEvent": {"name": "researcher"}}, events)
@@ -991,6 +994,43 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(client, FakeDeerFlowClient)
         self.assertEqual(captured_kwargs[0]["checkpointer"], async_checkpointer)
+
+    async def test_plan_mode_todo_middleware_keeps_todos_internal(self) -> None:
+        from langchain.agents import create_agent
+        from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+
+        from deerflow.agents.middlewares.todo_middleware import TodoMiddleware
+        from deerflow.agents.thread_state import AgentContext, ThreadState
+
+        agent = create_agent(
+            model=FakeMessagesListChatModel(responses=[]),
+            tools=[],
+            middleware=[TodoMiddleware()],
+            state_schema=ThreadState,
+            context_schema=AgentContext,
+        )
+
+        input_schema = agent.input_schema.model_json_schema()
+        schema_defs = input_schema.get("$defs", {})
+        input_props = schema_defs.get("InputSchema", {}).get("properties", {})
+        self.assertNotIn("todos", input_props)
+
+    def test_invalid_requested_model_falls_back_to_agent_model(self) -> None:
+        from types import SimpleNamespace
+
+        from deerflow.agents.lead_agent import agent as lead_agent
+
+        class FakeAppConfig:
+            models = [SimpleNamespace(name="default")]
+
+            def get_model_config(self, name: str):
+                return SimpleNamespace(name=name) if name in {"default", "agent-model"} else None
+
+        with patch.object(lead_agent, "get_app_config", return_value=FakeAppConfig()):
+            self.assertEqual(
+                lead_agent._resolve_model_name("missing-model", "agent-model"),
+                "agent-model",
+            )
 
 
 if __name__ == "__main__":

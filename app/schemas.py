@@ -34,6 +34,7 @@ class AguiRunAgentInput(BaseModel):
     context: list[dict[str, Any]] = Field(default_factory=list)
     forwarded_props: dict[str, Any] = Field(default_factory=dict, alias="forwardedProps")
     model_name: Optional[str] = Field(default=None, alias="modelName")
+    agent_name: Optional[str] = Field(default=None, alias="agentName")
     thinking_enabled: Optional[bool] = Field(default=None, alias="thinkingEnabled")
     subagent_enabled: Optional[bool] = Field(default=None, alias="subagentEnabled")
     plan_mode: Optional[bool] = Field(default=None, alias="planMode")

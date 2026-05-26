@@ -35,8 +35,8 @@ def _get_runtime_config(config: RunnableConfig) -> dict:
     return cfg
 
 
-def _resolve_model_name(requested_model_name: str | None = None) -> str:
-    """Resolve a runtime model name safely, falling back to default if invalid. Returns None if no models are configured."""
+def _resolve_model_name(requested_model_name: str | None = None, fallback_model_name: str | None = None) -> str:
+    """Resolve a runtime model name safely, falling back through agent/default config."""
     app_config = get_app_config()
     default_model_name = app_config.models[0].name if app_config.models else None
     if default_model_name is None:
@@ -44,9 +44,15 @@ def _resolve_model_name(requested_model_name: str | None = None) -> str:
 
     if requested_model_name and app_config.get_model_config(requested_model_name):
         return requested_model_name
+    if fallback_model_name and app_config.get_model_config(fallback_model_name):
+        if requested_model_name and requested_model_name != fallback_model_name:
+            logger.warning(f"Model '{requested_model_name}' not found in config; fallback to agent model '{fallback_model_name}'.")
+        return fallback_model_name
 
     if requested_model_name and requested_model_name != default_model_name:
         logger.warning(f"Model '{requested_model_name}' not found in config; fallback to default model '{default_model_name}'.")
+    if fallback_model_name and fallback_model_name != default_model_name:
+        logger.warning(f"Agent model '{fallback_model_name}' not found in config; fallback to default model '{default_model_name}'.")
     return default_model_name
 
 
@@ -328,7 +334,7 @@ def make_lead_agent(config: RunnableConfig):
     agent_model_name = agent_config.model if agent_config and agent_config.model else None
 
     # Final model name resolution: request → agent config → global default, with fallback for unknown names
-    model_name = _resolve_model_name(requested_model_name or agent_model_name)
+    model_name = _resolve_model_name(requested_model_name, agent_model_name)
 
     app_config = get_app_config()
     model_config = app_config.get_model_config(model_name)

@@ -333,6 +333,8 @@ def _chat_kwargs_from_agui(req: AguiRunAgentInput) -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     if req.model_name:
         kwargs["model_name"] = req.model_name
+    if req.agent_name:
+        kwargs["agent_name"] = req.agent_name
     if req.thinking_enabled is not None:
         kwargs["thinking_enabled"] = req.thinking_enabled
     if req.subagent_enabled is not None:
@@ -661,7 +663,6 @@ def _subagent_terminal_event_to_agui(
     events: list[dict[str, Any]] = []
     task_id = str(data.get("task_id") or "")
     if task_id:
-        subagent_names_by_id.pop(task_id, None)
         reasoning_message_id = _subagent_reasoning_message_id(task_id)
         if reasoning_message_id in open_subagent_reasoning_message_ids:
             events.append({"type": "REASONING_MESSAGE_END", "messageId": reasoning_message_id})
