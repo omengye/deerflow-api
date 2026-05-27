@@ -204,6 +204,8 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
             return "The configured LLM provider rejected the request because the account is out of quota, billing is unavailable, or usage is restricted. Please fix the provider account and try again."
         if reason == "auth":
             return "The configured LLM provider rejected the request because authentication or access is invalid. Please check the provider credentials and try again."
+        if reason == "content_policy":
+            return "The configured LLM provider rejected this request because the input was flagged by its content safety policy. Please revise the message and try again."
         if reason in {"busy", "transient"}:
             return "The configured LLM provider is temporarily unavailable after multiple retries. Please wait a moment and continue the conversation."
         return f"LLM request failed: {detail}"
@@ -255,7 +257,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                         attempt,
                         _extract_error_detail(exc),
                     )
-                    raise
+                    return AIMessage(content=self._build_user_message(exc, reason))
                 if retriable and attempt < self.retry_max_attempts:
                     wait_ms = self._build_retry_delay_ms(attempt, exc)
                     logger.warning(
@@ -311,7 +313,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                         attempt,
                         _extract_error_detail(exc),
                     )
-                    raise
+                    return AIMessage(content=self._build_user_message(exc, reason))
                 if retriable and attempt < self.retry_max_attempts:
                     wait_ms = self._build_retry_delay_ms(attempt, exc)
                     logger.warning(
