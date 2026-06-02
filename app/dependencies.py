@@ -17,6 +17,34 @@ _client_manager = None
 _lock = threading.Lock()
 
 
+def _rmtree_via_root_container(paths, thread_id: str) -> None:
+    """Remove a thread directory containing root-owned files via a root container.
+
+    The AIO sandbox runs as root, so it leaves root-owned files (the
+    daemon-created workdir, image-init scaffolding) inside the bind-mounted
+    thread directory that the backend process cannot delete. We mount the
+    *parent* directory into a throwaway root container and ``rm -rf`` the
+    target so the deletion runs with the same privileges that created the
+    files. ``host_thread_dir`` is used so the Docker daemon resolves the mount
+    source correctly even when the backend runs inside a container.
+    """
+    import os
+    import subprocess
+
+    host_thread_dir = paths.host_thread_dir(thread_id)
+    parent = os.path.dirname(host_thread_dir)
+    name = os.path.basename(host_thread_dir)
+    if not parent or not name:
+        raise RuntimeError(f"Refusing to clean up unexpected thread path: {host_thread_dir!r}")
+    subprocess.run(
+        ["docker", "run", "--rm", "-v", f"{parent}:/target", "alpine", "rm", "-rf", f"/target/{name}"],
+        shell=False,
+        capture_output=True,
+        timeout=60,
+        check=True,
+    )
+
+
 class ClientManager:
     """Manages the shared DeerFlowClient instance."""
 
@@ -456,7 +484,16 @@ class ClientManager:
                 paths = get_paths()
                 thread_dir = paths.thread_dir(thread_id)
                 if thread_dir.exists():
-                    shutil.rmtree(thread_dir)
+                    try:
+                        shutil.rmtree(thread_dir)
+                    except PermissionError:
+                        # The sandbox container starts as root (the image's init
+                        # needs root to boot), so it leaves root-owned files in the
+                        # bind-mounted thread directory — the daemon-created workdir
+                        # and image-init scaffolding (e.g. .openhands/skills). The
+                        # backend process cannot delete those, so fall back to a
+                        # throwaway root container to remove the whole directory.
+                        _rmtree_via_root_container(paths, thread_id)
             except Exception:
                 logger.warning("filesystem cleanup failed for %s", thread_id, exc_info=True)
 

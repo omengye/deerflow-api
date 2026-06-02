@@ -74,6 +74,12 @@ sandbox:
 #   replicas: 3
 #   container_prefix: deer-flow-sandbox
 #   idle_timeout: 600
+#   # User for sandbox commands. 'auto' (default, recommended) boots the
+#   # container as the image's root user so its init works, then runs tool
+#   # commands as the host UID:GID. The image's root init still leaves some
+#   # root-owned files in the thread directory; thread deletion cleans those
+#   # up via a short-lived root container, so the Docker CLI must stay available.
+#   container_user: auto
 #   security_opt:
 #     - seccomp:unconfined
 #   mounts:
