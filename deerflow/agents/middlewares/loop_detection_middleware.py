@@ -40,8 +40,73 @@ _DEFAULT_HARD_LIMIT = 5  # force-stop after 5 identical calls
 _DEFAULT_WINDOW_SIZE = 20  # track last N tool calls
 _DEFAULT_MAX_TRACKED_THREADS = 100  # LRU eviction limit
 _DEFAULT_TOOL_FREQ_WARN = 30  # warn after 30 calls to the same tool type
-_DEFAULT_TOOL_FREQ_HARD_LIMIT = 50  # force-stop after 50 calls to the same tool type
+_DEFAULT_TOOL_FREQ_HARD_LIMIT = 80  # force-stop after 80 calls to the same tool type
+# Per-run backstop across ALL tool types. A long, genuinely-diverse run
+# (every call differs, no single tool type repeats enough) evades both the
+# hash and per-tool-type layers and would otherwise only be stopped by the
+# graph ``recursion_limit`` — which aborts with an unrecoverable error rather
+# than degrading gracefully. The total caps are derived from recursion_limit
+# AND the per-turn graph cost (see ``_derive_total_call_limits``) so the two
+# stay in lock-step; these constants are the fallback when either is unknown.
+_DEFAULT_RECURSION_LIMIT = 200
+# How many graph super-steps a single tool-calling agent turn costs. In
+# LangChain's ``create_agent`` graph each ``before_model`` / ``after_model``
+# middleware hook is compiled as its *own* node, so one turn is
+# ``model + tools + (#before_model nodes) + (#after_model nodes)`` super-steps —
+# typically 4-5 for our agents, NOT 2. Use ``count_steps_per_turn`` to measure
+# the real value from a middleware chain; this is the fallback when unknown.
+_DEFAULT_STEPS_PER_TURN = 5
+# Of the turns achievable before the recursion limit, force a clean stop at this
+# fraction (headroom for the wrap-up step) and nudge to wrap up earlier still.
+_TOTAL_CALL_HARD_FRACTION = 0.80
+_TOTAL_CALL_WARN_FRACTION = 0.55
 _MAX_PENDING_WARNINGS_PER_RUN = 4
+
+
+def count_steps_per_turn(middlewares: list) -> int:
+    """Graph super-steps consumed by one tool-calling turn for *middlewares*.
+
+    Mirrors ``create_agent``'s graph construction: model + tools nodes (2) plus
+    one node per middleware that overrides a ``before_model`` / ``after_model``
+    hook. Used to keep the per-run backstop calibrated to the recursion limit.
+    """
+    before = after = 0
+    for m in middlewares:
+        cls = m.__class__
+        if cls.before_model is not AgentMiddleware.before_model or cls.abefore_model is not AgentMiddleware.abefore_model:
+            before += 1
+        if cls.after_model is not AgentMiddleware.after_model or cls.aafter_model is not AgentMiddleware.aafter_model:
+            after += 1
+    return before + after + 2
+
+
+def _derive_total_call_limits(recursion_limit: int | None, steps_per_turn: int | None = None) -> tuple[int, int]:
+    """Derive ``(total_call_warn, total_call_hard_limit)`` from the run budget.
+
+    Keeps the per-run tool-call backstop in lock-step with the graph
+    ``recursion_limit``: a run can make at most ``recursion_limit / steps_per_turn``
+    tool-calling turns, so we force a stop at a fraction of that ceiling (well
+    before the graph aborts with ``GraphRecursionError``). Returns sane, ordered
+    values (``1 <= warn < hard``) for any input.
+    """
+    limit = recursion_limit if isinstance(recursion_limit, int) and recursion_limit > 0 else _DEFAULT_RECURSION_LIMIT
+    steps = steps_per_turn if isinstance(steps_per_turn, int) and steps_per_turn > 0 else _DEFAULT_STEPS_PER_TURN
+    max_turns = max(2, limit // steps)
+    warn = max(1, int(max_turns * _TOTAL_CALL_WARN_FRACTION))
+    hard = max(warn + 1, int(max_turns * _TOTAL_CALL_HARD_FRACTION))
+    return warn, hard
+
+
+def calibrate_loop_detection(middlewares: list, recursion_limit: int | None) -> None:
+    """Recalibrate any ``LoopDetectionMiddleware`` in *middlewares* in place.
+
+    Call once the full chain is assembled so the per-run backstop reflects the
+    actual per-turn graph cost (number of model-phase middleware nodes).
+    """
+    steps = count_steps_per_turn(middlewares)
+    for m in middlewares:
+        if isinstance(m, LoopDetectionMiddleware):
+            m.set_run_budget(recursion_limit, steps_per_turn=steps)
 
 
 def _normalize_tool_call_args(raw_args: object) -> tuple[dict, str | None]:
@@ -142,6 +207,12 @@ _HARD_STOP_MSG = "[FORCED STOP] Repeated tool calls exceeded the safety limit. P
 
 _TOOL_FREQ_HARD_STOP_MSG = "[FORCED STOP] Tool {tool_name} called {count} times — exceeded the per-tool safety limit. Producing final answer with results collected so far."
 
+_TOTAL_CALLS_WARNING_MSG = (
+    "[LOOP DETECTED] You have made {count} tool calls in this run without producing a final answer. Wrap up now and produce your final answer from the results collected so far."
+)
+
+_TOTAL_CALLS_HARD_STOP_MSG = "[FORCED STOP] Total tool calls reached {count} — exceeded the per-run safety limit. Producing final answer with results collected so far."
+
 
 class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
     """Detects and breaks repetitive tool call loops.
@@ -161,6 +232,24 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             Default: 30.
         tool_freq_hard_limit: Number of calls to the same tool type before
             forcing a stop. Default: 50.
+        recursion_limit: The graph ``recursion_limit`` this agent runs under.
+            When ``total_call_warn`` / ``total_call_hard_limit`` are left as
+            ``None`` they are derived from it (see ``_derive_total_call_limits``)
+            so the per-run backstop stays in lock-step with the recursion limit.
+            Defaults to 200 when unknown.
+        steps_per_turn: Graph super-steps one tool-calling turn costs. With the
+            recursion limit this bounds the achievable turns. Left ``None`` here
+            and refined by ``calibrate_loop_detection`` once the full middleware
+            chain is known; defaults to 5 otherwise.
+        total_call_warn: Number of tool calls across *all* tool types in a
+            single run before injecting a wrap-up warning. Backstop for long,
+            diverse runs that evade the hash and per-tool-type layers. When
+            ``None`` (default), derived from the run budget.
+        total_call_hard_limit: Number of tool calls across all tool types
+            before forcing a stop. Kept below the achievable turn count so the
+            run ends with a clean final answer instead of a
+            ``GraphRecursionError``. When ``None`` (default), derived from the
+            run budget.
         stream_callback: Optional callback that receives ``{"type": ..., "message": ...}``
             events for ``loop_warning`` / ``loop_hard_stop``. When ``None``,
             falls back to LangGraph's ``get_stream_writer()``.
@@ -174,6 +263,10 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         max_tracked_threads: int = _DEFAULT_MAX_TRACKED_THREADS,
         tool_freq_warn: int = _DEFAULT_TOOL_FREQ_WARN,
         tool_freq_hard_limit: int = _DEFAULT_TOOL_FREQ_HARD_LIMIT,
+        recursion_limit: int | None = None,
+        steps_per_turn: int | None = None,
+        total_call_warn: int | None = None,
+        total_call_hard_limit: int | None = None,
         stream_callback: Callable[[dict[str, Any]], None] | None = None,
     ):
         super().__init__()
@@ -183,6 +276,12 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         self.max_tracked_threads = max_tracked_threads
         self.tool_freq_warn = tool_freq_warn
         self.tool_freq_hard_limit = tool_freq_hard_limit
+        # Per-run total backstop derived from the run budget unless overridden.
+        # ``calibrate_loop_detection`` refines steps_per_turn once the full chain
+        # is known; until then we use the supplied value or a safe default.
+        derived_warn, derived_hard = _derive_total_call_limits(recursion_limit, steps_per_turn)
+        self.total_call_warn = total_call_warn if total_call_warn is not None else derived_warn
+        self.total_call_hard_limit = total_call_hard_limit if total_call_hard_limit is not None else derived_hard
         self.stream_callback = stream_callback
         self._lock = threading.Lock()
         # Per-thread tracking using OrderedDict for LRU eviction
@@ -191,6 +290,9 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         # Per-thread, per-tool-type cumulative call counts
         self._tool_freq: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self._tool_freq_warned: dict[str, set[str]] = defaultdict(set)
+        # Per-thread cumulative call count across ALL tool types (backstop)
+        self._total_calls: dict[str, int] = defaultdict(int)
+        self._total_warned: set[str] = set()
         # Deferred warnings: queued in ``after_model`` and drained in
         # ``wrap_model_call`` so they land at the end of the message list
         # rather than between an AIMessage tool_calls and its ToolMessage
@@ -198,6 +300,15 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         self._pending_warnings: dict[tuple[str, str], list[str]] = defaultdict(list)
         self._pending_warning_touch_order: OrderedDict[tuple[str, str], None] = OrderedDict()
         self._max_pending_warning_keys = max(1, self.max_tracked_threads * 2)
+
+    def set_run_budget(self, recursion_limit: int | None, steps_per_turn: int | None = None) -> None:
+        """Recalibrate the per-run total backstop from the run budget.
+
+        Called by ``calibrate_loop_detection`` after the full middleware chain is
+        assembled, so the caps reflect the real per-turn graph cost. Overwrites
+        the values derived at construction.
+        """
+        self.total_call_warn, self.total_call_hard_limit = _derive_total_call_limits(recursion_limit, steps_per_turn)
 
     def _get_thread_id(self, runtime: Runtime) -> str:
         """Extract the loop-detection scope from runtime context.
@@ -234,6 +345,8 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             self._warned.pop(evicted_id, None)
             self._tool_freq.pop(evicted_id, None)
             self._tool_freq_warned.pop(evicted_id, None)
+            self._total_calls.pop(evicted_id, None)
+            self._total_warned.discard(evicted_id)
             for key in list(self._pending_warnings):
                 if key[0] == evicted_id:
                     self._drop_pending_warning_key_locked(key)
@@ -331,6 +444,23 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             count = history.count(call_hash)
             tool_names = [tc.get("name", "?") for tc in tool_calls]
 
+            # --- Layer 0: per-run total tool-call backstop (hard) ---
+            # Counted unconditionally before the early-returning layers below so
+            # diverse runs that never trip the hash / per-tool-type layers still
+            # stop before the graph recursion_limit aborts the run.
+            self._total_calls[thread_id] += len(tool_calls)
+            total_count = self._total_calls[thread_id]
+            if total_count >= self.total_call_hard_limit:
+                logger.error(
+                    "Total tool-call hard limit reached — forcing stop",
+                    extra={
+                        "thread_id": thread_id,
+                        "count": total_count,
+                        "tools": tool_names,
+                    },
+                )
+                return _TOTAL_CALLS_HARD_STOP_MSG.format(count=total_count), True
+
             # --- Layer 1: hash-based (identical call sets) ---
             if count >= self.hard_limit:
                 logger.error(
@@ -392,6 +522,20 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                             },
                         )
                         return _TOOL_FREQ_WARNING_MSG.format(tool_name=name, count=tc_count), False
+
+            # --- Layer 0: per-run total tool-call backstop (warn) ---
+            # Lowest priority: only reached when no hash / per-tool-type signal
+            # fired this turn, so a wrap-up nudge lands before the hard limit.
+            if total_count >= self.total_call_warn and thread_id not in self._total_warned:
+                self._total_warned.add(thread_id)
+                logger.warning(
+                    "Total tool-call warning — many calls without a final answer",
+                    extra={
+                        "thread_id": thread_id,
+                        "count": total_count,
+                    },
+                )
+                return _TOTAL_CALLS_WARNING_MSG.format(count=total_count), False
 
         return None, False
 
@@ -570,6 +714,8 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                 self._warned.pop(thread_id, None)
                 self._tool_freq.pop(thread_id, None)
                 self._tool_freq_warned.pop(thread_id, None)
+                self._total_calls.pop(thread_id, None)
+                self._total_warned.discard(thread_id)
                 for key in list(self._pending_warnings):
                     if key[0] == thread_id:
                         self._drop_pending_warning_key_locked(key)
@@ -578,5 +724,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                 self._warned.clear()
                 self._tool_freq.clear()
                 self._tool_freq_warned.clear()
+                self._total_calls.clear()
+                self._total_warned.clear()
                 self._pending_warnings.clear()
                 self._pending_warning_touch_order.clear()

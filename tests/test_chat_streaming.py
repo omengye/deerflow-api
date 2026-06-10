@@ -13,8 +13,10 @@ from app.schemas import AguiRunAgentInput, ChatRequest
 from deerflow.client import DeerFlowClient, StreamEvent, StreamEventType
 from deerflow.runtime import DisconnectMode, MemoryStreamBridge, RunManager, RunStatus
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphRecursionError
 from langchain_core.messages import AIMessageChunk
 from langchain_core.runnables import RunnableConfig
+from deerflow.client import _RECURSION_LIMIT_NOTICE
 
 
 class _FakeClient:
@@ -350,6 +352,46 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         async_events = [event async for event in client.astream("hello", thread_id="thread-1")]
 
         self.assertEqual(async_events, sync_events)
+
+    async def test_recursion_limit_emits_graceful_final_answer(self) -> None:
+        """A GraphRecursionError mid-stream is converted into a final AI text
+        event plus the usual end event, instead of propagating and discarding
+        the turn."""
+
+        class FakeAgent:
+            def stream(self, *_args: object, **_kwargs: object) -> Iterator[tuple[str, object]]:
+                yield ("messages", (AIMessageChunk(content="partial", id="msg-1"), {}))
+                raise GraphRecursionError("Recursion limit of 200 reached")
+
+            async def astream(self, *_args: object, **_kwargs: object) -> AsyncIterator[tuple[str, object]]:
+                yield ("messages", (AIMessageChunk(content="partial", id="msg-1"), {}))
+                raise GraphRecursionError("Recursion limit of 200 reached")
+
+        class TestClient(DeerFlowClient):
+            def _prepare_stream_invocation(
+                self,
+                message: str,
+                thread_id: str | None,
+                **kwargs: object,
+            ) -> tuple[RunnableConfig, dict[str, object], dict[str, object]]:
+                return RunnableConfig(), {"messages": [message]}, {"thread_id": thread_id or "generated"}
+
+        client = object.__new__(TestClient)
+        object.__setattr__(client, "_agent", FakeAgent())
+        object.__setattr__(client, "_agent_name", None)
+
+        sync_events = list(client.stream("hello", thread_id="thread-1"))
+        async_events = [event async for event in client.astream("hello", thread_id="thread-1")]
+
+        for events in (sync_events, async_events):
+            # Partial work streamed before the crash is preserved.
+            self.assertEqual(events[0].data.get("content"), "partial")
+            # A graceful notice is emitted in place of the raised error...
+            notice = events[-2]
+            self.assertEqual(notice.type, "messages-tuple")
+            self.assertEqual(notice.data["content"], _RECURSION_LIMIT_NOTICE)
+            # ...followed by the normal end event.
+            self.assertEqual(events[-1].type, "end")
 
     async def test_chat_stream_uses_async_client_stream(self) -> None:
         fake_client = _FakeClient()

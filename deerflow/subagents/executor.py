@@ -152,6 +152,10 @@ class SubagentExecutor:
         # Generate trace_id if not provided (for top-level calls)
         self.trace_id = trace_id or str(uuid.uuid4())[:8]
 
+        # Graph recursion budget for the run, set by ``_create_agent`` from the
+        # assembled chain's real per-turn cost. ``None`` until then.
+        self._run_recursion_limit: int | None = None
+
         # Filter tools based on config
         self.tools = _filter_tools(
             tools,
@@ -177,7 +181,11 @@ class SubagentExecutor:
             disable_keepalive=True,
         )
 
-        from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware
+        from deerflow.agents.middlewares.loop_detection_middleware import (
+            LoopDetectionMiddleware,
+            calibrate_loop_detection,
+            count_steps_per_turn,
+        )
         from deerflow.agents.middlewares.tool_error_handling_middleware import build_subagent_runtime_middlewares
 
         # Reuse shared middleware composition with lead agent, forwarding stream_callback
@@ -185,6 +193,16 @@ class SubagentExecutor:
         # isolated subagent thread (where get_stream_writer() is not available).
         middlewares = build_subagent_runtime_middlewares(lazy_init=True, stream_callback=stream_callback)
         middlewares.append(LoopDetectionMiddleware(stream_callback=stream_callback))
+
+        # recursion_limit counts graph super-steps, not turns. One tool-calling
+        # turn costs ``count_steps_per_turn`` super-steps — model + tools + one
+        # node per before/after_model middleware (currently 4 for this chain),
+        # NOT a fixed 3. Size the budget to the real per-turn cost so max_turns
+        # actually maps to max_turns turns, then calibrate the loop backstop to
+        # the same value so it stops cleanly before the recursion limit.
+        steps_per_turn = count_steps_per_turn(middlewares)
+        self._run_recursion_limit = self.config.max_turns * steps_per_turn
+        calibrate_loop_detection(middlewares, self._run_recursion_limit)
 
         agent = create_agent(
             model=model,
@@ -320,11 +338,11 @@ class SubagentExecutor:
             agent, chat_model = self._create_agent(stream_callback=stream_callback)
             state = await self._build_initial_state(task)
 
-            # LangGraph recursion_limit counts individual node executions, not agent
-            # turns. Each turn consumes at least 2 steps (agent + tools nodes), and
-            # middleware adds more. Multiply by 3 so max_turns maps to actual turns.
+            # Budget sized to the chain's real per-turn super-step cost in
+            # ``_create_agent`` (max_turns × steps_per_turn) so max_turns maps to
+            # actual turns. Fall back defensively if the agent wasn't built here.
             run_config: RunnableConfig = {
-                "recursion_limit": self.config.max_turns * 3,
+                "recursion_limit": self._run_recursion_limit or self.config.max_turns * 4,
             }
             context = {}
             if self.thread_id:

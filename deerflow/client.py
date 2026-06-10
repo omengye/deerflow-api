@@ -33,6 +33,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.errors import GraphRecursionError
 
 from deerflow.agents.lead_agent.agent import _build_middlewares
 from deerflow.agents.middlewares.subagent_limit_middleware import clamp_subagent_limit
@@ -56,6 +57,16 @@ from deerflow.uploads.manager import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Shown to the user when a run exhausts the graph ``recursion_limit``. The
+# loop-detection middleware normally forces a clean wrap-up well before this,
+# so reaching it means a genuinely long/diverse run. We surface a meaningful
+# final message instead of letting the bare ``GraphRecursionError`` propagate
+# (which discards the whole turn and leaves dangling tool calls).
+_RECURSION_LIMIT_NOTICE = (
+    "⚠️ 已达到本轮对话的最大步数限制，无法继续调用更多工具。"
+    "以上是我在限制内完成的部分结果。如需继续，请补充说明或将任务拆分后重试。"
+)
 
 
 StreamEventType = Literal["values", "messages-tuple", "custom", "end"]
@@ -296,7 +307,7 @@ class DeerFlowClient:
             # could later be torn down on a foreign loop.
             "model": create_chat_model(name=model_name, thinking_enabled=thinking_enabled, disable_keepalive=True),
             "tools": self._get_tools(model_name=model_name, subagent_enabled=subagent_enabled),
-            "middleware": _build_middlewares(config, model_name=model_name, agent_name=self._agent_name, custom_middlewares=self._middlewares),
+            "middleware": _build_middlewares(config, model_name=model_name, agent_name=self._agent_name, custom_middlewares=self._middlewares, recursion_limit=self._recursion_limit),
             "system_prompt": apply_prompt_template(
                 subagent_enabled=subagent_enabled,
                 max_concurrent_subagents=max_concurrent_subagents,
@@ -340,6 +351,20 @@ class DeerFlowClient:
         if usage:
             data["usage_metadata"] = usage
         return StreamEvent(type="messages-tuple", data=data)
+
+    def _recursion_limit_event(self) -> "StreamEvent":
+        """Build a synthetic AI text event used when the recursion limit is hit.
+
+        Surfaces a graceful final answer to the user. The text is *not* written
+        back to the checkpoint (the graph already aborted); any dangling tool
+        calls left in history are repaired by ``DanglingToolCallMiddleware`` on
+        the next turn.
+        """
+        return self._ai_text_event(
+            f"recursion-limit-{uuid.uuid4().hex[:12]}",
+            _RECURSION_LIMIT_NOTICE,
+            None,
+        )
 
     @staticmethod
     def _ai_tool_calls_event(msg_id: str | None, tool_calls) -> "StreamEvent":
@@ -838,14 +863,21 @@ class DeerFlowClient:
         if actual_thread_id:
             self._seed_seen_ids_from_checkpoint_sync(stream_state, actual_thread_id)
 
-        for item in agent.stream(
-            state,
-            config=config,
-            context=context,
-            stream_mode=["values", "messages", "custom"],
-            subgraphs=True,
-        ):
-            yield from self._events_from_stream_item(item, stream_state)
+        try:
+            for item in agent.stream(
+                state,
+                config=config,
+                context=context,
+                stream_mode=["values", "messages", "custom"],
+                subgraphs=True,
+            ):
+                yield from self._events_from_stream_item(item, stream_state)
+        except GraphRecursionError:
+            logger.warning(
+                "Recursion limit reached (thread=%s) — emitting graceful final answer",
+                actual_thread_id,
+            )
+            yield self._recursion_limit_event()
 
         yield StreamEvent(type="end", data={"usage": stream_state.cumulative_usage})
 
@@ -873,15 +905,22 @@ class DeerFlowClient:
         if actual_thread_id:
             await self._seed_seen_ids_from_checkpoint(stream_state, actual_thread_id)
 
-        async for item in agent.astream(
-            state,
-            config=config,
-            context=context,
-            stream_mode=["values", "messages", "custom"],
-            subgraphs=True,
-        ):
-            for event in self._events_from_stream_item(item, stream_state):
-                yield event
+        try:
+            async for item in agent.astream(
+                state,
+                config=config,
+                context=context,
+                stream_mode=["values", "messages", "custom"],
+                subgraphs=True,
+            ):
+                for event in self._events_from_stream_item(item, stream_state):
+                    yield event
+        except GraphRecursionError:
+            logger.warning(
+                "Recursion limit reached (thread=%s) — emitting graceful final answer",
+                actual_thread_id,
+            )
+            yield self._recursion_limit_event()
 
         yield StreamEvent(type="end", data={"usage": stream_state.cumulative_usage})
 

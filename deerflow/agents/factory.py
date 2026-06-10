@@ -306,7 +306,7 @@ def _assemble_from_features(
         extra_tools.append(task_tool)
 
     # --- [12] LoopDetection (always) ---
-    from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware
+    from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware, calibrate_loop_detection
 
     chain.append(LoopDetectionMiddleware())
 
@@ -324,6 +324,9 @@ def _assemble_from_features(
         clar_idx = next(i for i, m in enumerate(chain) if isinstance(m, ClarificationMiddleware))
         if clar_idx != len(chain) - 1:
             chain.append(chain.pop(clar_idx))
+
+    # Calibrate the loop-detection backstop now the full chain is assembled.
+    calibrate_loop_detection(chain, feat.recursion_limit)
 
     return chain, extra_tools
 

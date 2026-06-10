@@ -32,6 +32,12 @@ class RuntimeFeatures:
     auto_title: bool | AgentMiddleware = False
     guardrail: Literal[False] | AgentMiddleware = False
 
+    # Graph recursion limit this agent will run under. Used only to keep the
+    # always-on LoopDetectionMiddleware's per-run tool-call backstop in
+    # lock-step with the recursion limit. ``None`` falls back to the default
+    # (200). This is an explicit tuning value, not a config-file read.
+    recursion_limit: int | None = None
+
 
 # ---------------------------------------------------------------------------
 # Middleware positioning decorators

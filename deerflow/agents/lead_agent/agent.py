@@ -7,7 +7,7 @@ from langchain_core.runnables import RunnableConfig
 from deerflow.agents.lead_agent.prompt import apply_prompt_template
 from deerflow.agents.memory.summarization_hook import memory_flush_hook
 from deerflow.agents.middlewares.clarification_middleware import ClarificationMiddleware
-from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware
+from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware, calibrate_loop_detection
 from deerflow.agents.middlewares.memory_middleware import MemoryMiddleware
 from deerflow.agents.middlewares.subagent_limit_middleware import SubagentLimitMiddleware, clamp_subagent_limit
 from deerflow.agents.middlewares.summarization_middleware import BeforeSummarizationHook, DeerFlowSummarizationMiddleware
@@ -247,13 +247,15 @@ Being proactive with task management demonstrates thoroughness and ensures all r
 # ViewImageMiddleware should be before ClarificationMiddleware to inject image details before LLM
 # ToolErrorHandlingMiddleware should be before ClarificationMiddleware to convert tool exceptions to ToolMessages
 # ClarificationMiddleware should be last to intercept clarification requests after model calls
-def _build_middlewares(config: RunnableConfig, model_name: str | None, agent_name: str | None = None, custom_middlewares: list[AgentMiddleware] | None = None):
+def _build_middlewares(config: RunnableConfig, model_name: str | None, agent_name: str | None = None, custom_middlewares: list[AgentMiddleware] | None = None, recursion_limit: int | None = None):
     """Build middleware chain based on runtime configuration.
 
     Args:
         config: Runtime configuration containing configurable options like is_plan_mode.
         agent_name: If provided, MemoryMiddleware will use per-agent memory storage.
         custom_middlewares: Optional list of custom middlewares to inject into the chain.
+        recursion_limit: Graph recursion limit this agent runs under; used to
+            keep LoopDetectionMiddleware's per-run backstop in lock-step.
 
     Returns:
         List of middleware instances.
@@ -310,6 +312,10 @@ def _build_middlewares(config: RunnableConfig, model_name: str | None, agent_nam
 
     # ClarificationMiddleware should always be last
     middlewares.append(ClarificationMiddleware())
+
+    # Calibrate the loop-detection backstop now the full chain (and thus the
+    # per-turn graph cost) is known, keeping it below the recursion limit.
+    calibrate_loop_detection(middlewares, recursion_limit)
     return middlewares
 
 
