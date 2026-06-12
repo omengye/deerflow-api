@@ -100,20 +100,32 @@ sandbox:
 #   are visible to DeerFlow at /mnt/acp-workspace/.
 # - Keep `auto_approve_permissions: false` unless you explicitly trust the
 #   adapter and the commands it may request.
+# - The agent subprocess only inherits a trimmed environment (on Linux:
+#   HOME, LOGNAME, PATH, SHELL, TERM, USER) — NOT this server's
+#   ANTHROPIC_*/CLAUDE_CODE_* variables. Pass credentials explicitly via
+#   `env:` below using `$VAR_NAME`, and make sure that variable is set in
+#   the environment that runs the DeerFlow API process itself.
 # - Install adapter CLIs separately, for example:
 #     npm install -g @zed-industries/codex-acp
-#     pipx install claude-code-acp
+#     npm install -g @zed-industries/claude-code-acp
 #
 # acp_agents:
 #   codex:
 #     command: codex-acp
 #     args: []
+#     env:
+#       OPENAI_API_KEY: $OPENAI_API_KEY
 #     description: "Codex coding agent via ACP"
 #     model: null
 #     auto_approve_permissions: false
 #   claude_code:
 #     command: claude-code-acp
 #     args: []
+#     env:
+#       # Either an Anthropic API key...
+#       ANTHROPIC_API_KEY: $ANTHROPIC_API_KEY
+#       # ...or a Claude Code subscription OAuth token (use one or the other).
+#       # CLAUDE_CODE_OAUTH_TOKEN: $CLAUDE_CODE_OAUTH_TOKEN
 #     description: "Claude Code coding agent via ACP"
 #     model: null
 #     auto_approve_permissions: false

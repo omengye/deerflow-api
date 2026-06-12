@@ -85,8 +85,8 @@ acp_agents:
 # Codex ACP adapter
 npm install -g @zed-industries/codex-acp
 
-# Claude Code ACP adapter（如使用该 Python 包）
-pipx install claude-code-acp
+# Claude Code ACP adapter
+npm install -g @zed-industries/claude-code-acp
 ```
 
 运行机制与注意事项：
