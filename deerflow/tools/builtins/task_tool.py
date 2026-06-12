@@ -141,6 +141,13 @@ async def _task_tool_impl(
 
     # Subagents should not have subagent tools enabled (prevent recursive nesting)
     tools = get_available_tools(model_name=parent_model, groups=parent_tool_groups, subagent_enabled=False)
+    deferred_registry = None
+    try:
+        from deerflow.tools.builtins.tool_search import clone_deferred_registry_for_tools, get_deferred_registry
+
+        deferred_registry = clone_deferred_registry_for_tools(get_deferred_registry(), tools)
+    except Exception:
+        logger.debug("Failed to clone deferred registry for subagent", exc_info=True)
 
     # Create executor
     executor = SubagentExecutor(
@@ -152,6 +159,7 @@ async def _task_tool_impl(
         thread_id=thread_id,
         trace_id=trace_id,
         thinking_enabled=parent_thinking_enabled,
+        deferred_registry=deferred_registry,
     )
 
     # Resolve the live_event_callback from config metadata.

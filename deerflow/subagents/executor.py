@@ -10,7 +10,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain.agents import create_agent
 from langchain.tools import BaseTool
@@ -20,6 +20,9 @@ from langchain_core.runnables import RunnableConfig
 from deerflow.agents.thread_state import AgentContext, SandboxState, ThreadDataState, ThreadState
 from deerflow.models import aclose_chat_model, create_chat_model
 from deerflow.subagents.config import SubagentConfig
+
+if TYPE_CHECKING:
+    from deerflow.tools.builtins.tool_search import DeferredToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +134,7 @@ class SubagentExecutor:
         thread_id: str | None = None,
         trace_id: str | None = None,
         thinking_enabled: bool = False,
+        deferred_registry: "DeferredToolRegistry | None" = None,
     ):
         """Initialize the executor.
 
@@ -149,6 +153,7 @@ class SubagentExecutor:
         self.thread_data = thread_data
         self.thread_id = thread_id
         self.thinking_enabled = thinking_enabled
+        self.deferred_registry = deferred_registry
         # Generate trace_id if not provided (for top-level calls)
         self.trace_id = trace_id or str(uuid.uuid4())[:8]
 
@@ -192,6 +197,10 @@ class SubagentExecutor:
         # so TokenUsageMiddleware and LoopDetectionMiddleware can push events in the
         # isolated subagent thread (where get_stream_writer() is not available).
         middlewares = build_subagent_runtime_middlewares(lazy_init=True, stream_callback=stream_callback)
+        if self.deferred_registry is not None:
+            from deerflow.agents.middlewares.deferred_tool_filter_middleware import DeferredToolFilterMiddleware
+
+            middlewares.append(DeferredToolFilterMiddleware())
         middlewares.append(LoopDetectionMiddleware(stream_callback=stream_callback))
 
         # recursion_limit counts graph super-steps, not turns. One tool-calling
@@ -281,10 +290,15 @@ class SubagentExecutor:
         """
         # Load skills as conversation items (Codex pattern)
         skill_messages = await self._load_skill_messages()
+        from deerflow.tools.builtins.tool_search import get_deferred_tools_prompt_section
+
+        deferred_section = get_deferred_tools_prompt_section(self.deferred_registry)
 
         messages: list = []
         # Skill content injected as developer/system messages before the task
         messages.extend(skill_messages)
+        if deferred_section:
+            messages.append(SystemMessage(content=deferred_section))
         # Then the actual task
         messages.append(HumanMessage(content=task))
 
@@ -334,7 +348,13 @@ class SubagentExecutor:
             )
 
         chat_model: Any = None
+        deferred_registry_set = False
         try:
+            if self.deferred_registry is not None:
+                from deerflow.tools.builtins.tool_search import set_deferred_registry
+
+                set_deferred_registry(self.deferred_registry)
+                deferred_registry_set = True
             agent, chat_model = self._create_agent(stream_callback=stream_callback)
             state = await self._build_initial_state(task)
 
@@ -551,6 +571,10 @@ class SubagentExecutor:
             result.error = str(e)
             result.completed_at = datetime.now()
         finally:
+            if deferred_registry_set:
+                from deerflow.tools.builtins.tool_search import reset_deferred_registry
+
+                reset_deferred_registry()
             # execute() runs us inside ``asyncio.run`` on a worker thread; the
             # loop closes immediately after we return. Drain the model's httpx
             # pool first so no SSL transport survives into the post-close GC

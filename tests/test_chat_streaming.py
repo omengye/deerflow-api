@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import json
 import unittest
 from collections.abc import AsyncIterator, Iterable, Iterator
@@ -61,6 +62,10 @@ def _fake_request() -> Request:
 
 def _stream_event_type(value: str) -> StreamEventType:
     return cast(StreamEventType, cast(object, value))
+
+
+def _reload_module(name: str):
+    return importlib.reload(importlib.import_module(name))
 
 
 class _FakeManager:
@@ -951,7 +956,10 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_values_event_skips_historical_tool_calls_when_seen_ids_prepopulated(self) -> None:
         """Regression: pre-populated seen_ids must prevent historical tool calls from being re-emitted."""
         from langchain_core.messages import AIMessage, ToolMessage
-        from deerflow.client import DeerFlowClient, _StreamProcessingState
+
+        client_module = _reload_module("deerflow.client")
+        DeerFlowClient = client_module.DeerFlowClient
+        _StreamProcessingState = client_module._StreamProcessingState
 
         # Simulate Turn 2: seen_ids pre-populated with Turn 1 message IDs (checkpoint pre-pop)
         stream_state = _StreamProcessingState()
@@ -987,7 +995,10 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_values_event_replays_historical_tool_calls_without_prepopulation(self) -> None:
         """Document the bug: without seen_ids pre-population, historical tool calls ARE re-emitted."""
         from langchain_core.messages import AIMessage, ToolMessage
-        from deerflow.client import DeerFlowClient, _StreamProcessingState
+
+        client_module = _reload_module("deerflow.client")
+        DeerFlowClient = client_module.DeerFlowClient
+        _StreamProcessingState = client_module._StreamProcessingState
 
         stream_state = _StreamProcessingState()  # Fresh, no pre-population
 
@@ -1041,8 +1052,11 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         from langchain.agents import create_agent
         from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 
-        from deerflow.agents.middlewares.todo_middleware import TodoMiddleware
-        from deerflow.agents.thread_state import AgentContext, ThreadState
+        todo_module = _reload_module("deerflow.agents.middlewares.todo_middleware")
+        thread_state_module = _reload_module("deerflow.agents.thread_state")
+        TodoMiddleware = todo_module.TodoMiddleware
+        AgentContext = thread_state_module.AgentContext
+        ThreadState = thread_state_module.ThreadState
 
         agent = create_agent(
             model=FakeMessagesListChatModel(responses=[]),

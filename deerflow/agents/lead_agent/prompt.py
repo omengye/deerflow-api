@@ -643,7 +643,7 @@ def get_deferred_tools_prompt_section() -> str:
     and can use tool_search to load them.
     Returns empty string when tool_search is disabled or no tools are deferred.
     """
-    from deerflow.tools.builtins.tool_search import get_deferred_registry
+    from deerflow.tools.builtins.tool_search import get_deferred_tools_prompt_section as _get_section
 
     try:
         from deerflow.config import get_app_config
@@ -653,12 +653,7 @@ def get_deferred_tools_prompt_section() -> str:
     except Exception:
         return ""
 
-    registry = get_deferred_registry()
-    if not registry:
-        return ""
-
-    names = "\n".join(e.name for e in registry.entries)
-    return f"<available-deferred-tools>\n{names}\n</available-deferred-tools>"
+    return _get_section()
 
 
 def _build_acp_section() -> str:

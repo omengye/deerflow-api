@@ -158,6 +158,27 @@ def reset_deferred_registry() -> None:
     _registry_var.set(None)
 
 
+def get_deferred_tools_prompt_section(registry: DeferredToolRegistry | None = None) -> str:
+    """Generate an <available-deferred-tools> block for prompt injection."""
+    registry = registry if registry is not None else get_deferred_registry()
+    if not registry or not registry.deferred_names:
+        return ""
+    names = "\n".join(sorted(registry.deferred_names))
+    return f"<available-deferred-tools>\n{names}\n</available-deferred-tools>"
+
+
+def clone_deferred_registry_for_tools(source: DeferredToolRegistry | None, tools: list[BaseTool]) -> DeferredToolRegistry | None:
+    """Clone deferred entries whose names survived a tool-policy filter."""
+    if source is None:
+        return None
+    allowed_names = {tool.name for tool in tools}
+    registry = DeferredToolRegistry()
+    for entry in source.entries:
+        if entry.name in allowed_names:
+            registry.register(entry.tool)
+    return registry if len(registry) else None
+
+
 # ── Tool ──
 
 

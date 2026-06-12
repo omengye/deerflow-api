@@ -146,6 +146,25 @@ tool_groups:
   - name: file:write
   - name: bash
 
+tool_search:
+  enabled: false
+
+tool_output:
+  enabled: true
+  externalize_min_chars: 12000
+  preview_head_chars: 2000
+  preview_tail_chars: 1000
+  fallback_max_chars: 30000
+  fallback_head_chars: 8000
+  fallback_tail_chars: 3000
+  storage_subdir: ".tool-results"
+  exempt_tools:
+    - read_file
+    - read_file_tool
+  # tool_overrides:
+  #   web_search: 8000
+  #   bash: 20000
+
 # Set https_proxy to null or "" on a web tool to disable proxying for that tool.
 tools:
   - name: web_search
