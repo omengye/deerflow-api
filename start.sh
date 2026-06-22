@@ -3,6 +3,24 @@
 set -e
 cd "$(dirname "$0")"
 
+# --- Proxy hygiene -----------------------------------------------------------
+# An https_proxy is set in this environment (e.g. http://172.17.0.1:11055) so
+# outbound calls that genuinely need it (web search, foreign gateways) keep
+# working. But with no NO_PROXY, *every* httpx call — including loopback/LAN and
+# the domestic DashScope endpoint — would be tunnelled through the proxy, which
+# is slow and can make internal requests hang ("no response"). Exempt internal
+# and domestic traffic here. Append to any pre-existing NO_PROXY.
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,dashscope.aliyuncs.com"
+export no_proxy="$NO_PROXY"
+
+# Silence langchain-openai's "custom httpx transport disables proxy
+# auto-detection" warning and restore httpx's native env-proxy/NO_PROXY
+# handling on every path. DeerFlow already injects no-keepalive httpx clients
+# on hot paths (see deerflow/models/factory.py), so disabling langchain's
+# socket-option transport here loses nothing in practice.
+export LANGCHAIN_OPENAI_TCP_KEEPALIVE=0
+# -----------------------------------------------------------------------------
+
 # Install dependencies (if not already installed)
 if [ ! -d ".venv" ]; then
     echo "📦 Installing dependencies with uv..."
