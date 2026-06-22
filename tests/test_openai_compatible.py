@@ -132,7 +132,7 @@ class OpenAICompatibleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_logs_request_tools_without_injecting_them(self) -> None:
         events = [StreamEvent(type="end", data={"usage": {}})]
-        payload = {
+        payload: dict[str, object] = {
             "model": "model-a",
             "stream": True,
             "messages": [{"role": "user", "content": "hello"}],
@@ -146,7 +146,7 @@ class OpenAICompatibleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("logging only, not injecting", "\n".join(logs.output))
         self.assertEqual(cast(dict[str, Any], chunks[-2])["choices"][0]["finish_reason"], "stop")
 
-    async def test_maps_internal_message_tool_calls_to_openai_chunks(self) -> None:
+    async def test_suppresses_internal_message_tool_calls_in_openai_chunks(self) -> None:
         events = [
             StreamEvent(
                 type="messages-tuple",
@@ -160,20 +160,12 @@ class OpenAICompatibleTests(unittest.IsolatedAsyncioTestCase):
             {"model": "model-a", "stream": True, "messages": [{"role": "user", "content": "search"}]},
         )
 
-        delta = cast(dict[str, Any], chunks[1])["choices"][0]["delta"]
-        self.assertEqual(
-            delta["tool_calls"],
-            [
-                {
-                    "index": 0,
-                    "id": "call-1",
-                    "type": "function",
-                    "function": {"name": "search", "arguments": '{"q": "deer"}'},
-                }
-            ],
-        )
+        for chunk in chunks:
+            if isinstance(chunk, dict):
+                delta = chunk["choices"][0]["delta"]
+                self.assertNotIn("tool_calls", delta)
 
-    async def test_maps_internal_tool_call_chunk_events_to_openai_chunks(self) -> None:
+    async def test_suppresses_internal_tool_call_chunk_events_in_openai_chunks(self) -> None:
         events = [
             StreamEvent(type=_event_type("tool_call_chunk"), data={"tool_call": {"name": "lookup", "args": {"id": 7}, "id": "call-7"}}),
             StreamEvent(type="end", data={"usage": {}}),
@@ -184,9 +176,10 @@ class OpenAICompatibleTests(unittest.IsolatedAsyncioTestCase):
             {"model": "model-a", "stream": True, "messages": [{"role": "user", "content": "lookup"}]},
         )
 
-        delta = cast(dict[str, Any], chunks[1])["choices"][0]["delta"]
-        self.assertEqual(delta["tool_calls"][0]["id"], "call-7")
-        self.assertEqual(delta["tool_calls"][0]["function"], {"name": "lookup", "arguments": '{"id": 7}'})
+        for chunk in chunks:
+            if isinstance(chunk, dict):
+                delta = chunk["choices"][0]["delta"]
+                self.assertNotIn("tool_calls", delta)
 
     async def test_maps_reasoning_content_to_openai_chunks_incrementally(self) -> None:
         events = [

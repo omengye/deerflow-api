@@ -98,10 +98,10 @@ async def chat_completions(request: Request, req: OpenAIChatCompletionRequest = 
                     for payload in _message_tuple_to_openai_chunks(completion_id, created, model, data, reasoning_content_state):
                         yield _sse(payload)
                 elif entry.event == "tool_call_chunk":
-                    if isinstance(entry.data, dict):
-                        payload = _tool_call_chunk_to_openai(completion_id, created, model, entry.data)
-                        if payload is not None:
-                            yield _sse(payload)
+                    # DeerFlow tool calls are executed internally by the backend.
+                    # Emitting them as OpenAI Chat Completions `tool_calls` would
+                    # make compatible clients think they must execute external tools.
+                    continue
                 elif entry.event == "thinking_chunk":
                     if isinstance(entry.data, dict):
                         payload = _thinking_chunk_to_openai(completion_id, created, model, entry.data)
@@ -205,26 +205,11 @@ def _message_tuple_to_openai_chunks(
             delta = _reasoning_delta(reasoning_content_state, reasoning_id, reasoning)
             if delta:
                 chunks.append(_chunk(completion_id, created, model, delta={"reasoning_content": delta}))
-        tool_calls = data.get("tool_calls")
-        if isinstance(tool_calls, list) and tool_calls:
-            chunks.append(_chunk(completion_id, created, model, delta={"tool_calls": _openai_tool_calls(tool_calls)}))
         content = data.get("content")
         if isinstance(content, str) and content:
             chunks.append(_chunk(completion_id, created, model, delta={"content": content}))
         return chunks
     return []
-
-
-def _tool_call_chunk_to_openai(
-    completion_id: str,
-    created: int,
-    model: str,
-    data: dict[str, Any],
-) -> dict[str, Any] | None:
-    tool_call = data.get("tool_call")
-    if not isinstance(tool_call, dict):
-        return None
-    return _chunk(completion_id, created, model, delta={"tool_calls": _openai_tool_calls([tool_call])})
 
 
 def _thinking_chunk_to_openai(
@@ -247,27 +232,6 @@ def _reasoning_delta(reasoning_content_state: dict[str, str], reasoning_id: str,
         delta = reasoning
     reasoning_content_state[reasoning_id] = reasoning if reasoning.startswith(previous) else previous + delta
     return delta
-
-
-def _openai_tool_calls(tool_calls: list[Any]) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for index, tool_call in enumerate(tool_calls):
-        if not isinstance(tool_call, dict):
-            continue
-        args = tool_call.get("args", {})
-        arguments = args if isinstance(args, str) else json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False, default=str)
-        result.append(
-            {
-                "index": index,
-                "id": str(tool_call.get("id") or f"call_{uuid.uuid4().hex}"),
-                "type": "function",
-                "function": {
-                    "name": str(tool_call.get("name") or "tool"),
-                    "arguments": arguments,
-                },
-            }
-        )
-    return result
 
 
 def _chunk(
