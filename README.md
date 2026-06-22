@@ -72,7 +72,7 @@ acp_agents:
     auto_approve_permissions: false
 
   claude_code:
-    command: claude-code-acp
+    command: claude-agent-acp
     args: []
     description: "Claude Code coding agent via ACP"
     model: null
@@ -86,7 +86,7 @@ acp_agents:
 npm install -g @zed-industries/codex-acp
 
 # Claude Code ACP adapter
-npm install -g @zed-industries/claude-code-acp
+npm install -g @agentclientprotocol/claude-agent-acp
 ```
 
 运行机制与注意事项：

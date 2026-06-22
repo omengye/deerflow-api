@@ -107,7 +107,7 @@ sandbox:
 #   the environment that runs the DeerFlow API process itself.
 # - Install adapter CLIs separately, for example:
 #     npm install -g @zed-industries/codex-acp
-#     npm install -g @zed-industries/claude-code-acp
+#     npm install -g @agentclientprotocol/claude-agent-acp
 #
 # acp_agents:
 #   codex:
@@ -119,7 +119,7 @@ sandbox:
 #     model: null
 #     auto_approve_permissions: false
 #   claude_code:
-#     command: claude-code-acp
+#     command: claude-agent-acp
 #     args: []
 #     env:
 #       # Either an Anthropic API key...
