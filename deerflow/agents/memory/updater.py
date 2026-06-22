@@ -296,6 +296,28 @@ def _fact_content_key(content: Any) -> str | None:
     return stripped.casefold()
 
 
+def _parse_json_with_repair(text: str) -> dict[str, Any]:
+    """Parse JSON from LLM response, using json-repair as a fallback for malformed output."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        from json_repair import repair_json  # type: ignore[import-untyped]
+
+        repaired = repair_json(text, return_objects=True)
+        if isinstance(repaired, dict):
+            return repaired
+        raise json.JSONDecodeError("json-repair returned a non-dict object", text, 0)
+    except ImportError:
+        raise
+    except json.JSONDecodeError:
+        raise
+    except Exception as exc:
+        raise json.JSONDecodeError(str(exc), text, 0) from exc
+
+
 class MemoryUpdater:
     """Updates memory using LLM based on conversation context."""
 
@@ -377,9 +399,10 @@ class MemoryUpdater:
 
         if response_text.startswith("```"):
             lines = response_text.split("\n")
-            response_text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
+            last_line = lines[-1].strip()
+            response_text = "\n".join(lines[1:-1] if last_line == "```" else lines[1:]).strip()
 
-        update_data = json.loads(response_text)
+        update_data = _parse_json_with_repair(response_text)
         # Reload after the LLM call so we apply the generated patch to the
         # freshest memory state. The model may have spent seconds generating;
         # meanwhile manual edits or another worker may have persisted changes.
