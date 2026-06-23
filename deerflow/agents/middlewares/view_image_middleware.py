@@ -105,8 +105,19 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
             # Return a properly formatted text block, not a plain string array
             return [{"type": "text", "text": "No images have been viewed."}]
 
-        # Build the message with image information
-        content_blocks: list[str | dict] = [{"type": "text", "text": "Here are the images you've viewed:"}]
+        # Build the message with image information. This synthetic user message
+        # must carry an explicit task reminder; otherwise some models merely
+        # acknowledge the tool result instead of answering the user's request.
+        content_blocks: list[str | dict] = [
+            {
+                "type": "text",
+                "text": (
+                    "Image input for analysis. Use the attached image(s) to answer "
+                    "the user's most recent request. Do not merely confirm that "
+                    "the image was read."
+                ),
+            }
+        ]
 
         for image_path, image_data in viewed_images.items():
             mime_type = image_data.get("mime_type", "unknown")
@@ -158,7 +169,11 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
         for msg in messages[assistant_idx + 1 :]:
             if isinstance(msg, HumanMessage):
                 content_str = str(msg.content)
-                if "Here are the images you've viewed" in content_str or "Here are the details of the images you've viewed" in content_str:
+                if (
+                    "Image input for analysis" in content_str
+                    or "Here are the images you've viewed" in content_str
+                    or "Here are the details of the images you've viewed" in content_str
+                ):
                     # Already added, don't add again
                     return False
 
