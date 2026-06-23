@@ -279,13 +279,18 @@ class DeerFlowClient:
     def _ensure_agent(self, config: RunnableConfig):
         """Create (or recreate) the agent when config-dependent params change."""
         cfg = config.get("configurable", {})
+        app_config = get_app_config()
+        requested_model_name = cfg.get("model_name")
+        model_name = requested_model_name or (app_config.models[0].name if app_config.models else None)
+        model_config = app_config.get_model_config(model_name) if model_name else None
         memory_signature = self._get_memory_signature(self._agent_name)
         key = (
-            cfg.get("model_name"),
+            model_name,
+            getattr(model_config, "supports_vision", False),
             cfg.get("thinking_enabled"),
             cfg.get("is_plan_mode"),
             cfg.get("subagent_enabled"),
-            getattr(get_app_config().subagents, "enabled", True),
+            getattr(app_config.subagents, "enabled", True),
             cfg.get("max_concurrent_subagents"),
             memory_signature,
             self._agent_name,
@@ -296,8 +301,7 @@ class DeerFlowClient:
             return
 
         thinking_enabled = cfg.get("thinking_enabled", True)
-        model_name = cfg.get("model_name")
-        subagent_enabled = bool(cfg.get("subagent_enabled", False)) and getattr(get_app_config().subagents, "enabled", True)
+        subagent_enabled = bool(cfg.get("subagent_enabled", False)) and getattr(app_config.subagents, "enabled", True)
         max_concurrent_subagents = clamp_subagent_limit(cfg.get("max_concurrent_subagents", 3))
 
         kwargs: dict[str, Any] = {
