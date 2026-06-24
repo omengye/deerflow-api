@@ -44,6 +44,10 @@ def test_view_image_middleware_injects_image_with_analysis_instruction() -> None
         "type": "image_url",
         "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
     }
+    # Verify structured marker is present for robust deduplication
+    assert injected.additional_kwargs.get("_view_image_injection") is True
+    # Verify viewed_images is cleared after injection to prevent accumulation
+    assert update["viewed_images"] == {}
 
 
 def test_view_image_middleware_does_not_inject_duplicate_image_message() -> None:
@@ -54,7 +58,8 @@ def test_view_image_middleware_does_not_inject_duplicate_image_message() -> None
                 "type": "text",
                 "text": "Image input for analysis. Use the attached image(s) to answer the user's most recent request.",
             }
-        ]
+        ],
+        additional_kwargs={"_view_image_injection": True}
     )
     state = {
         "messages": [

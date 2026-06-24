@@ -163,17 +163,12 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
         if not self._all_tools_completed(messages, last_assistant_msg):
             return False
 
-        # Check if we've already added an image details message
-        # Look for a human message after the last assistant message that contains image details
+        # Check if we've already added an image details message by looking for the structured marker
+        # instead of fragile string matching that breaks when summarization rewrites message text
         assistant_idx = messages.index(last_assistant_msg)
         for msg in messages[assistant_idx + 1 :]:
             if isinstance(msg, HumanMessage):
-                content_str = str(msg.content)
-                if (
-                    "Image input for analysis" in content_str
-                    or "Here are the images you've viewed" in content_str
-                    or "Here are the details of the images you've viewed" in content_str
-                ):
+                if msg.additional_kwargs.get("_view_image_injection"):
                     # Already added, don't add again
                     return False
 
@@ -195,12 +190,21 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
         image_content = self._create_image_details_message(state)
 
         # Create a new human message with mixed content (text + images)
-        human_msg = HumanMessage(content=image_content)
+        # Mark with structured metadata so deduplication is robust against message summarization
+        human_msg = HumanMessage(
+            content=image_content,
+            additional_kwargs={"_view_image_injection": True}
+        )
 
         logger.debug("Injecting image details message with images before LLM call")
 
-        # Return state update with the new message
-        return {"messages": [human_msg]}
+        # Clear viewed_images after injection to prevent token/checkpoint bloat from accumulating
+        # base64 data across multiple view_image calls. The merge_viewed_images reducer treats
+        # empty dict as a clear signal.
+        return {
+            "messages": [human_msg],
+            "viewed_images": {}
+        }
 
     @override
     def before_model(self, state: ViewImageMiddlewareState, runtime: Runtime) -> dict | None:
