@@ -439,7 +439,7 @@ class ClientManager:
             self.mark_thread_done(thread_id)
             try:
                 await self.stream_bridge.publish_end(run_id)
-                asyncio.create_task(self.stream_bridge.cleanup(run_id, delay=60))
+                asyncio.create_task(self.stream_bridge.cleanup(run_id, delay=300))
                 asyncio.create_task(self.run_manager.cleanup(run_id, delay=300))
             except RuntimeError as exc:
                 if "Event loop is closed" not in str(exc):

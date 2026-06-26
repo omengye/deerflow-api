@@ -50,14 +50,15 @@ class _FakeClient:
 
 
 class _FakeRequest:
-    headers: dict[str, str] = {}
+    def __init__(self, headers: dict[str, str] | None = None) -> None:
+        self.headers = headers or {}
 
     async def is_disconnected(self) -> bool:
         return False
 
 
-def _fake_request() -> Request:
-    return cast(Request, cast(object, _FakeRequest()))
+def _fake_request(headers: dict[str, str] | None = None) -> Request:
+    return cast(Request, cast(object, _FakeRequest(headers)))
 
 
 def _stream_event_type(value: str) -> StreamEventType:
@@ -149,6 +150,20 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             payload
         )
 
+    @staticmethod
+    def _parse_agui_sse_chunk(chunk: str) -> tuple[str | None, dict[str, object]]:
+        event_id: str | None = None
+        data_lines: list[str] = []
+        for line in chunk.rstrip("\n").splitlines():
+            if line.startswith("id:"):
+                event_id = line.removeprefix("id:").strip()
+            elif line.startswith("data:"):
+                value = line.removeprefix("data:")
+                data_lines.append(value[1:] if value.startswith(" ") else value)
+        if not data_lines:
+            raise AssertionError(f"SSE chunk has no data field: {chunk!r}")
+        return event_id, json.loads("\n".join(data_lines))
+
     async def _collect_agui_stream(self, fake_client: _FakeClient, parent_run_id: str | None = None) -> tuple[list[dict[str, object]], _FakeManager, list[str]]:
         fake_manager = _FakeManager(fake_client)
         original_get_client_manager = chat.get_client_manager
@@ -160,9 +175,8 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             chat.get_client_manager = original_get_client_manager
         events: list[dict[str, object]] = []
         for chunk in chunks:
-            self.assertTrue(chunk.startswith("data: "))
             self.assertTrue(chunk.endswith("\n\n"))
-            events.append(json.loads(chunk.removeprefix("data: ").strip()))
+            events.append(self._parse_agui_sse_chunk(chunk)[1])
         return events, fake_manager, chunks
 
     async def test_chat_stream_options_preflight(self) -> None:
@@ -273,7 +287,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         finally:
             chat.get_client_manager = original_get_client_manager
 
-        events = [json.loads(chunk.removeprefix("data: ").strip()) for chunk in chunks]
+        events = [self._parse_agui_sse_chunk(chunk)[1] for chunk in chunks]
         self.assertEqual(events[0], {"type": "RUN_STARTED", "threadId": "thread-1", "runId": "run-1", "rawEvent": {"name": "lead_agent"}})
         record = fake_manager.run_manager.get("run-1")
         self.assertIsNotNone(record)
@@ -286,6 +300,40 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.kwargs["subagent_enabled"], True)
         self.assertTrue(fake_client.astream_called)
         self.assertEqual(fake_client.last_message, "newest")
+
+    async def test_chat_agui_reconnect_attaches_existing_run_and_resumes_after_last_event_id(self) -> None:
+        fake_client = _FakeClient()
+        fake_manager = _FakeManager(fake_client)
+        record = await fake_manager.run_manager.create_or_reject(
+            "thread-1",
+            run_id="run-1",
+            on_disconnect=DisconnectMode.continue_,
+            metadata={"entrypoint": "chat_agui"},
+        )
+        await fake_manager.run_manager.set_status(record.run_id, RunStatus.running)
+        await fake_manager.stream_bridge.publish(record.run_id, "messages-tuple", {"type": "ai", "content": "first", "id": "msg-1"})
+        stream = fake_manager.stream_bridge.subscribe(record.run_id)
+        first_entry = await anext(stream)
+        await stream.aclose()
+        await fake_manager.stream_bridge.publish(record.run_id, "messages-tuple", {"type": "ai", "content": "second", "id": "msg-2"})
+        await fake_manager.run_manager.set_status(record.run_id, RunStatus.success)
+        await fake_manager.stream_bridge.publish_end(record.run_id)
+
+        original_get_client_manager = chat.get_client_manager
+        chat.get_client_manager = lambda: fake_manager
+        try:
+            response = await chat.chat_agui(_fake_request({"last-event-id": first_entry.id}), self._agui_request())
+            chunks = [str(chunk) async for chunk in response.body_iterator]
+        finally:
+            chat.get_client_manager = original_get_client_manager
+
+        parsed = [self._parse_agui_sse_chunk(chunk) for chunk in chunks]
+        events = [event for _event_id, event in parsed]
+        self.assertFalse(fake_client.astream_called)
+        self.assertEqual([event["type"] for event in events], ["RUN_STARTED", "TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END", "RUN_FINISHED"])
+        self.assertEqual(events[2]["delta"], "second")
+        self.assertIsNotNone(parsed[2][0])
+        self.assertNotEqual(parsed[2][0], first_entry.id)
 
     async def test_deerflow_client_astream_uses_agent_astream(self) -> None:
         class FakeAgent:
@@ -896,14 +944,14 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1], {"type": "RUN_ERROR", "message": "boom", "rawEvent": {"name": "lead_agent"}})
         self.assertEqual(fake_manager.done, ["thread-1"])
 
-    async def test_chat_agui_preserves_parent_run_id_and_data_only_sse(self) -> None:
+    async def test_chat_agui_preserves_parent_run_id_and_sse_event_shape(self) -> None:
         fake_client = _FakeClient()
 
         events, _fake_manager, chunks = await self._collect_agui_stream(fake_client, parent_run_id="parent-1")
 
         self.assertEqual(events[0], {"type": "RUN_STARTED", "threadId": "thread-1", "runId": "run-1", "parentRunId": "parent-1", "rawEvent": {"name": "lead_agent"}})
-        self.assertTrue(all(chunk.startswith("data: ") for chunk in chunks))
         self.assertTrue(all("event:" not in chunk for chunk in chunks))
+        self.assertTrue(any(chunk.startswith("id: ") for chunk in chunks))
 
     async def test_chat_agui_maps_values_snapshot_roles_and_tool_calls(self) -> None:
         fake_client = _FakeClient(

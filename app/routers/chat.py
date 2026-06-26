@@ -36,7 +36,7 @@ _AGUI_OPTIONS_HEADERS = {
     "Allow": "OPTIONS, POST",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "OPTIONS, POST",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, Last-Event-ID",
     "Access-Control-Max-Age": "86400",
 }
 
@@ -151,26 +151,33 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
     thread_id = req.thread_id
     run_id = req.run_id
 
-    kwargs = _chat_kwargs_from_agui(req)
-    user_message = _latest_user_message(req)
-    if user_message is None:
-        raise HTTPException(status_code=400, detail="No user message found in request")
-
-    try:
-        record = await manager.start_client_stream_run(
-            thread_id=thread_id,
-            run_id=run_id,
-            message=user_message,
-            kwargs=kwargs,
-            request_id=get_request_id(),
-            entrypoint="chat_agui",
-            on_disconnect=req.on_disconnect or "cancel",
-            multitask_strategy=req.multitask_strategy or "reject",
-        )
-    except ConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
     last_event_id = request.headers.get("last-event-id")
+    requested_kwargs = _chat_kwargs_from_agui(req)
+    record = manager.run_manager.get(run_id)
+    if record is not None:
+        if record.thread_id != thread_id:
+            raise HTTPException(status_code=409, detail=f"Run {run_id} belongs to a different thread")
+        kwargs = dict(record.kwargs)
+    else:
+        kwargs = requested_kwargs
+        if last_event_id:
+            raise HTTPException(status_code=410, detail=f"Run {run_id} is no longer available for reconnect")
+        user_message = _latest_user_message(req)
+        if user_message is None:
+            raise HTTPException(status_code=400, detail="No user message found in request")
+        try:
+            record = await manager.start_client_stream_run(
+                thread_id=thread_id,
+                run_id=run_id,
+                message=user_message,
+                kwargs=kwargs,
+                request_id=get_request_id(),
+                entrypoint="chat_agui",
+                on_disconnect=req.on_disconnect or "cancel",
+                multitask_strategy=req.multitask_strategy or "reject",
+            )
+        except ConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     client = await manager.get_async_client(**kwargs)
     agent_name: str = client.agent_name
@@ -197,8 +204,11 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
         # receives incremental REASONING_MESSAGE_CONTENT.delta values.
         reasoning_content_state: dict[str, str] = {}
 
-        def emit(agui_event: dict[str, Any], name: str | None = None) -> str:
-            return _agui_sse(_annotate_event_name(agui_event, name if name is not None else agent_name, subagent_names_by_id))
+        def emit(agui_event: dict[str, Any], name: str | None = None, *, event_id: str | None = None) -> str:
+            return _agui_sse(
+                _annotate_event_name(agui_event, name if name is not None else agent_name, subagent_names_by_id),
+                event_id=event_id,
+            )
 
         try:
             yield emit({"type": "RUN_STARTED", "threadId": thread_id, "runId": run_id, **({"parentRunId": req.parent_run_id} if req.parent_run_id else {})})
@@ -229,19 +239,20 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                     continue
                 event_agent_name = entry.data.get("_agent_name") if isinstance(entry.data, dict) else None
                 event = StreamEvent(type=cast(StreamEventType, entry.event), data=entry.data)
+                events_for_entry: list[tuple[dict[str, Any], str | None]] = []
                 if event.type == "end":
                     for reasoning_event in _close_reasoning_messages(open_reasoning_message_ids):
-                        yield emit(reasoning_event, event_agent_name)
+                        events_for_entry.append((reasoning_event, event_agent_name))
                     for reasoning_event in _close_subagent_reasoning_messages(open_subagent_reasoning_message_ids):
-                        yield emit(reasoning_event, event_agent_name)
+                        events_for_entry.append((reasoning_event, event_agent_name))
                     if open_text_message_id:
-                        yield emit({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id}, event_agent_name)
+                        events_for_entry.append(({"type": "TEXT_MESSAGE_END", "messageId": open_text_message_id}, event_agent_name))
                         open_text_message_id = None
                     for text_event in _close_subagent_text_messages(open_subagent_text_message_ids):
-                        yield emit(text_event, event_agent_name)
+                        events_for_entry.append((text_event, event_agent_name))
                     for tc_id in list(open_tool_call_ids):
-                        yield emit({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")}, event_agent_name)
-                        yield emit({"type": "TOOL_CALL_END", "toolCallId": tc_id}, event_agent_name)
+                        events_for_entry.append(({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")}, event_agent_name))
+                        events_for_entry.append(({"type": "TOOL_CALL_END", "toolCallId": tc_id}, event_agent_name))
                     open_tool_call_ids.clear()
                 for agui_event in _stream_event_to_agui(
                     event,
@@ -286,7 +297,9 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                             open_subagent_reasoning_message_ids.discard(message_id)
                         else:
                             open_reasoning_message_ids.discard(message_id)
-                    yield emit(agui_event, event_agent_name)
+                    events_for_entry.append((agui_event, event_agent_name))
+                for index, (agui_event, agui_event_agent_name) in enumerate(events_for_entry):
+                    yield emit(agui_event, agui_event_agent_name, event_id=entry.id if index == len(events_for_entry) - 1 else None)
             for tc_id in list(open_tool_call_ids):
                 yield emit({"type": "TOOL_CALL_ARGS", "toolCallId": tc_id, "delta": tool_call_args_state.get(tc_id, "{}")})
                 yield emit({"type": "TOOL_CALL_END", "toolCallId": tc_id})
@@ -356,8 +369,13 @@ def _latest_user_message(req: AguiRunAgentInput) -> str | None:
     return None
 
 
-def _agui_sse(event: dict[str, Any]) -> str:
-    return f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+def _agui_sse(event: dict[str, Any], *, event_id: str | None = None) -> str:
+    lines: list[str] = []
+    if event_id:
+        safe_event_id = str(event_id).replace("\r", "").replace("\n", "")
+        lines.append(f"id: {safe_event_id}")
+    lines.append(f"data: {json.dumps(event, ensure_ascii=False, default=str)}")
+    return "\n".join(lines) + "\n\n"
 
 
 def _close_reasoning_messages(open_reasoning_message_ids: set[str]) -> list[dict[str, Any]]:
