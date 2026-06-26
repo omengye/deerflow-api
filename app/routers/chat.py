@@ -1,8 +1,11 @@
 """Chat endpoints — streaming and AG-UI."""
 import asyncio
 import json
+import mimetypes
 import uuid
+from pathlib import PurePosixPath
 from typing import Any, cast
+from urllib.parse import quote
 
 import logging
 
@@ -481,9 +484,14 @@ def _stream_event_to_agui(
             reasoning_content_state if reasoning_content_state is not None else {},
         )
     if event_type == "values":
+        events: list[dict[str, Any]] = []
         messages = event.data.get("messages")
         if isinstance(messages, list):
-            return [{"type": "MESSAGES_SNAPSHOT", "messages": [_message_to_agui(m) for m in messages if isinstance(m, dict)]}]
+            events.append({"type": "MESSAGES_SNAPSHOT", "messages": [_message_to_agui(m) for m in messages if isinstance(m, dict)]})
+        artifact_event = _artifacts_to_agui(thread_id, event.data.get("artifacts"))
+        if artifact_event is not None:
+            events.append(artifact_event)
+        return events
     if event_type == "tool_call_chunk":
         return _subagent_tool_call_chunk_to_agui(event.data, tool_call_args_state, open_tool_call_ids, subagent_names_by_id)
     if event_type == "tool_result_chunk":
@@ -595,6 +603,42 @@ def _message_tuple_to_agui(
             })
             return events
     return []
+
+
+def _artifacts_to_agui(thread_id: str, artifacts: Any) -> dict[str, Any] | None:
+    if not isinstance(artifacts, list):
+        return None
+
+    items: list[dict[str, Any]] = []
+    for raw in artifacts:
+        if not isinstance(raw, str):
+            continue
+        path = raw.strip()
+        if not path.startswith("/mnt/user-data/outputs/"):
+            continue
+        name = PurePosixPath(path).name or "artifact"
+        mime_type, _ = mimetypes.guess_type(name)
+        encoded_path = quote(path.lstrip("/"), safe="/")
+        items.append(
+            {
+                "path": path,
+                "name": name,
+                "url": f"/api/threads/{thread_id}/artifacts/{encoded_path}",
+                "mimeType": mime_type,
+                "kind": "image" if mime_type and mime_type.startswith("image/") else "file",
+            }
+        )
+
+    if not items:
+        return None
+    return {
+        "type": "CUSTOM",
+        "name": "deerflow.artifacts",
+        "value": {
+            "threadId": thread_id,
+            "artifacts": items,
+        },
+    }
 
 
 def _subagent_started_to_agui(data: dict[str, Any], subagent_names_by_id: dict[str, str]) -> list[dict[str, Any]]:

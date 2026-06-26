@@ -53,6 +53,7 @@ class ThreadResponse(BaseModel):
 class ThreadDetail(BaseModel):
     thread_id: str
     messages: list[dict[str, Any]]
+    artifacts: list[Any] = Field(default_factory=list)
     title: Optional[str] = None
     status: Literal["idle", "running"] = "idle"
 

@@ -73,14 +73,18 @@ async def get_thread(thread_id: str):
             checkpoints = thread["checkpoints"]
             if checkpoints:
                 latest = checkpoints[-1]
-                messages = latest.get("values", {}).get("messages", [])
-                title = latest.get("values", {}).get("title")
+                values = latest.get("values", {})
+                messages = values.get("messages", [])
+                artifacts = values.get("artifacts", [])
+                title = values.get("title")
             else:
                 messages = []
+                artifacts = []
                 title = None
         else:
             values = thread.get("values", {})
             messages = values.get("messages", [])
+            artifacts = values.get("artifacts", [])
             title = values.get("title")
 
         serialized = []
@@ -100,6 +104,7 @@ async def get_thread(thread_id: str):
         return ThreadDetail(
             thread_id=thread_id,
             messages=serialized,
+            artifacts=artifacts if isinstance(artifacts, list) else [],
             title=title,
             status=status,
         )
