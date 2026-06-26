@@ -1,7 +1,7 @@
 # DeerFlow config.yaml
 # ⚠️ 配置你的 API Key 后再启动服务
 
-config_version: 11
+config_version: 12
 log_level: info
 
 # API service settings. Prefer putting operational configuration here instead
@@ -38,6 +38,16 @@ api:
   scheduler_db_path: ./data/scheduled_tasks.db
   scheduler_poll_interval_seconds: 5
   scheduler_timezone: Asia/Shanghai
+
+stream_bridge:
+  # memory: single-process development; redis: cross-process replay for SSE reconnects.
+  type: memory
+  queue_maxsize: 512
+  # Redis Streams backend. Enable by setting type: redis.
+  redis_url: ${REDIS_URL:-redis://localhost:6379/0}
+  redis_key_prefix: deerflow:stream
+  redis_maxlen: 10000
+  redis_retention_seconds: 3600
 
 token_usage:
   enabled: false

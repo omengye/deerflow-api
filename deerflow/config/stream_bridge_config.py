@@ -12,11 +12,25 @@ class StreamBridgeConfig(BaseModel):
 
     type: StreamBridgeType = Field(
         default="memory",
-        description="Stream bridge backend type. 'memory' uses in-process asyncio.Queue (single-process only). 'redis' uses Redis Streams (planned for Phase 2, not yet implemented).",
+        description="Stream bridge backend type. 'memory' uses an in-process buffer (single-process only). 'redis' uses Redis Streams.",
     )
     redis_url: str | None = Field(
         default=None,
         description="Redis URL for the redis stream bridge type. Example: 'redis://localhost:6379/0'.",
+    )
+    redis_key_prefix: str = Field(
+        default="deerflow:stream",
+        description="Redis key prefix for per-run stream keys.",
+    )
+    redis_maxlen: int = Field(
+        default=10000,
+        ge=1,
+        description="Approximate maximum Redis Stream entries retained per run.",
+    )
+    redis_retention_seconds: int = Field(
+        default=3600,
+        ge=0,
+        description="Minimum seconds to retain a completed Redis stream after cleanup is requested.",
     )
     queue_maxsize: int = Field(
         default=256,

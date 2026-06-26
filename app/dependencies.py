@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import settings
-from deerflow.runtime import DisconnectMode, MemoryStreamBridge, RunManager, RunRecord, RunStatus
+from deerflow.runtime import DisconnectMode, MemoryStreamBridge, RunManager, RunRecord, RunStatus, make_stream_bridge
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,7 @@ class ClientManager:
         self._running_threads: set[str] = set()  # thread_ids currently running
         self._thread_lock = threading.Lock()
         self.run_manager = RunManager()
+        self._stream_bridge_cm = None
         self.stream_bridge = MemoryStreamBridge(queue_maxsize=512)
         self.scheduler_service = None
         self.feishu_channel = None
@@ -86,6 +87,10 @@ class ClientManager:
                 f"Failed to load DeerFlow config: {e}\n"
                 f"Set DEER_FLOW_CONFIG_PATH or place config.yaml in the project root."
             ) from e
+
+        if self._stream_bridge_cm is None:
+            self._stream_bridge_cm = make_stream_bridge(config.stream_bridge)
+            self.stream_bridge = await self._stream_bridge_cm.__aenter__()
 
         self._assert_storage_ready()
 
@@ -599,6 +604,14 @@ class ClientManager:
                 logger.warning("Error closing sync SQLite connection", exc_info=True)
             finally:
                 self._sync_sqlite_conn = None
+        if self._stream_bridge_cm is not None:
+            try:
+                await self._stream_bridge_cm.__aexit__(None, None, None)
+            except Exception:
+                logger.warning("Error closing stream bridge", exc_info=True)
+            finally:
+                self._stream_bridge_cm = None
+                self.stream_bridge = MemoryStreamBridge(queue_maxsize=512)
         self._checkpointer = None
         self._running_threads.clear()
 
