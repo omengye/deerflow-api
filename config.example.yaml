@@ -167,6 +167,7 @@ tool_groups:
   - name: file:read
   - name: file:write
   - name: bash
+  - name: object_storage
 
 tool_search:
   enabled: false
@@ -205,6 +206,37 @@ tools:
     use: deerflow.community.image_search.tools:image_search_tool
     max_results: 5
     https_proxy: http://172.17.0.1:11055
+  # Qiniu Kodo object storage tools. Install optional dependency first:
+  #   uv sync --extra qiniu
+  #
+  # Shared fields may be placed on any enabled qiniu_* tool entry. The tools
+  # also read QINIU_ACCESS_KEY, QINIU_SECRET_KEY, QINIU_BUCKET, QINIU_DOMAIN,
+  # QINIU_KEY_PREFIX, and QINIU_PRIVATE_BUCKET from the environment.
+  # - name: qiniu_upload_file
+  #   group: object_storage
+  #   use: deerflow.community.qiniu_kodo.tools:qiniu_upload_file_tool
+  #   access_key: $QINIU_ACCESS_KEY
+  #   secret_key: $QINIU_SECRET_KEY
+  #   bucket: your-bucket
+  #   domain: https://cdn.example.com
+  #   key_prefix: deerflow/{thread_id}/
+  #   private_bucket: false
+  #   upload_token_expires: 3600
+  # - name: qiniu_download_file
+  #   group: object_storage
+  #   use: deerflow.community.qiniu_kodo.tools:qiniu_download_file_tool
+  # - name: qiniu_list_objects
+  #   group: object_storage
+  #   use: deerflow.community.qiniu_kodo.tools:qiniu_list_objects_tool
+  # - name: qiniu_stat_object
+  #   group: object_storage
+  #   use: deerflow.community.qiniu_kodo.tools:qiniu_stat_object_tool
+  # - name: qiniu_delete_object
+  #   group: object_storage
+  #   use: deerflow.community.qiniu_kodo.tools:qiniu_delete_object_tool
+  # - name: qiniu_get_download_url
+  #   group: object_storage
+  #   use: deerflow.community.qiniu_kodo.tools:qiniu_get_download_url_tool
   - name: ls
     group: file:read
     use: deerflow.sandbox.tools:ls_tool
