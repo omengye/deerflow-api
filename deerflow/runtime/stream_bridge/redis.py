@@ -43,7 +43,13 @@ class RedisStreamBridge(StreamBridge):
                     "Redis stream bridge requires the 'redis' package. "
                     "Install project dependencies after enabling stream_bridge.type=redis."
                 ) from exc
-            self._redis = redis_asyncio.from_url(redis_url, decode_responses=True)
+            # XREAD uses a server-side BLOCK timeout; a client read timeout shorter
+            # than that turns an idle stream into redis.exceptions.TimeoutError.
+            self._redis = redis_asyncio.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_timeout=None,
+            )
         else:
             self._redis = client
 

@@ -114,6 +114,14 @@ class RedisStreamBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(event, HEARTBEAT_SENTINEL)
 
+    async def test_owned_redis_client_disables_socket_read_timeout(self) -> None:
+        bridge = RedisStreamBridge(redis_url="redis://127.0.0.1:6379/1")
+        try:
+            kwargs = bridge._redis.connection_pool.connection_kwargs
+            self.assertIsNone(kwargs["socket_timeout"])
+        finally:
+            await bridge.close()
+
     async def test_cleanup_deletes_key_after_retention_window(self) -> None:
         fake = _FakeRedis()
         bridge = RedisStreamBridge(client=fake, key_prefix="test", retention_seconds=0)
