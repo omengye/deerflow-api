@@ -11,6 +11,7 @@ update CHANGELOG.md and bump the version per SemVer.
 from __future__ import annotations
 
 import inspect
+from importlib.metadata import PackageNotFoundError, version
 from typing import get_type_hints
 
 import pytest
@@ -62,8 +63,13 @@ def test_public_api_complete() -> None:
 def test_version_set() -> None:
     import deerflow_sdk
 
+    try:
+        expected_version = version("deerflow-api")
+    except PackageNotFoundError:
+        expected_version = "0+unknown"
+
     assert isinstance(deerflow_sdk.__version__, str)
-    assert deerflow_sdk.__version__.startswith("0.1.")
+    assert deerflow_sdk.__version__ == expected_version
 
 
 # ---------------------------------------------------------------------

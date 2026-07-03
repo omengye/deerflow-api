@@ -11,6 +11,8 @@ Design rules (do NOT violate):
   3. Engine (LangGraph) is an internal detail in ``deerflow_sdk._engine``.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from deerflow_sdk._config import HarnessConfig, ModelConfig
 from deerflow_sdk._errors import (
     DeerFlowError,
@@ -78,4 +80,7 @@ __all__ = [
     "ModelError",
 ]
 
-__version__ = "0.1.0.dev0"
+try:
+    __version__ = version("deerflow-api")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
