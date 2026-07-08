@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DeerFlow 管理台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="loginView" class="login-shell">
+      <main class="login-panel" aria-labelledby="loginTitle">
+        <div class="brand-mark" aria-hidden="true">DF</div>
+        <h1 id="loginTitle">DeerFlow 管理台</h1>
+        <p class="muted">输入 Bearer token，后端校验通过后进入管理页面。</p>
+
+        <form id="loginForm" class="form-grid">
+          <label>
+            <span>API Token</span>
+            <input id="tokenInput" name="token" type="password" autocomplete="current-password" placeholder="Bearer token" />
+          </label>
+          <button id="loginButton" class="primary-button" type="submit">登录</button>
+          <p id="loginMessage" class="form-message" role="status"></p>
+        </form>
+      </main>
+    </div>
+
+    <div id="appView" class="app-shell hidden">
+      <aside class="sidebar" aria-label="主导航">
+        <div class="sidebar-brand">
+          <div class="brand-mark small" aria-hidden="true">DF</div>
+          <div>
+            <strong>DeerFlow</strong>
+            <span>Admin</span>
+          </div>
+        </div>
+
+        <nav class="nav-list">
+          <button class="nav-item active" data-view-target="overview" type="button">总览</button>
+          <button class="nav-item" data-view-target="models" type="button">大模型</button>
+          <button class="nav-item" data-view-target="skills" type="button">Skills</button>
+          <button class="nav-item" data-view-target="mcp" type="button">MCP</button>
+          <button class="nav-item" data-view-target="runtime" type="button">运行配置</button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <span id="sidebarBaseUrl" class="mono"></span>
+          <button id="logoutButton" class="ghost-button" type="button">退出</button>
+        </div>
+      </aside>
+
+      <main class="content-shell">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">管理状态</p>
+            <h2 id="viewTitle">总览</h2>
+          </div>
+          <div class="topbar-actions">
+            <span id="connectionBadge" class="status-badge neutral">未连接</span>
+            <button id="refreshButton" class="secondary-button" type="button">刷新</button>
+          </div>
+        </header>
+
+        <section id="toast" class="toast hidden" role="status"></section>
+
+        <section id="overviewView" class="view-section active">
+          <div class="metric-grid">
+            <article class="metric-card">
+              <span class="metric-label">模型</span>
+              <strong id="modelsCount">0</strong>
+              <span class="metric-note">来自 /api/models</span>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Skills</span>
+              <strong id="skillsCount">0</strong>
+              <span class="metric-note">来自 /api/skills</span>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">MCP Server</span>
+              <strong id="mcpCount">0</strong>
+              <span class="metric-note">来自 /api/mcp/config</span>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Ready</span>
+              <strong id="readyStatus">--</strong>
+              <span class="metric-note">来自 /health/ready</span>
+            </article>
+          </div>
+
+          <div class="section-grid">
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>后端检查</h3>
+                  <p>读取健康状态和可用管理能力。</p>
+                </div>
+              </div>
+              <div id="healthDetails" class="detail-list"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>当前能力</h3>
+                  <p>前端已接入 Admin API 迭代 1，模型配置可直接保存。</p>
+                </div>
+              </div>
+              <ul class="capability-list">
+                <li><span class="dot ok"></span> Token 登录校验</li>
+                <li><span class="dot ok"></span> 模型列表展示</li>
+                <li><span class="dot ok"></span> Skill 启停</li>
+                <li><span class="dot ok"></span> MCP JSON 读写</li>
+                <li><span class="dot ok"></span> 模型新增/编辑写入 /api/admin/models</li>
+                <li><span class="dot ok"></span> 自定义 skill 文件编辑</li>
+                <li><span class="dot ok"></span> 运行配置安全字段写入</li>
+              </ul>
+            </section>
+          </div>
+        </section>
+
+        <section id="modelsView" class="view-section">
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>大模型配置</h3>
+                <p>展示当前可用模型；新增和编辑可保存到 config.yaml。</p>
+              </div>
+              <button id="openModelDraftButton" class="secondary-button" type="button">新增/编辑模型</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>显示名</th>
+                    <th>Thinking</th>
+                    <th>Vision</th>
+                  </tr>
+                </thead>
+                <tbody id="modelsTableBody"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="modelDraftPanel" class="panel hidden">
+            <div class="panel-header">
+              <div>
+                <h3>模型配置草稿</h3>
+                <p>保存会替换同名模型；未同名时追加到当前模型列表，并自动 reload。</p>
+              </div>
+              <button id="closeModelDraftButton" class="ghost-button" type="button">关闭</button>
+            </div>
+            <div class="split-form">
+              <form id="modelDraftForm" class="form-grid compact">
+                <label>
+                  <span>name</span>
+                  <input id="draftModelName" type="text" placeholder="qwen3-plus" required />
+                </label>
+                <label>
+                  <span>display_name</span>
+                  <input id="draftDisplayName" type="text" placeholder="Qwen 3 Plus" />
+                </label>
+                <label>
+                  <span>use</span>
+                  <input id="draftUse" type="text" value="langchain_openai:ChatOpenAI" required />
+                </label>
+                <label>
+                  <span>model</span>
+                  <input id="draftModelId" type="text" placeholder="qwen3-plus" required />
+                </label>
+                <label>
+                  <span>base_url</span>
+                  <input id="draftBaseUrl" type="url" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" />
+                </label>
+                <label>
+                  <span>api_key</span>
+                  <input id="draftApiKey" type="text" placeholder="$DASHSCOPE_API_KEY" />
+                </label>
+                <label class="checkbox-row">
+                  <input id="draftThinking" type="checkbox" />
+                  <span>supports_thinking</span>
+                </label>
+                <label class="checkbox-row">
+                  <input id="draftVision" type="checkbox" />
+                  <span>supports_vision</span>
+                </label>
+              </form>
+              <div class="code-panel">
+                <div class="code-header">
+                  <span>YAML 片段</span>
+                  <div class="row-actions">
+                    <button id="saveModelButton" class="primary-button" type="button">保存</button>
+                    <button id="copyModelYamlButton" class="ghost-button" type="button">复制</button>
+                  </div>
+                </div>
+                <pre id="modelYamlPreview"></pre>
+              </div>
+            </div>
+            <p id="modelDraftMessage" class="form-message" role="status"></p>
+          </section>
+        </section>
+
+        <section id="skillsView" class="view-section">
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>Skills</h3>
+                <p>读取、启用和禁用已有 skill。</p>
+              </div>
+              <button id="openSkillDraftButton" class="secondary-button" type="button">生成 Skill 草稿</button>
+            </div>
+            <div class="toolbar-row">
+              <label class="checkbox-row">
+                <input id="enabledOnlyToggle" type="checkbox" />
+                <span>只显示已启用</span>
+              </label>
+              <label class="filter-field">
+                <span>来源</span>
+                <select id="skillCategoryFilter">
+                  <option value="all">全部</option>
+                  <option value="public">内置</option>
+                  <option value="custom">自定义</option>
+                </select>
+              </label>
+              <button id="refreshCustomSkillsButton" class="secondary-button" type="button">刷新自定义</button>
+              <span id="skillActionMessage" class="inline-message"></span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>描述</th>
+                    <th>来源</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="skillsTableBody"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="skillDraftPanel" class="panel hidden">
+            <div class="panel-header">
+              <div>
+                <h3>自定义 Skill 草稿</h3>
+                <p>创建、编辑和删除自定义 skill，并管理允许目录下的支持文件。</p>
+              </div>
+              <div class="row-actions">
+                <button id="saveSkillButton" class="primary-button" type="button">保存</button>
+                <button id="deleteSkillButton" class="danger-button" type="button">删除</button>
+                <button id="closeSkillDraftButton" class="ghost-button" type="button">关闭</button>
+              </div>
+            </div>
+            <div class="split-form">
+              <form id="skillDraftForm" class="form-grid compact">
+                <label>
+                  <span>已有自定义 skill</span>
+                  <select id="customSkillSelect">
+                    <option value="">新建</option>
+                  </select>
+                </label>
+                <label>
+                  <span>name</span>
+                  <input id="draftSkillName" type="text" placeholder="market-research" required />
+                </label>
+                <label>
+                  <span>description</span>
+                  <input id="draftSkillDescription" type="text" placeholder="收集并整理市场信息" required />
+                </label>
+                <label class="checkbox-row">
+                  <input id="draftSkillEnabled" type="checkbox" checked />
+                  <span>启用</span>
+                </label>
+                <label>
+                  <span>支持文件路径</span>
+                  <input id="supportFilePath" type="text" placeholder="references/notes.md" />
+                </label>
+                <label>
+                  <span>支持文件内容</span>
+                  <textarea id="supportFileContent" class="small-editor" spellcheck="false"></textarea>
+                </label>
+                <div class="row-actions">
+                  <button id="writeSupportFileButton" class="secondary-button" type="button">写入文件</button>
+                  <button id="deleteSupportFileButton" class="ghost-button" type="button">删除文件</button>
+                </div>
+              </form>
+              <div class="code-panel">
+                <div class="code-header">
+                  <span>SKILL.md</span>
+                  <div class="row-actions">
+                    <button id="loadSkillHistoryButton" class="ghost-button" type="button">历史</button>
+                    <button id="copySkillMarkdownButton" class="ghost-button" type="button">复制</button>
+                  </div>
+                </div>
+                <textarea id="skillMarkdownEditor" class="json-editor" spellcheck="false"></textarea>
+              </div>
+            </div>
+            <p id="skillDraftMessage" class="form-message" role="status"></p>
+            <pre id="skillHistoryPreview" class="history-preview"></pre>
+          </section>
+        </section>
+
+        <section id="mcpView" class="view-section">
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>MCP 配置</h3>
+                <p>直接编辑 mcp_servers JSON，保存到 extensions_config.json。</p>
+              </div>
+              <button id="saveMcpButton" class="primary-button" type="button">保存 MCP</button>
+            </div>
+            <div class="toolbar-row">
+              <label class="filter-field">
+                <span>Server</span>
+                <select id="mcpServerSelect"></select>
+              </label>
+              <button id="enableMcpButton" class="secondary-button" type="button">启用</button>
+              <button id="disableMcpButton" class="secondary-button" type="button">禁用</button>
+              <button id="testMcpButton" class="ghost-button" type="button">测试</button>
+            </div>
+            <textarea id="mcpEditor" class="json-editor" spellcheck="false"></textarea>
+            <p id="mcpMessage" class="form-message" role="status"></p>
+          </section>
+        </section>
+
+        <section id="runtimeView" class="view-section">
+          <div class="section-grid">
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>运行配置</h3>
+                  <p>这些字段来自 config.yaml，当前迭代支持只读查看和手动 reload。</p>
+                </div>
+                <button id="reloadConfigButton" class="secondary-button" type="button">重新加载配置</button>
+              </div>
+              <div id="runtimeConfigDetails" class="readonly-grid">
+                <div>
+                  <span>配置源</span>
+                  <strong>config.yaml</strong>
+                </div>
+                <div>
+                  <span>鉴权方式</span>
+                  <strong>Bearer API token</strong>
+                </div>
+                <div>
+                  <span>热更新</span>
+                  <strong>模型 / Skill / MCP 需后端 reload 支持</strong>
+                </div>
+              </div>
+              <p id="runtimeMessage" class="form-message" role="status"></p>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>运行配置编辑</h3>
+                  <p>仅开放安全字段；保存后对新请求生效。</p>
+                </div>
+                <button id="saveRuntimeButton" class="primary-button" type="button">保存运行配置</button>
+              </div>
+              <form id="runtimeEditForm" class="form-grid compact">
+                <label>
+                  <span>model_name</span>
+                  <input id="runtimeModelName" type="text" placeholder="留空使用默认模型" />
+                </label>
+                <label>
+                  <span>max_concurrent_subagents</span>
+                  <input id="runtimeMaxSubagents" type="number" min="2" max="4" />
+                </label>
+                <label>
+                  <span>chat_request_timeout</span>
+                  <input id="runtimeChatTimeout" type="number" min="1" step="1" />
+                </label>
+                <label>
+                  <span>max_upload_size_mb</span>
+                  <input id="runtimeMaxUploadSize" type="number" min="1" max="2048" />
+                </label>
+                <label>
+                  <span>max_uploads_per_request</span>
+                  <input id="runtimeMaxUploads" type="number" min="1" max="200" />
+                </label>
+                <label>
+                  <span>allowed_upload_extensions</span>
+                  <input id="runtimeAllowedExtensions" type="text" placeholder=".pdf,.txt,.md" />
+                </label>
+                <label class="checkbox-row">
+                  <input id="runtimeThinking" type="checkbox" />
+                  <span>thinking_enabled</span>
+                </label>
+                <label class="checkbox-row">
+                  <input id="runtimeSubagent" type="checkbox" />
+                  <span>subagent_enabled</span>
+                </label>
+                <label class="checkbox-row">
+                  <input id="runtimePlanMode" type="checkbox" />
+                  <span>plan_mode</span>
+                </label>
+              </form>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

@@ -38,9 +38,17 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
 
 class ApiKeyAuthMiddleware(BaseHTTPMiddleware):
-    """Protect API routes with a Bearer token when auth is enabled."""
+    """Protect externally useful routes with a Bearer token when auth is enabled."""
 
-    _PUBLIC_PATHS = {"/health", "/health/ready"}
+    _PUBLIC_PATHS = {"/health"}
+    _PROTECTED_PATHS = {
+        "/health/ready",
+        "/docs",
+        "/docs/oauth2-redirect",
+        "/openapi.json",
+        "/redoc",
+    }
+    _PROTECTED_PREFIXES = ("/api", "/v1")
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if not _should_authenticate(request):
@@ -61,9 +69,11 @@ def _should_authenticate(request: Request) -> bool:
         return False
     if request.url.path in ApiKeyAuthMiddleware._PUBLIC_PATHS:
         return False
-    if not (request.url.path.startswith("/api") or request.url.path.startswith("/v1")):
+    if not settings.auth_enabled:
         return False
-    return settings.auth_enabled
+    if request.url.path in ApiKeyAuthMiddleware._PROTECTED_PATHS:
+        return True
+    return request.url.path.startswith(ApiKeyAuthMiddleware._PROTECTED_PREFIXES)
 
 
 def _is_authorized(request: Request) -> bool:

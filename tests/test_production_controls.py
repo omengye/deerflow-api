@@ -2,9 +2,10 @@ import unittest
 import tempfile
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import app.config as app_config
@@ -25,9 +26,17 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
         async def protected():
             return {"ok": True}
 
+        @app.post("/v1/chat/completions")
+        async def openai_compatible():
+            return {"ok": True}
+
         @app.get("/health")
         async def public():
             return {"status": "ok"}
+
+        @app.get("/health/ready")
+        async def ready():
+            return {"status": "ok", "checks": {"storage": {"ok": True}}}
 
         return TestClient(app)
 
@@ -45,20 +54,116 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
             settings.auth_enabled = original_enabled
             settings.api_keys = original_keys
 
-    async def test_api_auth_allows_valid_bearer_token_and_public_health(self) -> None:
+    async def test_auth_protects_v1_docs_openapi_and_readiness(self) -> None:
         original_enabled = settings.auth_enabled
         original_keys = list(settings.api_keys)
         settings.auth_enabled = True
         settings.api_keys = ["secret"]
         try:
             client = self._auth_test_client()
-            protected = client.get("/api/chat", headers={"Authorization": "Bearer secret"})
+            protected_paths = [
+                "/api/chat",
+                "/v1/chat/completions",
+                "/docs",
+                "/docs/oauth2-redirect",
+                "/openapi.json",
+                "/redoc",
+                "/health/ready",
+            ]
+            for path in protected_paths:
+                method = client.post if path == "/v1/chat/completions" else client.get
+                kwargs = {"json": {"messages": [{"role": "user", "content": "hi"}]}} if path == "/v1/chat/completions" else {}
+                with self.subTest(path=path):
+                    unauthorized = method(path, **kwargs)
+                    authorized = method(path, headers={"Authorization": "Bearer secret"}, **kwargs)
+                    self.assertEqual(unauthorized.status_code, 401)
+                    self.assertEqual(unauthorized.headers["www-authenticate"], "Bearer")
+                    self.assertEqual(authorized.status_code, 200)
+        finally:
+            settings.auth_enabled = original_enabled
+            settings.api_keys = original_keys
+
+    async def test_auth_keeps_basic_health_public(self) -> None:
+        original_enabled = settings.auth_enabled
+        original_keys = list(settings.api_keys)
+        settings.auth_enabled = True
+        settings.api_keys = ["secret"]
+        try:
+            client = self._auth_test_client()
             public = client.get("/health")
-            self.assertEqual(protected.status_code, 200)
             self.assertEqual(public.status_code, 200)
         finally:
             settings.auth_enabled = original_enabled
             settings.api_keys = original_keys
+
+    async def test_admin_ui_is_only_served_when_auth_enabled(self) -> None:
+        from app import _admin_ui_file_response
+
+        original_enabled = settings.auth_enabled
+        try:
+            settings.auth_enabled = False
+            with self.assertRaises(HTTPException) as disabled:
+                _admin_ui_file_response()
+            self.assertEqual(disabled.exception.status_code, 404)
+
+            settings.auth_enabled = True
+            response = _admin_ui_file_response()
+            self.assertTrue(str(response.path).endswith("admin-ui\\index.html") or str(response.path).endswith("admin-ui/index.html"))
+        finally:
+            settings.auth_enabled = original_enabled
+
+    async def test_admin_ui_redirects_bare_admin_path_to_slash(self) -> None:
+        from app import admin_redirect
+
+        original_enabled = settings.auth_enabled
+        try:
+            settings.auth_enabled = True
+            response = admin_redirect()
+            self.assertEqual(response.status_code, 307)
+            self.assertEqual(response.headers["location"], "/admin/")
+        finally:
+            settings.auth_enabled = original_enabled
+
+    async def test_admin_ui_rejects_path_traversal(self) -> None:
+        from app import _admin_ui_file_response
+
+        original_enabled = settings.auth_enabled
+        try:
+            settings.auth_enabled = True
+            with self.assertRaises(HTTPException) as traversal:
+                _admin_ui_file_response("../config.yaml")
+            self.assertEqual(traversal.exception.status_code, 404)
+        finally:
+            settings.auth_enabled = original_enabled
+
+    async def test_skills_api_preserves_skill_category(self) -> None:
+        from app.routers import skills as skills_router
+
+        client = SimpleNamespace(
+            list_skills=lambda enabled_only=False: {
+                "skills": [
+                    {
+                        "name": "builtin",
+                        "description": "Built-in skill",
+                        "category": "public",
+                        "enabled": True,
+                    },
+                    {
+                        "name": "custom-one",
+                        "description": "Custom skill",
+                        "category": "custom",
+                        "enabled": False,
+                    },
+                ]
+            }
+        )
+        manager = SimpleNamespace(get_client=lambda: client)
+
+        with patch.object(skills_router, "get_client_manager", return_value=manager):
+            response = await skills_router.list_skills()
+
+        categories = {skill.name: skill.category for skill in response.skills}
+        self.assertEqual(categories, {"builtin": "public", "custom-one": "custom"})
 
     async def test_run_manager_rejects_second_inflight_run_on_same_thread(self) -> None:
         manager = ClientManager()

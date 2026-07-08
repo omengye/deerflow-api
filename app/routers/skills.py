@@ -22,10 +22,14 @@ async def list_skills(enabled_only: bool = False):
         skills = []
         if isinstance(result, dict) and "skills" in result:
             for s in result["skills"]:
+                category = s.get("category", "public")
+                if category not in ("public", "custom"):
+                    category = "public"
                 skills.append(SkillInfo(
                     name=s.get("name", ""),
                     display_name=s.get("display_name", s.get("name", "")),
                     description=s.get("description", ""),
+                    category=category,
                     enabled=s.get("enabled", False),
                 ))
         return SkillListResponse(skills=skills)

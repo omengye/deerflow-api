@@ -27,10 +27,32 @@ if not _embedded_harness_package.exists() and str(_harness_path) not in sys.path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, RedirectResponse
 
 from app.config import settings
 from app.dependencies import get_client_manager
 from app.middleware import ApiKeyAuthMiddleware, RequestContextMiddleware
+
+
+_ADMIN_UI_DIR = _project_root / "admin-ui"
+
+
+def _admin_ui_file_response(asset_path: str = "index.html") -> FileResponse:
+    """Serve admin UI assets only when API authentication is enabled."""
+    if not settings.auth_enabled:
+        raise HTTPException(status_code=404, detail="Admin UI is disabled")
+    if not _ADMIN_UI_DIR.exists():
+        raise HTTPException(status_code=404, detail="Admin UI not found")
+
+    root = _ADMIN_UI_DIR.resolve()
+    target = (root / asset_path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Admin UI asset not found") from exc
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="Admin UI asset not found")
+    return FileResponse(target)
 
 
 @asynccontextmanager
@@ -86,7 +108,7 @@ app.add_middleware(ApiKeyAuthMiddleware)
 app.add_middleware(RequestContextMiddleware)
 
 # Import routers
-from app.routers import chat, threads, models, skills, mcp, uploads, runs, openai_compatible  # noqa: E402
+from app.routers import admin, chat, threads, models, skills, mcp, uploads, runs, openai_compatible  # noqa: E402
 
 app.include_router(chat.router, prefix="/api")
 app.include_router(threads.router, prefix="/api")
@@ -95,7 +117,24 @@ app.include_router(skills.router, prefix="/api")
 app.include_router(mcp.router, prefix="/api")
 app.include_router(uploads.router, prefix="/api")
 app.include_router(runs.router, prefix="/api")
+app.include_router(admin.router, prefix="/api")
 app.include_router(openai_compatible.router)
+
+
+@app.get("/admin/", include_in_schema=False)
+def admin_index():
+    return _admin_ui_file_response()
+
+
+@app.get("/admin", include_in_schema=False)
+def admin_redirect():
+    _admin_ui_file_response()
+    return RedirectResponse(url="/admin/", status_code=307)
+
+
+@app.get("/admin/{asset_path:path}", include_in_schema=False)
+def admin_asset(asset_path: str):
+    return _admin_ui_file_response(asset_path)
 
 
 @app.get("/health")

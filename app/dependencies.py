@@ -336,6 +336,57 @@ class ClientManager:
 
         return {"status": "ok" if ok else "error", "checks": checks}
 
+    def reload_runtime_config(
+        self,
+        *,
+        include_extensions: bool = True,
+        reset_clients: bool = True,
+        extensions_config_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Reload file-backed runtime config and invalidate cached clients."""
+        from deerflow.config.app_config import reload_app_config
+
+        config = reload_app_config(settings.config_path or None)
+        extensions_reloaded = False
+        mcp_cache_reset = False
+
+        if include_extensions:
+            from deerflow.config.extensions_config import reload_extensions_config
+
+            reload_extensions_config(extensions_config_path)
+            extensions_reloaded = True
+            try:
+                from deerflow.mcp.cache import reset_mcp_tools_cache
+
+                reset_mcp_tools_cache()
+                mcp_cache_reset = True
+            except Exception:
+                logger.debug("Failed to reset MCP tools cache after admin reload", exc_info=True)
+
+        clients_reset = False
+        if reset_clients:
+            self._client_map.clear()
+            self._async_client_map.clear()
+            clients_reset = True
+
+        with self._thread_lock:
+            active_threads = len(self._running_threads)
+
+        result: dict[str, Any] = {
+            "success": True,
+            "config_version": getattr(config, "model_extra", {}).get("config_version")
+            if getattr(config, "model_extra", None)
+            else None,
+            "models_count": len(getattr(config, "models", []) or []),
+            "extensions_reloaded": extensions_reloaded,
+            "mcp_cache_reset": mcp_cache_reset,
+            "clients_reset": clients_reset,
+            "active_threads": active_threads,
+        }
+        if active_threads:
+            result["warning"] = "Reload applies to new runs; active runs continue with their existing client state."
+        return result
+
     async def start_client_stream_run(
         self,
         *,
