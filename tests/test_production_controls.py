@@ -112,15 +112,27 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
         finally:
             settings.auth_enabled = original_enabled
 
-    async def test_admin_ui_redirects_bare_admin_path_to_slash(self) -> None:
-        from app import admin_redirect
+    async def test_management_ui_redirects_bare_management_path_to_slash(self) -> None:
+        from app import management_redirect
 
         original_enabled = settings.auth_enabled
         try:
             settings.auth_enabled = True
-            response = admin_redirect()
+            response = management_redirect()
             self.assertEqual(response.status_code, 307)
-            self.assertEqual(response.headers["location"], "/admin/")
+            self.assertEqual(response.headers["location"], "/management/")
+        finally:
+            settings.auth_enabled = original_enabled
+
+    async def test_legacy_admin_ui_redirects_to_management(self) -> None:
+        from app import legacy_admin_redirect
+
+        original_enabled = settings.auth_enabled
+        try:
+            settings.auth_enabled = True
+            response = legacy_admin_redirect()
+            self.assertEqual(response.status_code, 307)
+            self.assertEqual(response.headers["location"], "/management/")
         finally:
             settings.auth_enabled = original_enabled
 

@@ -2,7 +2,7 @@
 
 ## Background
 
-The current `/admin` UI is a static management surface served by FastAPI only when API authentication is enabled. It can already call existing public API endpoints for read-only or limited write operations:
+The current `/management/` UI is a static management surface served by FastAPI only when API authentication is enabled. It can already call existing public API endpoints for read-only or limited write operations:
 
 - `GET /api/models`
 - `GET /api/skills`
@@ -36,7 +36,7 @@ The remaining gap is a dedicated Admin API layer. The Admin UI should not write 
 
 ### Goal
 
-Make `/admin` a real authenticated management panel for service identity, safe config inspection, model configuration writes, and config reloads.
+Make `/management/` a real authenticated management panel for service identity, safe config inspection, model configuration writes, and config reloads.
 
 ### Deliverables
 

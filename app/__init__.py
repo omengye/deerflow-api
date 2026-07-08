@@ -121,20 +121,27 @@ app.include_router(admin.router, prefix="/api")
 app.include_router(openai_compatible.router)
 
 
-@app.get("/admin/", include_in_schema=False)
-def admin_index():
+@app.get("/management/", include_in_schema=False)
+def management_index():
     return _admin_ui_file_response()
 
 
-@app.get("/admin", include_in_schema=False)
-def admin_redirect():
+@app.get("/management", include_in_schema=False)
+def management_redirect():
     _admin_ui_file_response()
-    return RedirectResponse(url="/admin/", status_code=307)
+    return RedirectResponse(url="/management/", status_code=307)
 
 
-@app.get("/admin/{asset_path:path}", include_in_schema=False)
-def admin_asset(asset_path: str):
+@app.get("/management/{asset_path:path}", include_in_schema=False)
+def management_asset(asset_path: str):
     return _admin_ui_file_response(asset_path)
+
+
+@app.get("/admin", include_in_schema=False)
+@app.get("/admin/", include_in_schema=False)
+def legacy_admin_redirect():
+    _admin_ui_file_response()
+    return RedirectResponse(url="/management/", status_code=307)
 
 
 @app.get("/health")

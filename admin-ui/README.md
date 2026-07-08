@@ -7,10 +7,11 @@ Standalone static admin interface for the DeerFlow API service.
 After the API service starts, visit:
 
 ```text
-http://localhost:8000/admin
+http://localhost:8000/management/
 ```
 
 The FastAPI route only serves this page when `api.auth_enabled: true` is configured.
+Requests to `/admin` are redirected to `/management/` for compatibility.
 
 You can also open `index.html` directly in a browser during local development.
 
