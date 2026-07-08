@@ -31,6 +31,7 @@ class AdminApiTests(unittest.TestCase):
             "max_uploads_per_request": settings.max_uploads_per_request,
             "allowed_upload_extensions": list(settings.allowed_upload_extensions),
         }
+        self._original_feishu = settings.feishu
         self._tmp = tempfile.TemporaryDirectory()
         self.config_path = Path(self._tmp.name) / "config.yaml"
         self.skills_root = Path(self._tmp.name) / "skills"
@@ -103,6 +104,7 @@ tool_groups: []
         settings.config_path = self._original_config_path
         for key, value in self._original_runtime.items():
             setattr(settings, key, value)
+        settings.feishu = self._original_feishu
         reset_app_config()
         reset_extensions_config()
         self._tmp.cleanup()
@@ -289,6 +291,46 @@ tool_groups: []
         self.assertEqual(settings.allowed_upload_extensions, [".pdf", ".txt"])
         raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual(raw["api"]["allowed_upload_extensions"], [".pdf", ".txt"])
+
+    def test_feishu_config_write_redacts_and_preserves_secrets(self) -> None:
+        client = self._client()
+
+        created = client.put(
+            "/api/admin/feishu",
+            headers=self._auth_headers(),
+            json={
+                "enabled": True,
+                "app_id": "cli_test",
+                "app_secret": "literal-feishu-secret",
+                "verification_token": "literal-token",
+                "restart": False,
+            },
+        )
+
+        self.assertEqual(created.status_code, 200)
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["api"]["feishu"]["app_id"], "cli_test")
+        self.assertEqual(raw["api"]["feishu"]["app_secret"], "literal-feishu-secret")
+
+        read = client.get("/api/admin/feishu", headers=self._auth_headers())
+        self.assertEqual(read.status_code, 200)
+        payload = read.json()
+        self.assertTrue(payload["config"]["app_secret"]["redacted"])
+        self.assertTrue(payload["config"]["verification_token"]["redacted"])
+
+        updated_config = payload["config"]
+        updated_config["app_id"] = "cli_renamed"
+        preserved = client.put(
+            "/api/admin/feishu",
+            headers=self._auth_headers(),
+            json={**updated_config, "restart": False},
+        )
+
+        self.assertEqual(preserved.status_code, 200)
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["api"]["feishu"]["app_id"], "cli_renamed")
+        self.assertEqual(raw["api"]["feishu"]["app_secret"], "literal-feishu-secret")
+        self.assertEqual(raw["api"]["feishu"]["verification_token"], "literal-token")
 
     def test_mcp_admin_enable_disable_and_test_redacts_secrets(self) -> None:
         client = self._client()

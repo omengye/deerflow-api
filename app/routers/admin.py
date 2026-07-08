@@ -18,7 +18,7 @@ import yaml
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.config import settings
+from app.config import FeishuSettings, settings
 from app.dependencies import get_client_manager
 from deerflow.config.app_config import AppConfig, pop_current_app_config, push_current_app_config
 from deerflow.config.extensions_config import ExtensionsConfig
@@ -79,6 +79,14 @@ class AdminModelsUpdateRequest(BaseModel):
 class AdminReloadRequest(BaseModel):
     include_extensions: bool = True
     reset_clients: bool = True
+
+
+class AdminFeishuUpdateRequest(BaseModel):
+    enabled: bool = False
+    app_id: str | None = None
+    app_secret: Any = None
+    verification_token: Any = None
+    restart: bool = True
 
 
 class AdminSkillUpsertRequest(BaseModel):
@@ -516,6 +524,73 @@ def _admin_config_response(raw_config: dict[str, Any], path: Path) -> dict[str, 
     }
 
 
+def _raw_feishu_config(config_data: dict[str, Any]) -> dict[str, Any]:
+    api_config = config_data.get("api") if isinstance(config_data.get("api"), dict) else {}
+    raw = api_config.get("feishu") if isinstance(api_config, dict) else None
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _normalize_feishu_config(raw: dict[str, Any]) -> dict[str, Any]:
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        enabled = str(enabled).strip().lower() in {"1", "true", "yes", "on"}
+    return {
+        "enabled": enabled,
+        "app_id": str(raw.get("app_id") or ""),
+        "app_secret": str(raw.get("app_secret") or ""),
+        "verification_token": str(raw.get("verification_token") or ""),
+    }
+
+
+def _resolve_admin_scalar(value: Any, *, field: str) -> Any:
+    if isinstance(value, str) and value.startswith("$"):
+        env_name = value[1:]
+        env_value = os.environ.get(env_name)
+        if env_value is None:
+            raise HTTPException(status_code=400, detail=f"Environment variable {env_name} not found for {field}")
+        return env_value
+    return value
+
+
+def _feishu_settings_from_config(raw: dict[str, Any], *, validate_start: bool) -> FeishuSettings | None:
+    normalized = _normalize_feishu_config(raw)
+    app_id = str(_resolve_admin_scalar(normalized["app_id"], field="api.feishu.app_id") or "")
+    if not app_id and not normalized["enabled"]:
+        return None
+
+    app_secret = str(_resolve_admin_scalar(normalized["app_secret"], field="api.feishu.app_secret") or "")
+    verification_token = str(
+        _resolve_admin_scalar(normalized["verification_token"], field="api.feishu.verification_token") or ""
+    )
+
+    if validate_start and normalized["enabled"]:
+        if not app_id:
+            raise HTTPException(status_code=400, detail="Feishu app_id is required when enabled")
+        if not app_secret:
+            raise HTTPException(status_code=400, detail="Feishu app_secret is required when enabled")
+
+    return FeishuSettings(
+        enabled=bool(normalized["enabled"]),
+        app_id=app_id,
+        app_secret=app_secret,
+        verification_token=verification_token,
+    )
+
+
+def _set_runtime_feishu_settings(raw: dict[str, Any], *, validate_start: bool) -> None:
+    settings.feishu = _feishu_settings_from_config(raw, validate_start=validate_start)
+
+
+def _feishu_response(config_data: dict[str, Any], *, restart_result: dict[str, Any] | None = None) -> dict[str, Any]:
+    manager = get_client_manager()
+    raw = _normalize_feishu_config(_raw_feishu_config(config_data))
+    return {
+        "config": _redact_value("feishu", raw),
+        "runtime": manager.feishu_status(),
+        "restart": restart_result,
+    }
+
+
 def _validate_models(raw_models: list[dict[str, Any]]) -> list[ModelConfig]:
     models: list[ModelConfig] = []
     names: set[str] = set()
@@ -624,6 +699,7 @@ async def admin_me():
             "custom_skills_write": True,
             "runtime_write": True,
             "mcp_admin": True,
+            "feishu_admin": True,
         },
     }
 
@@ -698,6 +774,63 @@ async def reload_admin_config(req: AdminReloadRequest = Body(default_factory=Adm
     except Exception as exc:
         logger.exception("Admin config reload failed")
         raise HTTPException(status_code=500, detail=f"Reload failed: {exc}") from exc
+
+
+@router.get("/feishu")
+async def get_admin_feishu():
+    """Return redacted Feishu channel config and runtime status."""
+    config_data = _load_config_data(_config_path())
+    return _feishu_response(config_data)
+
+
+@router.put("/feishu")
+async def update_admin_feishu(req: AdminFeishuUpdateRequest = Body()):
+    """Write Feishu channel config and optionally restart the channel."""
+    path = _config_path()
+    config_data = _load_config_data(path)
+    api_config = config_data.setdefault("api", {})
+    if not isinstance(api_config, dict):
+        raise HTTPException(status_code=400, detail="api section must be an object")
+
+    existing = api_config.get("feishu") if isinstance(api_config.get("feishu"), dict) else {}
+    incoming = {
+        "enabled": req.enabled,
+        "app_id": req.app_id or "",
+        "app_secret": req.app_secret if req.app_secret is not None else "",
+        "verification_token": req.verification_token if req.verification_token is not None else "",
+    }
+    restored = _restore_redacted_values(incoming, existing, path="api.feishu")
+    normalized = _normalize_feishu_config(restored)
+    if req.restart:
+        _ = _feishu_settings_from_config(normalized, validate_start=True)
+
+    api_config["feishu"] = normalized
+    _atomic_write_config(config_data, path=path)
+
+    restart_result = None
+    if req.restart:
+        _set_runtime_feishu_settings(normalized, validate_start=True)
+        try:
+            restart_result = await get_client_manager().restart_feishu_channel(raise_on_error=True)
+        except Exception as exc:
+            logger.exception("Admin Feishu update wrote config but restart failed")
+            raise HTTPException(status_code=500, detail=f"Feishu config saved but restart failed: {exc}") from exc
+
+    return {"success": True, **_feishu_response(config_data, restart_result=restart_result)}
+
+
+@router.post("/feishu/restart")
+async def restart_admin_feishu():
+    """Restart Feishu channel from the file-backed config."""
+    config_data = _load_config_data(_config_path())
+    raw = _normalize_feishu_config(_raw_feishu_config(config_data))
+    _set_runtime_feishu_settings(raw, validate_start=True)
+    try:
+        restart_result = await get_client_manager().restart_feishu_channel(raise_on_error=True)
+    except Exception as exc:
+        logger.exception("Admin Feishu restart failed")
+        raise HTTPException(status_code=500, detail=f"Feishu restart failed: {exc}") from exc
+    return {"success": True, **_feishu_response(config_data, restart_result=restart_result)}
 
 
 @router.get("/skills/custom")

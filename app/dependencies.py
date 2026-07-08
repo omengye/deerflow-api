@@ -68,6 +68,65 @@ class ClientManager:
         self.scheduler_service = None
         self.feishu_channel = None
 
+    def feishu_status(self) -> dict[str, Any]:
+        """Return current Feishu channel runtime status."""
+        feishu = settings.feishu
+        return {
+            "enabled": bool(feishu and feishu.enabled),
+            "configured": bool(feishu and feishu.app_id),
+            "running": self.feishu_channel is not None,
+            "app_id": feishu.app_id if feishu and feishu.app_id else "",
+        }
+
+    async def start_feishu_channel(self, *, raise_on_error: bool = False) -> dict[str, Any]:
+        """Start the Feishu WebSocket channel from current API settings."""
+        feishu = settings.feishu
+        if not feishu or not feishu.enabled:
+            return {**self.feishu_status(), "status": "disabled"}
+        if not feishu.app_id:
+            return {**self.feishu_status(), "status": "not_configured", "error": "app_id is required"}
+        if self.feishu_channel is not None:
+            return {**self.feishu_status(), "status": "running"}
+
+        try:
+            from app.channels.feishu import FeishuChannel
+
+            channel = FeishuChannel(
+                app_id=feishu.app_id,
+                app_secret=feishu.app_secret,
+                verification_token=feishu.verification_token,
+            )
+            await channel.start(asyncio.get_running_loop())
+            self.feishu_channel = channel
+            return {**self.feishu_status(), "status": "started"}
+        except ImportError as exc:
+            message = 'lark-oapi not installed; install with: uv pip install "deerflow-api[feishu]"'
+            if raise_on_error:
+                raise RuntimeError(message) from exc
+            logger.warning(message)
+            return {**self.feishu_status(), "status": "error", "error": message}
+        except Exception as exc:
+            if raise_on_error:
+                raise
+            logger.exception("Failed to start Feishu channel")
+            return {**self.feishu_status(), "status": "error", "error": str(exc)}
+
+    async def stop_feishu_channel(self) -> dict[str, Any]:
+        """Stop the current Feishu channel if one is running."""
+        channel = self.feishu_channel
+        if channel is None:
+            return {**self.feishu_status(), "status": "stopped"}
+        try:
+            await channel.astop()
+        finally:
+            self.feishu_channel = None
+        return {**self.feishu_status(), "status": "stopped"}
+
+    async def restart_feishu_channel(self, *, raise_on_error: bool = False) -> dict[str, Any]:
+        """Restart Feishu channel so updated config can take effect immediately."""
+        await self.stop_feishu_channel()
+        return await self.start_feishu_channel(raise_on_error=raise_on_error)
+
     async def startup(self):
         """Initialize the DeerFlowClient on startup."""
         from deerflow.config.app_config import get_app_config, reload_app_config
@@ -615,6 +674,8 @@ class ClientManager:
 
     async def shutdown(self):
         """Cleanup on shutdown."""
+        await self.stop_feishu_channel()
+
         if self.scheduler_service is not None:
             try:
                 await self.scheduler_service.stop()

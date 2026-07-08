@@ -39,6 +39,7 @@
           <button class="nav-item" data-view-target="models" type="button">大模型</button>
           <button class="nav-item" data-view-target="skills" type="button">Skills</button>
           <button class="nav-item" data-view-target="mcp" type="button">MCP</button>
+          <button class="nav-item" data-view-target="feishu" type="button">Feishu</button>
           <button class="nav-item" data-view-target="runtime" type="button">运行配置</button>
         </nav>
 
@@ -124,7 +125,7 @@
                 <h3>大模型配置</h3>
                 <p>展示当前可用模型；新增和编辑可保存到 config.yaml。</p>
               </div>
-              <button id="openModelDraftButton" class="secondary-button" type="button">新增/编辑模型</button>
+              <button id="openModelDraftButton" class="secondary-button" type="button">新增模型</button>
             </div>
             <div class="table-wrap">
               <table>
@@ -134,6 +135,7 @@
                     <th>显示名</th>
                     <th>Thinking</th>
                     <th>Vision</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="modelsTableBody"></tbody>
@@ -145,7 +147,7 @@
             <div class="panel-header">
               <div>
                 <h3>模型配置草稿</h3>
-                <p>保存会替换同名模型；未同名时追加到当前模型列表，并自动 reload。</p>
+                <p>保存会替换当前编辑的模型；未选择已有模型时追加到当前模型列表，并自动 reload。</p>
               </div>
               <button id="closeModelDraftButton" class="ghost-button" type="button">关闭</button>
             </div>
@@ -161,7 +163,11 @@
                 </label>
                 <label>
                   <span>use</span>
-                  <input id="draftUse" type="text" value="langchain_openai:ChatOpenAI" required />
+                  <select id="draftUse" required></select>
+                </label>
+                <label id="draftUseCustomRow" class="hidden">
+                  <span>自定义类路径</span>
+                  <input id="draftUseCustom" type="text" placeholder="package.module:ClassName" />
                 </label>
                 <label>
                   <span>model</span>
@@ -173,7 +179,7 @@
                 </label>
                 <label>
                   <span>api_key</span>
-                  <input id="draftApiKey" type="text" placeholder="$DASHSCOPE_API_KEY" />
+                  <input id="draftApiKey" type="text" placeholder="$DASHSCOPE_API_KEY；编辑时留空保留原值" />
                 </label>
                 <label class="checkbox-row">
                   <input id="draftThinking" type="checkbox" />
@@ -322,6 +328,59 @@
             <textarea id="mcpEditor" class="json-editor" spellcheck="false"></textarea>
             <p id="mcpMessage" class="form-message" role="status"></p>
           </section>
+        </section>
+
+        <section id="feishuView" class="view-section">
+          <div class="section-grid">
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>Feishu Channel</h3>
+                  <p>配置飞书长连接机器人，保存到 config.yaml，可立即重启 channel。</p>
+                </div>
+                <button id="restartFeishuButton" class="secondary-button" type="button">重启 Channel</button>
+              </div>
+              <div id="feishuStatusDetails" class="readonly-grid">
+                <div>
+                  <span>运行状态</span>
+                  <strong>未读取</strong>
+                </div>
+              </div>
+              <p id="feishuMessage" class="form-message" role="status"></p>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>Feishu 配置编辑</h3>
+                  <p>app_secret 和 verification_token 留空会保留已有值。</p>
+                </div>
+                <button id="saveFeishuButton" class="primary-button" type="button">保存 Feishu</button>
+              </div>
+              <form id="feishuEditForm" class="form-grid compact">
+                <label class="checkbox-row">
+                  <input id="feishuEnabled" type="checkbox" />
+                  <span>enabled</span>
+                </label>
+                <label>
+                  <span>app_id</span>
+                  <input id="feishuAppId" type="text" placeholder="cli_xxx" />
+                </label>
+                <label>
+                  <span>app_secret</span>
+                  <input id="feishuAppSecret" type="text" placeholder="$FEISHU_APP_SECRET；留空保留原值" />
+                </label>
+                <label>
+                  <span>verification_token</span>
+                  <input id="feishuVerificationToken" type="text" placeholder="$FEISHU_VERIFICATION_TOKEN；WS 模式可留空" />
+                </label>
+                <label class="checkbox-row">
+                  <input id="feishuRestartOnSave" type="checkbox" checked />
+                  <span>保存后重启 channel</span>
+                </label>
+              </form>
+            </section>
+          </div>
         </section>
 
         <section id="runtimeView" class="view-section">

@@ -3,6 +3,33 @@
     token: "deerflow.admin.token",
     loggedIn: "deerflow.admin.loggedIn",
   };
+  const defaultModelUse = "langchain_openai:ChatOpenAI";
+  const customModelUseValue = "__custom__";
+  const modelUseGroups = [
+    {
+      label: "LangChain 标准类",
+      options: [
+        { label: "OpenAI 兼容 - langchain_openai:ChatOpenAI", value: "langchain_openai:ChatOpenAI" },
+        { label: "Azure OpenAI - langchain_openai:AzureChatOpenAI", value: "langchain_openai:AzureChatOpenAI" },
+        { label: "Anthropic - langchain_anthropic:ChatAnthropic", value: "langchain_anthropic:ChatAnthropic" },
+        { label: "DeepSeek - langchain_deepseek:ChatDeepSeek", value: "langchain_deepseek:ChatDeepSeek" },
+        { label: "Google Gemini - langchain_google_genai:ChatGoogleGenerativeAI", value: "langchain_google_genai:ChatGoogleGenerativeAI" },
+      ],
+    },
+    {
+      label: "DeerFlow 内置适配类",
+      options: [
+        { label: "DashScope reasoning - deerflow.models.patched_dashscope:PatchedDashScopeChatOpenAI", value: "deerflow.models.patched_dashscope:PatchedDashScopeChatOpenAI" },
+        { label: "DeepSeek reasoning - deerflow.models.patched_deepseek:PatchedChatDeepSeek", value: "deerflow.models.patched_deepseek:PatchedChatDeepSeek" },
+        { label: "MiniMax reasoning - deerflow.models.patched_minimax:PatchedChatMiniMax", value: "deerflow.models.patched_minimax:PatchedChatMiniMax" },
+        { label: "Gemini OpenAI gateway - deerflow.models.patched_openai:PatchedChatOpenAI", value: "deerflow.models.patched_openai:PatchedChatOpenAI" },
+        { label: "vLLM OpenAI-compatible - deerflow.models.vllm_provider:VllmChatModel", value: "deerflow.models.vllm_provider:VllmChatModel" },
+        { label: "MindIE - deerflow.models.mindie_provider:MindIEChatModel", value: "deerflow.models.mindie_provider:MindIEChatModel" },
+        { label: "Claude OAuth/cache - deerflow.models.claude_provider:ClaudeChatModel", value: "deerflow.models.claude_provider:ClaudeChatModel" },
+        { label: "ChatGPT Codex Responses - deerflow.models.openai_codex_provider:CodexChatModel", value: "deerflow.models.openai_codex_provider:CodexChatModel" },
+      ],
+    },
+  ];
 
   const state = {
     baseUrl: "",
@@ -13,8 +40,10 @@
     health: null,
     adminMe: null,
     adminConfig: null,
+    feishu: null,
     customSkills: [],
     currentView: "overview",
+    editingModelName: null,
   };
 
   const views = {
@@ -22,6 +51,7 @@
     models: "大模型",
     skills: "Skills",
     mcp: "MCP",
+    feishu: "Feishu",
     runtime: "运行配置",
   };
 
@@ -55,6 +85,16 @@
     enableMcpButton: document.getElementById("enableMcpButton"),
     disableMcpButton: document.getElementById("disableMcpButton"),
     testMcpButton: document.getElementById("testMcpButton"),
+    feishuStatusDetails: document.getElementById("feishuStatusDetails"),
+    feishuMessage: document.getElementById("feishuMessage"),
+    feishuEditForm: document.getElementById("feishuEditForm"),
+    saveFeishuButton: document.getElementById("saveFeishuButton"),
+    restartFeishuButton: document.getElementById("restartFeishuButton"),
+    feishuEnabled: document.getElementById("feishuEnabled"),
+    feishuAppId: document.getElementById("feishuAppId"),
+    feishuAppSecret: document.getElementById("feishuAppSecret"),
+    feishuVerificationToken: document.getElementById("feishuVerificationToken"),
+    feishuRestartOnSave: document.getElementById("feishuRestartOnSave"),
     modelDraftPanel: document.getElementById("modelDraftPanel"),
     openModelDraftButton: document.getElementById("openModelDraftButton"),
     closeModelDraftButton: document.getElementById("closeModelDraftButton"),
@@ -66,6 +106,8 @@
     draftModelName: document.getElementById("draftModelName"),
     draftDisplayName: document.getElementById("draftDisplayName"),
     draftUse: document.getElementById("draftUse"),
+    draftUseCustomRow: document.getElementById("draftUseCustomRow"),
+    draftUseCustom: document.getElementById("draftUseCustom"),
     draftModelId: document.getElementById("draftModelId"),
     draftBaseUrl: document.getElementById("draftBaseUrl"),
     draftApiKey: document.getElementById("draftApiKey"),
@@ -257,6 +299,7 @@
       loadSkills(),
       loadCustomSkills(),
       loadMcp(),
+      loadFeishu(),
     ]);
 
     const failed = tasks.filter((task) => task.status === "rejected");
@@ -316,6 +359,13 @@
     state.mcpServers = data?.mcp_servers && typeof data.mcp_servers === "object" ? data.mcp_servers : {};
     el.mcpEditor.value = JSON.stringify(state.mcpServers, null, 2);
     renderMcpServerSelect();
+  }
+
+  async function loadFeishu() {
+    const data = await request("/api/admin/feishu");
+    state.feishu = data;
+    renderFeishu();
+    return data;
   }
 
   function renderOverview() {
@@ -399,6 +449,54 @@
     el.runtimePlanMode.checked = Boolean(api.plan_mode);
   }
 
+  function renderFeishu() {
+    if (!el.feishuStatusDetails) return;
+    const data = state.feishu || {};
+    const config = data.config && typeof data.config === "object" ? data.config : {};
+    const runtime = data.runtime && typeof data.runtime === "object" ? data.runtime : {};
+    const rows = [
+      ["运行状态", runtime.running ? "运行中" : "未运行"],
+      ["启用配置", runtime.enabled ? "启用" : "禁用"],
+      ["配置完整", runtime.configured ? "已配置" : "未配置"],
+      ["App ID", runtime.app_id || config.app_id || "--"],
+    ];
+
+    el.feishuStatusDetails.innerHTML = rows
+      .map(([label, value]) => {
+        return `
+          <div>
+            <span>${escapeHtml(label)}</span>
+            <strong>${escapeHtml(value)}</strong>
+          </div>
+        `;
+      })
+      .join("");
+    populateFeishuForm(config);
+  }
+
+  function populateFeishuForm(config) {
+    if (!el.feishuEditForm) return;
+    el.feishuEnabled.checked = Boolean(config.enabled);
+    el.feishuAppId.value = config.app_id || "";
+    el.feishuAppSecret.value = secretInputValue(config.app_secret);
+    el.feishuVerificationToken.value = secretInputValue(config.verification_token);
+    el.feishuAppSecret.placeholder =
+      config.app_secret && typeof config.app_secret === "object" && config.app_secret.configured
+        ? "留空保留现有 app_secret"
+        : "$FEISHU_APP_SECRET";
+    el.feishuVerificationToken.placeholder =
+      config.verification_token && typeof config.verification_token === "object" && config.verification_token.configured
+        ? "留空保留现有 verification_token"
+        : "$FEISHU_VERIFICATION_TOKEN；WS 模式可留空";
+  }
+
+  function secretPayload(value, existing) {
+    const trimmed = String(value || "").trim();
+    if (trimmed) return trimmed;
+    if (existing !== undefined) return existing;
+    return "";
+  }
+
   function formatConfigValue(value) {
     if (value && typeof value === "object") {
       if (value.redacted) return "已配置（已脱敏）";
@@ -414,18 +512,24 @@
 
   function renderModels() {
     if (!state.models.length) {
-      el.modelsTableBody.innerHTML = `<tr><td colspan="4">没有读取到模型配置。</td></tr>`;
+      el.modelsTableBody.innerHTML = `<tr><td colspan="5">没有读取到模型配置。</td></tr>`;
       return;
     }
 
     el.modelsTableBody.innerHTML = state.models
       .map((model) => {
+        const name = escapeHtml(model.name);
         return `
           <tr>
-            <td class="mono">${escapeHtml(model.name)}</td>
+            <td class="mono">${name}</td>
             <td>${escapeHtml(model.display_name || model.name)}</td>
             <td>${badge(model.supports_thinking ? "支持" : "不支持", model.supports_thinking ? "ok" : "neutral")}</td>
             <td>${badge(model.supports_vision ? "支持" : "不支持", model.supports_vision ? "ok" : "neutral")}</td>
+            <td>
+              <div class="row-actions">
+                <button class="secondary-button" data-model-action="edit" data-model-name="${name}" type="button">编辑</button>
+              </div>
+            </td>
           </tr>
         `;
       })
@@ -569,6 +673,48 @@
     }
   }
 
+  async function saveFeishuConfig() {
+    el.feishuMessage.textContent = "";
+    const current = state.feishu?.config && typeof state.feishu.config === "object" ? state.feishu.config : {};
+    const body = {
+      enabled: el.feishuEnabled.checked,
+      app_id: el.feishuAppId.value.trim(),
+      app_secret: secretPayload(el.feishuAppSecret.value, current.app_secret),
+      verification_token: secretPayload(el.feishuVerificationToken.value, current.verification_token),
+      restart: el.feishuRestartOnSave.checked,
+    };
+    setBusy(el.saveFeishuButton, true, "保存中");
+    try {
+      const data = await request("/api/admin/feishu", { method: "PUT", body });
+      state.feishu = data;
+      renderFeishu();
+      const status = data.restart?.status ? `，channel 状态：${data.restart.status}` : "";
+      el.feishuMessage.textContent = `Feishu 配置已保存${status}。`;
+      await loadAdminConfig();
+      showToast("Feishu 配置已保存。");
+    } catch (error) {
+      el.feishuMessage.textContent = `保存失败：${error.message}`;
+    } finally {
+      setBusy(el.saveFeishuButton, false);
+    }
+  }
+
+  async function restartFeishuChannel() {
+    el.feishuMessage.textContent = "";
+    setBusy(el.restartFeishuButton, true, "重启中");
+    try {
+      const data = await request("/api/admin/feishu/restart", { method: "POST" });
+      state.feishu = data;
+      renderFeishu();
+      el.feishuMessage.textContent = `Feishu channel 已处理：${data.restart?.status || "ok"}。`;
+      showToast("Feishu channel 已重启。");
+    } catch (error) {
+      el.feishuMessage.textContent = `重启失败：${error.message}`;
+    } finally {
+      setBusy(el.restartFeishuButton, false);
+    }
+  }
+
   async function saveRuntimeConfig() {
     el.runtimeMessage.textContent = "";
     const body = {
@@ -670,24 +816,132 @@
     return JSON.stringify(trimmed);
   }
 
+  function populateModelUseSelect() {
+    el.draftUse.innerHTML = [
+      ...modelUseGroups.map((group) => {
+        const options = group.options
+          .map((option) => `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`)
+          .join("");
+        return `<optgroup label="${escapeHtml(group.label)}">${options}</optgroup>`;
+      }),
+      `<option value="${customModelUseValue}">自定义类路径</option>`,
+    ].join("");
+  }
+
+  function knownModelUse(value) {
+    return modelUseGroups.some((group) => group.options.some((option) => option.value === value));
+  }
+
+  function updateModelUseCustomVisibility() {
+    const custom = el.draftUse.value === customModelUseValue;
+    el.draftUseCustomRow.classList.toggle("hidden", !custom);
+    el.draftUseCustom.required = custom;
+  }
+
+  function setModelUse(value) {
+    const use = String(value || defaultModelUse).trim();
+    if (knownModelUse(use)) {
+      el.draftUse.value = use;
+      el.draftUseCustom.value = "";
+    } else {
+      el.draftUse.value = customModelUseValue;
+      el.draftUseCustom.value = use;
+    }
+    updateModelUseCustomVisibility();
+  }
+
+  function modelUseValue() {
+    if (el.draftUse.value === customModelUseValue) {
+      return el.draftUseCustom.value.trim();
+    }
+    return el.draftUse.value.trim();
+  }
+
   function updateModelDraft() {
     const name = el.draftModelName.value.trim() || "new-model";
     const displayName = el.draftDisplayName.value.trim() || name;
-    const use = el.draftUse.value.trim() || "langchain_openai:ChatOpenAI";
+    const use = modelUseValue() || (el.draftUse.value === customModelUseValue ? "package.module:ClassName" : defaultModelUse);
     const model = el.draftModelId.value.trim() || name;
     const baseUrl = el.draftBaseUrl.value.trim();
-    const apiKey = el.draftApiKey.value.trim() || "$MODEL_API_KEY";
+    const editingModel = getEditableModel(state.editingModelName);
+    const apiKey = el.draftApiKey.value.trim();
     const lines = [
       `- name: ${yamlValue(name)}`,
       `  display_name: ${yamlValue(displayName)}`,
       `  use: ${yamlValue(use)}`,
       `  model: ${yamlValue(model)}`,
-      `  api_key: ${yamlValue(apiKey)}`,
     ];
+    if (apiKey) {
+      lines.push(`  api_key: ${yamlValue(apiKey)}`);
+    } else if (state.editingModelName) {
+      lines.push(
+        isConfiguredSecret(editingModel?.api_key)
+          ? "  # api_key 留空保存时会保留现有值"
+          : "  # api_key 未配置；填写后会写入",
+      );
+    } else {
+      lines.push(`  api_key: ${yamlValue("$MODEL_API_KEY")}`);
+    }
     if (baseUrl) lines.push(`  base_url: ${yamlValue(baseUrl)}`);
     lines.push(`  supports_thinking: ${el.draftThinking.checked ? "true" : "false"}`);
     lines.push(`  supports_vision: ${el.draftVision.checked ? "true" : "false"}`);
     el.modelYamlPreview.textContent = lines.join("\n");
+  }
+
+  function getEditableModel(name) {
+    if (!name || !Array.isArray(state.adminConfig?.models)) return null;
+    return state.adminConfig.models.find((model) => model && model.name === name) || null;
+  }
+
+  function isConfiguredSecret(value) {
+    return Boolean(value && typeof value === "object" && value.configured !== false && "redacted" in value);
+  }
+
+  function hasConfigField(config, field) {
+    return Boolean(config && Object.prototype.hasOwnProperty.call(config, field));
+  }
+
+  function secretInputValue(value) {
+    if (typeof value === "string") return value;
+    if (value && typeof value === "object" && value.source === "env_ref" && value.value) {
+      return String(value.value);
+    }
+    return "";
+  }
+
+  function resetModelDraft() {
+    state.editingModelName = null;
+    el.modelDraftForm.reset();
+    setModelUse(defaultModelUse);
+    el.draftApiKey.placeholder = "$DASHSCOPE_API_KEY；编辑时留空保留原值";
+    el.modelDraftMessage.textContent = "";
+    updateModelDraft();
+  }
+
+  async function openModelEditor(name) {
+    if (!state.adminConfig) {
+      await loadAdminConfig();
+    }
+    const model = getEditableModel(name);
+    if (!model) {
+      showToast(`未找到模型配置：${name}`);
+      return;
+    }
+
+    state.editingModelName = model.name;
+    el.draftModelName.value = model.name || "";
+    el.draftDisplayName.value = model.display_name || model.name || "";
+    setModelUse(model.use || defaultModelUse);
+    el.draftModelId.value = model.model || model.name || "";
+    el.draftBaseUrl.value = model.base_url || "";
+    el.draftApiKey.value = secretInputValue(model.api_key);
+    el.draftThinking.checked = Boolean(model.supports_thinking);
+    el.draftVision.checked = Boolean(model.supports_vision);
+    el.draftApiKey.placeholder = isConfiguredSecret(model.api_key) ? "留空保留现有 api_key" : "$DASHSCOPE_API_KEY";
+    el.modelDraftMessage.textContent = `正在编辑 ${model.name}。api_key 留空会保留原值。`;
+    el.modelDraftPanel.classList.remove("hidden");
+    updateModelDraft();
+    el.modelDraftPanel.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   function modelDraftPayload(existingModel) {
@@ -696,7 +950,10 @@
       throw new Error("name 不能为空。");
     }
     const displayName = el.draftDisplayName.value.trim() || name;
-    const use = el.draftUse.value.trim() || "langchain_openai:ChatOpenAI";
+    const use = modelUseValue();
+    if (!use) {
+      throw new Error("use 不能为空。");
+    }
     const model = el.draftModelId.value.trim() || name;
     const baseUrl = el.draftBaseUrl.value.trim();
     const apiKey = el.draftApiKey.value.trim();
@@ -711,9 +968,9 @@
     if (baseUrl) payload.base_url = baseUrl;
     if (apiKey) {
       payload.api_key = apiKey;
-    } else if (existingModel?.api_key) {
+    } else if (hasConfigField(existingModel, "api_key")) {
       payload.api_key = existingModel.api_key;
-    } else {
+    } else if (!existingModel) {
       payload.api_key = "$MODEL_API_KEY";
     }
     return payload;
@@ -727,7 +984,8 @@
 
     const currentModels = Array.isArray(state.adminConfig?.models) ? [...state.adminConfig.models] : [];
     const name = el.draftModelName.value.trim();
-    const index = currentModels.findIndex((model) => model && model.name === name);
+    const originalName = state.editingModelName || name;
+    const index = currentModels.findIndex((model) => model && model.name === originalName);
     let payload;
     try {
       payload = modelDraftPayload(index >= 0 ? currentModels[index] : null);
@@ -742,7 +1000,13 @@
       currentModels.push(payload);
     }
 
-    const defaultModel = state.adminConfig?.default_model || currentModels[0]?.name || payload.name;
+    const modelNames = currentModels.map((model) => model?.name).filter(Boolean);
+    let defaultModel = state.adminConfig?.default_model || currentModels[0]?.name || payload.name;
+    if (state.editingModelName && defaultModel === state.editingModelName) {
+      defaultModel = payload.name;
+    } else if (!modelNames.includes(defaultModel)) {
+      defaultModel = currentModels[0]?.name || payload.name;
+    }
     setBusy(el.saveModelButton, true, "保存中");
     try {
       await request("/api/admin/models", {
@@ -755,6 +1019,7 @@
       });
       el.modelDraftMessage.textContent = `${payload.name} 已保存并重新加载配置。`;
       await Promise.all([loadAdminConfig(), loadModels()]);
+      state.editingModelName = payload.name;
       renderOverview();
       showToast("模型配置已保存。");
     } catch (error) {
@@ -961,6 +1226,8 @@
     el.testMcpButton.addEventListener("click", testMcpServer);
     el.reloadConfigButton.addEventListener("click", reloadConfig);
     el.saveRuntimeButton.addEventListener("click", saveRuntimeConfig);
+    el.saveFeishuButton.addEventListener("click", saveFeishuConfig);
+    el.restartFeishuButton.addEventListener("click", restartFeishuChannel);
 
     document.querySelectorAll("[data-view-target]").forEach((button) => {
       button.addEventListener("click", () => setView(button.dataset.viewTarget));
@@ -972,12 +1239,29 @@
       toggleSkill(button.dataset.skillName, button.dataset.skillAction);
     });
 
+    el.modelsTableBody.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-model-action]");
+      if (!button) return;
+      if (button.dataset.modelAction === "edit") {
+        openModelEditor(button.dataset.modelName).catch((error) => {
+          showToast(`读取模型配置失败：${error.message}`);
+        });
+      }
+    });
+
     el.openModelDraftButton.addEventListener("click", () => {
       el.modelDraftPanel.classList.remove("hidden");
-      updateModelDraft();
+      resetModelDraft();
     });
     el.closeModelDraftButton.addEventListener("click", () => el.modelDraftPanel.classList.add("hidden"));
     el.modelDraftForm.addEventListener("input", updateModelDraft);
+    el.draftUse.addEventListener("change", () => {
+      updateModelUseCustomVisibility();
+      updateModelDraft();
+      if (el.draftUse.value === customModelUseValue) {
+        el.draftUseCustom.focus();
+      }
+    });
     el.saveModelButton.addEventListener("click", saveModelDraft);
     el.copyModelYamlButton.addEventListener("click", () => copyText(el.modelYamlPreview.textContent, "模型配置片段已复制。"));
 
@@ -1006,6 +1290,8 @@
     state.baseUrl = normalizeBaseUrl(defaultBaseUrl());
     state.token = savedToken;
     el.tokenInput.value = savedToken;
+    populateModelUseSelect();
+    setModelUse(defaultModelUse);
     updateModelDraft();
     updateSkillDraft();
     renderRuntimeConfig();
