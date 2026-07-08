@@ -124,17 +124,12 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
         finally:
             settings.auth_enabled = original_enabled
 
-    async def test_legacy_admin_ui_redirects_to_management(self) -> None:
-        from app import legacy_admin_redirect
+    async def test_legacy_admin_ui_routes_are_not_registered(self) -> None:
+        from app import app as main_app
 
-        original_enabled = settings.auth_enabled
-        try:
-            settings.auth_enabled = True
-            response = legacy_admin_redirect()
-            self.assertEqual(response.status_code, 307)
-            self.assertEqual(response.headers["location"], "/management/")
-        finally:
-            settings.auth_enabled = original_enabled
+        route_paths = {getattr(route, "path", "") for route in main_app.routes}
+        self.assertNotIn("/admin", route_paths)
+        self.assertNotIn("/admin/", route_paths)
 
     async def test_admin_ui_rejects_path_traversal(self) -> None:
         from app import _admin_ui_file_response

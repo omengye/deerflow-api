@@ -137,13 +137,6 @@ def management_asset(asset_path: str):
     return _admin_ui_file_response(asset_path)
 
 
-@app.get("/admin", include_in_schema=False)
-@app.get("/admin/", include_in_schema=False)
-def legacy_admin_redirect():
-    _admin_ui_file_response()
-    return RedirectResponse(url="/management/", status_code=307)
-
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
