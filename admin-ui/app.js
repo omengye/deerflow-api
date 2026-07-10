@@ -44,6 +44,7 @@
     customSkills: [],
     currentView: "overview",
     editingModelName: null,
+    modelReloadSequence: 0,
   };
 
   const views = {
@@ -205,36 +206,57 @@
       ...(options.headers || {}),
     };
     const init = { method, headers };
+    const timeoutMs = Number(options.timeoutMs);
+    let timeoutId = null;
+
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0 && window.AbortController) {
+      const controller = new AbortController();
+      init.signal = controller.signal;
+      timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+    }
 
     if (options.body !== undefined) {
       headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(options.body);
     }
 
-    const response = await fetch(`${state.baseUrl}${path}`, init);
-    const text = await response.text();
-    let payload = null;
-    if (text) {
-      try {
-        payload = JSON.parse(text);
-      } catch (_err) {
-        payload = { detail: text };
+    try {
+      const response = await fetch(`${state.baseUrl}${path}`, init);
+      const text = await response.text();
+      let payload = null;
+      if (text) {
+        try {
+          payload = JSON.parse(text);
+        } catch (_err) {
+          payload = { detail: text };
+        }
+      }
+
+      if (!response.ok && !options.allowHttpError) {
+        const detail = payload && payload.detail ? payload.detail : response.statusText;
+        const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+        error.status = response.status;
+        error.payload = payload;
+        throw error;
+      }
+
+      if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+        payload.__ok = response.ok;
+        payload.__status = response.status;
+      }
+      return payload;
+    } catch (error) {
+      if (error.name === "AbortError") {
+        const timeoutError = new Error("请求超时");
+        timeoutError.name = "TimeoutError";
+        throw timeoutError;
+      }
+      throw error;
+    } finally {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
       }
     }
-
-    if (!response.ok && !options.allowHttpError) {
-      const detail = payload && payload.detail ? payload.detail : response.statusText;
-      const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
-      error.status = response.status;
-      error.payload = payload;
-      throw error;
-    }
-
-    if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-      payload.__ok = response.ok;
-      payload.__status = response.status;
-    }
-    return payload;
   }
 
   async function verifyLogin(event) {
@@ -976,6 +998,45 @@
     return payload;
   }
 
+  function summarizeModel(model) {
+    return {
+      name: model?.name || "",
+      display_name: model?.display_name || model?.name || "",
+      supports_thinking: Boolean(model?.supports_thinking),
+      supports_vision: Boolean(model?.supports_vision),
+    };
+  }
+
+  function applySavedModelState(models, defaultModel, responseModels) {
+    state.adminConfig = {
+      ...(state.adminConfig || {}),
+      models,
+      default_model: defaultModel,
+    };
+    state.models = Array.isArray(responseModels) ? responseModels : models.map(summarizeModel);
+    renderRuntimeConfig();
+    renderModels();
+    renderOverview();
+  }
+
+  async function reloadModelsAfterSave(modelName, sequence) {
+    try {
+      const reload = await request("/api/admin/config/reload", {
+        method: "POST",
+        body: { include_extensions: true, reset_clients: true },
+        timeoutMs: 15000,
+      });
+      await Promise.allSettled([loadAdminConfig(), loadModels()]);
+      renderOverview();
+      if (sequence !== state.modelReloadSequence) return;
+      const active = reload?.active_threads ? `，当前运行线程 ${reload.active_threads} 个` : "";
+      el.modelDraftMessage.textContent = `${modelName} 已保存并重新加载配置${active}。`;
+    } catch (error) {
+      if (sequence !== state.modelReloadSequence) return;
+      el.modelDraftMessage.textContent = `${modelName} 已保存；重新加载未完成：${error.message}。可稍后手动刷新。`;
+    }
+  }
+
   async function saveModelDraft() {
     el.modelDraftMessage.textContent = "";
     if (!state.adminConfig) {
@@ -1007,21 +1068,23 @@
     } else if (!modelNames.includes(defaultModel)) {
       defaultModel = currentModels[0]?.name || payload.name;
     }
+    const reloadSequence = state.modelReloadSequence + 1;
+    state.modelReloadSequence = reloadSequence;
     setBusy(el.saveModelButton, true, "保存中");
     try {
-      await request("/api/admin/models", {
+      const data = await request("/api/admin/models", {
         method: "PUT",
         body: {
           models: currentModels,
           default_model: defaultModel,
-          reload: true,
+          reload: false,
         },
       });
-      el.modelDraftMessage.textContent = `${payload.name} 已保存并重新加载配置。`;
-      await Promise.all([loadAdminConfig(), loadModels()]);
+      applySavedModelState(currentModels, defaultModel, data?.models);
       state.editingModelName = payload.name;
-      renderOverview();
+      el.modelDraftMessage.textContent = `${payload.name} 已保存，正在重新加载配置。`;
       showToast("模型配置已保存。");
+      reloadModelsAfterSave(payload.name, reloadSequence);
     } catch (error) {
       el.modelDraftMessage.textContent = `保存失败：${error.message}`;
     } finally {
