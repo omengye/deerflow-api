@@ -27,7 +27,15 @@ When served by the API process, the API base URL is inferred from the current or
 
 - `GET /api/admin/me`: validate admin capability metadata.
 - `GET /api/admin/config`: read redacted runtime/configuration state.
-- `PUT /api/admin/models`: write model configuration to `config.yaml`.
+- `GET /api/admin/config/health`: validate configuration compatibility and report safe diagnostics.
+- `PUT /api/admin/models`: compatibility endpoint for replacing model configuration.
+- `POST /api/admin/models`: create one model.
+- `PATCH /api/admin/models/{name}`: safely patch one model; omitted secrets are retained.
+- `DELETE /api/admin/models/{name}`: delete one model and repair the default selection.
+- `GET|PUT /api/admin/title`: read or update automatic title generation.
+- `GET|PUT /api/admin/subagents`: read or update built-in/custom subagent configuration.
+- `GET|PUT /api/admin/memory`: read or update global memory configuration.
+- `GET|PUT /api/admin/summarization`: read or update conversation summarization configuration.
 - `POST /api/admin/config/reload`: reload file-backed configuration.
 - `GET /api/admin/skills/custom`: list custom skills.
 - `GET /api/admin/skills/custom/{name}`: read a custom skill.
@@ -58,6 +66,7 @@ Authorization: Bearer <token>
 
 Broader admin operations can be added later:
 
-- Fine-grained model delete/default actions.
-- Full runtime management for sandbox, tracing, Feishu, and scheduler lifecycle.
+- Structured ACP-agent management and permission approval controls.
+- Full runtime management for sandbox and scheduler lifecycle.
+- Tracing and token-usage observability management.
 - MCP tool discovery using a real MCP session with operator approval.

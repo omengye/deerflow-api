@@ -82,7 +82,18 @@ models:
     api_key: literal-secret
     supports_thinking: false
     supports_vision: true
+    when_thinking_enabled:
+      extra_body:
+        enable_thinking: true
 default_model: base
+title:
+  enabled: true
+  model_name: base
+subagents:
+  enabled: true
+  timeout_seconds: 900
+  agents: {{}}
+  custom_agents: {{}}
 skills:
   enabled: true
   path: {skills_path}
@@ -162,6 +173,250 @@ tool_groups: []
         raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual(raw["models"][0]["display_name"], "Renamed Model")
         self.assertEqual(raw["models"][0]["api_key"], "literal-secret")
+
+    def test_bulk_update_models_preserves_omitted_api_key(self) -> None:
+        client = self._client()
+        config_response = client.get("/api/admin/config", headers=self._auth_headers())
+        model = config_response.json()["models"][0]
+        model.pop("api_key")
+        model["display_name"] = "No Secret In Payload"
+
+        response = client.put(
+            "/api/admin/models",
+            headers=self._auth_headers(),
+            json={"models": [model], "default_model": "base", "reload": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["models"][0]["api_key"], "literal-secret")
+
+    def test_patch_model_blank_api_key_preserves_secret_and_advanced_fields(self) -> None:
+        client = self._client()
+
+        response = client.patch(
+            "/api/admin/models/base",
+            headers=self._auth_headers(),
+            json={
+                "changes": {"name": "renamed", "display_name": "Renamed", "api_key": ""},
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["models"][0]["name"], "renamed")
+        self.assertEqual(raw["models"][0]["api_key"], "literal-secret")
+        self.assertTrue(raw["models"][0]["when_thinking_enabled"]["extra_body"]["enable_thinking"])
+        self.assertEqual(raw["default_model"], "renamed")
+
+    def test_patch_model_requires_explicit_clear_to_remove_api_key(self) -> None:
+        client = self._client()
+
+        response = client.patch(
+            "/api/admin/models/base",
+            headers=self._auth_headers(),
+            json={"clear_api_key": True, "reload": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertNotIn("api_key", raw["models"][0])
+
+    def test_patch_model_preserves_environment_reference_api_key(self) -> None:
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        raw["models"][0]["api_key"] = "${BASE_MODEL_KEY:-test-fallback}"
+        self.config_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        client = self._client()
+
+        response = client.patch(
+            "/api/admin/models/base",
+            headers=self._auth_headers(),
+            json={"changes": {"display_name": "Env Model"}, "reload": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        updated = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated["models"][0]["api_key"], "${BASE_MODEL_KEY:-test-fallback}")
+
+    def test_create_set_default_and_delete_model(self) -> None:
+        client = self._client()
+        created = client.post(
+            "/api/admin/models",
+            headers=self._auth_headers(),
+            json={
+                "model": {
+                    "name": "second",
+                    "display_name": "Second",
+                    "use": "langchain_openai:ChatOpenAI",
+                    "model": "second-model",
+                    "api_key": "second-secret",
+                },
+                "set_default": True,
+                "reload": False,
+            },
+        )
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(created.json()["default_model"], "second")
+
+        deleted = client.delete("/api/admin/models/second?reload=false", headers=self._auth_headers())
+        self.assertEqual(deleted.status_code, 200)
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["default_model"], "base")
+        self.assertEqual([model["name"] for model in raw["models"]], ["base"])
+
+    def test_title_and_subagents_section_updates(self) -> None:
+        client = self._client()
+
+        title = client.put(
+            "/api/admin/title",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "max_words": 8,
+                    "max_chars": 80,
+                    "model_name": "base",
+                    "prompt_template": "Title {max_words}: {user_msg} / {assistant_msg}",
+                },
+                "reload": False,
+            },
+        )
+        self.assertEqual(title.status_code, 200)
+
+        subagents = client.put(
+            "/api/admin/subagents",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "timeout_seconds": 600,
+                    "max_turns": 30,
+                    "agents": {"general-purpose": {"description": "Built-in override", "model": "base", "max_turns": 20}},
+                    "custom_agents": {},
+                },
+                "reload": False,
+            },
+        )
+        self.assertEqual(subagents.status_code, 200)
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["title"]["max_words"], 8)
+        self.assertEqual(raw["subagents"]["agents"]["general-purpose"]["model"], "base")
+        self.assertEqual(raw["subagents"]["agents"]["general-purpose"]["description"], "Built-in override")
+
+    def test_title_and_subagents_reject_unknown_models(self) -> None:
+        client = self._client()
+        title = client.put(
+            "/api/admin/title",
+            headers=self._auth_headers(),
+            json={"config": {"enabled": True, "model_name": "missing"}, "reload": False},
+        )
+        self.assertEqual(title.status_code, 400)
+
+        subagents = client.put(
+            "/api/admin/subagents",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "agents": {"general-purpose": {"model": "missing"}},
+                    "custom_agents": {},
+                },
+                "reload": False,
+            },
+        )
+        self.assertEqual(subagents.status_code, 400)
+
+    def test_config_health_reports_safe_contract_warnings(self) -> None:
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        raw["guardrails"] = {"enabled": False, "providers": []}
+        raw["tracing"] = {"enabled": False}
+        raw["title"]["model"] = raw["title"].pop("model_name")
+        self.config_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        client = self._client()
+
+        response = client.get("/api/admin/config/health", headers=self._auth_headers())
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["valid"])
+        codes = {warning["code"] for warning in payload["warnings"]}
+        self.assertIn("legacy_title_model", codes)
+        self.assertIn("guardrails_provider_contract", codes)
+        self.assertIn("tracing_top_level_enabled_ignored", codes)
+        self.assertGreaterEqual(payload["literal_secrets"]["count"], 1)
+
+    def test_memory_and_summarization_section_updates(self) -> None:
+        client = self._client()
+        memory = client.put(
+            "/api/admin/memory",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "storage_path": "memory.json",
+                    "storage_class": "deerflow.agents.memory.storage.FileMemoryStorage",
+                    "debounce_seconds": 15,
+                    "model_name": "base",
+                    "max_facts": 120,
+                    "fact_confidence_threshold": 0.8,
+                    "injection_enabled": True,
+                    "max_injection_tokens": 2500,
+                },
+                "reload": False,
+            },
+        )
+        self.assertEqual(memory.status_code, 200)
+
+        summarization = client.put(
+            "/api/admin/summarization",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "model_name": "base",
+                    "trigger": [{"type": "messages", "value": 50}, {"type": "fraction", "value": 0.8}],
+                    "keep": {"type": "messages", "value": 20},
+                    "trim_tokens_to_summarize": 4000,
+                    "summary_prompt": "Summarize the conversation.",
+                    "preserve_recent_skill_count": 4,
+                    "preserve_recent_skill_tokens": 20000,
+                    "preserve_recent_skill_tokens_per_skill": 4000,
+                    "skill_file_read_tool_names": ["read_file", "view"],
+                },
+                "reload": False,
+            },
+        )
+        self.assertEqual(summarization.status_code, 200)
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["memory"]["model_name"], "base")
+        self.assertEqual(raw["memory"]["max_facts"], 120)
+        self.assertEqual(raw["summarization"]["trigger"][1]["type"], "fraction")
+        self.assertEqual(raw["summarization"]["keep"]["value"], 20)
+
+    def test_memory_and_summarization_reject_invalid_references_and_thresholds(self) -> None:
+        client = self._client()
+        memory = client.put(
+            "/api/admin/memory",
+            headers=self._auth_headers(),
+            json={"config": {"enabled": True, "model_name": "missing"}, "reload": False},
+        )
+        self.assertEqual(memory.status_code, 400)
+
+        summarization = client.put(
+            "/api/admin/summarization",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "model_name": "base",
+                    "trigger": {"type": "fraction", "value": 1.5},
+                    "keep": {"type": "messages", "value": 20},
+                },
+                "reload": False,
+            },
+        )
+        self.assertEqual(summarization.status_code, 400)
 
     def test_update_models_rejects_duplicate_names(self) -> None:
         client = self._client()

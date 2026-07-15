@@ -2,13 +2,15 @@
 
 import logging
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
 
 class SubagentOverrideConfig(BaseModel):
     """Per-agent configuration overrides."""
+
+    model_config = ConfigDict(extra="allow")
 
     timeout_seconds: int | None = Field(
         default=None,
@@ -33,6 +35,8 @@ class SubagentOverrideConfig(BaseModel):
 
 class CustomSubagentConfig(BaseModel):
     """User-defined subagent type declared in config.yaml."""
+
+    model_config = ConfigDict(extra="allow")
 
     description: str = Field(
         description="When the lead agent should delegate to this subagent",
@@ -70,6 +74,8 @@ class CustomSubagentConfig(BaseModel):
 
 class SubagentsAppConfig(BaseModel):
     """Configuration for the subagent system."""
+
+    model_config = ConfigDict(extra="allow")
 
     enabled: bool = Field(
         default=True,

@@ -37,6 +37,7 @@
         <nav class="nav-list">
           <button class="nav-item active" data-view-target="overview" type="button">总览</button>
           <button class="nav-item" data-view-target="models" type="button">大模型</button>
+          <button class="nav-item" data-view-target="agent" type="button">Agent 配置</button>
           <button class="nav-item" data-view-target="skills" type="button">Skills</button>
           <button class="nav-item" data-view-target="mcp" type="button">MCP</button>
           <button class="nav-item" data-view-target="feishu" type="button">Feishu</button>
@@ -147,7 +148,7 @@
             <div class="panel-header">
               <div>
                 <h3>模型配置草稿</h3>
-                <p>保存会替换当前编辑的模型；未选择已有模型时追加到当前模型列表，并自动 reload。</p>
+                <p>编辑时只更新提交字段；api_key 留空会由后端保留，只有明确勾选清除才会删除。</p>
               </div>
               <button id="closeModelDraftButton" class="ghost-button" type="button">关闭</button>
             </div>
@@ -179,15 +180,31 @@
                 </label>
                 <label>
                   <span>api_key</span>
-                  <input id="draftApiKey" type="text" placeholder="$DASHSCOPE_API_KEY；编辑时留空保留原值" />
+                  <input id="draftApiKey" type="password" autocomplete="new-password" placeholder="$DASHSCOPE_API_KEY；编辑时留空保留原值" />
+                </label>
+                <label id="draftClearApiKeyRow" class="checkbox-row hidden danger-check">
+                  <input id="draftClearApiKey" type="checkbox" />
+                  <span>明确清除现有 api_key</span>
                 </label>
                 <label class="checkbox-row">
                   <input id="draftThinking" type="checkbox" />
                   <span>supports_thinking</span>
                 </label>
                 <label class="checkbox-row">
+                  <input id="draftReasoningEffort" type="checkbox" />
+                  <span>supports_reasoning_effort</span>
+                </label>
+                <label class="checkbox-row">
                   <input id="draftVision" type="checkbox" />
                   <span>supports_vision</span>
+                </label>
+                <label class="checkbox-row">
+                  <input id="draftSetDefault" type="checkbox" />
+                  <span>保存后设为默认模型</span>
+                </label>
+                <label>
+                  <span>高级参数 JSON</span>
+                  <textarea id="draftModelAdvanced" class="small-editor" spellcheck="false" placeholder='{"when_thinking_enabled":{"extra_body":{"enable_thinking":true}}}'></textarea>
                 </label>
               </form>
               <div class="code-panel">
@@ -202,6 +219,210 @@
               </div>
             </div>
             <p id="modelDraftMessage" class="form-message" role="status"></p>
+          </section>
+        </section>
+
+        <section id="agentView" class="view-section">
+          <div class="section-grid">
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>Title 自动生成</h3>
+                  <p>首轮对话完成后生成标题；Prompt 仅允许指定占位符。</p>
+                </div>
+                <button id="saveTitleButton" class="primary-button" type="button">保存 Title</button>
+              </div>
+              <form id="titleEditForm" class="form-grid compact">
+                <label class="checkbox-row">
+                  <input id="titleEnabled" type="checkbox" />
+                  <span>enabled</span>
+                </label>
+                <label>
+                  <span>model_name</span>
+                  <select id="titleModelName"></select>
+                </label>
+                <label>
+                  <span>max_words</span>
+                  <input id="titleMaxWords" type="number" min="1" max="20" />
+                </label>
+                <label>
+                  <span>max_chars</span>
+                  <input id="titleMaxChars" type="number" min="10" max="200" />
+                </label>
+                <label>
+                  <span>prompt_template</span>
+                  <textarea id="titlePromptTemplate" class="small-editor" spellcheck="false"></textarea>
+                </label>
+              </form>
+              <p class="field-help">可用变量：{max_words}、{user_msg}、{assistant_msg}</p>
+              <p id="titleMessage" class="form-message" role="status"></p>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>Subagents 全局配置</h3>
+                  <p>控制子 Agent 可用性、默认超时和默认最大轮次。</p>
+                </div>
+                <button id="saveSubagentsButton" class="primary-button" type="button">保存 Subagents</button>
+              </div>
+              <form id="subagentsEditForm" class="form-grid compact">
+                <label class="checkbox-row">
+                  <input id="subagentsEnabled" type="checkbox" />
+                  <span>enabled</span>
+                </label>
+                <label>
+                  <span>timeout_seconds</span>
+                  <input id="subagentsTimeout" type="number" min="1" />
+                </label>
+                <label>
+                  <span>max_turns（留空使用内置默认）</span>
+                  <input id="subagentsMaxTurns" type="number" min="1" />
+                </label>
+              </form>
+              <p id="subagentsMessage" class="form-message" role="status"></p>
+            </section>
+          </div>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>Subagent 类型配置</h3>
+                <p>内置覆盖和自定义 Agent 分区编辑；保存前会由后端校验模型引用和字段范围。</p>
+              </div>
+            </div>
+            <div class="section-grid">
+              <label>
+                <span>agents JSON</span>
+                <textarea id="subagentsAgentsEditor" class="json-editor compact-editor" spellcheck="false"></textarea>
+              </label>
+              <label>
+                <span>custom_agents JSON</span>
+                <textarea id="subagentsCustomEditor" class="json-editor compact-editor" spellcheck="false"></textarea>
+              </label>
+            </div>
+          </section>
+
+          <div class="section-grid">
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>Memory</h3>
+                  <p>控制全局记忆更新、事实存储和系统 Prompt 注入预算。</p>
+                </div>
+                <button id="saveMemoryButton" class="primary-button" type="button">保存 Memory</button>
+              </div>
+              <form id="memoryEditForm" class="form-grid compact">
+                <label class="checkbox-row">
+                  <input id="memoryEnabled" type="checkbox" />
+                  <span>enabled</span>
+                </label>
+                <label class="checkbox-row">
+                  <input id="memoryInjectionEnabled" type="checkbox" />
+                  <span>injection_enabled</span>
+                </label>
+                <label>
+                  <span>model_name</span>
+                  <select id="memoryModelName"></select>
+                </label>
+                <label>
+                  <span>debounce_seconds</span>
+                  <input id="memoryDebounce" type="number" min="1" max="300" />
+                </label>
+                <label>
+                  <span>max_facts</span>
+                  <input id="memoryMaxFacts" type="number" min="10" max="500" />
+                </label>
+                <label>
+                  <span>fact_confidence_threshold</span>
+                  <input id="memoryConfidence" type="number" min="0" max="1" step="0.05" />
+                </label>
+                <label>
+                  <span>max_injection_tokens</span>
+                  <input id="memoryMaxInjectionTokens" type="number" min="100" max="8000" />
+                </label>
+                <label>
+                  <span>storage_path</span>
+                  <input id="memoryStoragePath" type="text" placeholder="memory.json" />
+                </label>
+                <label>
+                  <span>storage_class</span>
+                  <input id="memoryStorageClass" type="text" />
+                </label>
+              </form>
+              <p id="memoryMessage" class="form-message" role="status"></p>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>Summarization</h3>
+                  <p>配置长对话总结触发条件、保留范围和 Skill 内容保护预算。</p>
+                </div>
+                <button id="saveSummarizationButton" class="primary-button" type="button">保存 Summarization</button>
+              </div>
+              <form id="summarizationEditForm" class="form-grid compact">
+                <label class="checkbox-row">
+                  <input id="summarizationEnabled" type="checkbox" />
+                  <span>enabled</span>
+                </label>
+                <label>
+                  <span>model_name</span>
+                  <select id="summarizationModelName"></select>
+                </label>
+                <label>
+                  <span>trigger JSON</span>
+                  <textarea id="summarizationTrigger" class="small-editor" spellcheck="false"></textarea>
+                </label>
+                <label>
+                  <span>keep.type</span>
+                  <select id="summarizationKeepType">
+                    <option value="messages">messages</option>
+                    <option value="tokens">tokens</option>
+                    <option value="fraction">fraction</option>
+                  </select>
+                </label>
+                <label>
+                  <span>keep.value</span>
+                  <input id="summarizationKeepValue" type="number" min="0" step="0.1" />
+                </label>
+                <label>
+                  <span>trim_tokens_to_summarize（留空为 null）</span>
+                  <input id="summarizationTrimTokens" type="number" min="1" />
+                </label>
+                <label>
+                  <span>preserve_recent_skill_count</span>
+                  <input id="summarizationSkillCount" type="number" min="0" />
+                </label>
+                <label>
+                  <span>preserve_recent_skill_tokens</span>
+                  <input id="summarizationSkillTokens" type="number" min="0" />
+                </label>
+                <label>
+                  <span>preserve_recent_skill_tokens_per_skill</span>
+                  <input id="summarizationSkillTokensPerSkill" type="number" min="0" />
+                </label>
+                <label>
+                  <span>skill_file_read_tool_names</span>
+                  <input id="summarizationSkillTools" type="text" placeholder="read_file,read,view,cat" />
+                </label>
+                <label>
+                  <span>summary_prompt（留空使用默认）</span>
+                  <textarea id="summarizationPrompt" class="small-editor" spellcheck="false"></textarea>
+                </label>
+              </form>
+              <p id="summarizationMessage" class="form-message" role="status"></p>
+            </section>
+          </div>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>受控能力摘要</h3>
+                <p>ACP、Sandbox、Stream Bridge 和内置 Tools 只读展示，不在本轮开放高风险编辑。</p>
+              </div>
+            </div>
+            <div id="agentSystemSummary" class="readonly-grid"></div>
           </section>
         </section>
 
@@ -381,6 +602,7 @@
               </form>
             </section>
           </div>
+
         </section>
 
         <section id="runtimeView" class="view-section">
@@ -443,6 +665,14 @@
                   <span>allowed_upload_extensions</span>
                   <input id="runtimeAllowedExtensions" type="text" placeholder=".pdf,.txt,.md" />
                 </label>
+                <label>
+                  <span>scheduler_poll_interval_seconds</span>
+                  <input id="runtimeSchedulerPoll" type="number" min="0.5" max="3600" step="0.5" />
+                </label>
+                <label>
+                  <span>scheduler_timezone</span>
+                  <input id="runtimeSchedulerTimezone" type="text" placeholder="Asia/Shanghai" />
+                </label>
                 <label class="checkbox-row">
                   <input id="runtimeThinking" type="checkbox" />
                   <span>thinking_enabled</span>
@@ -455,9 +685,26 @@
                   <input id="runtimePlanMode" type="checkbox" />
                   <span>plan_mode</span>
                 </label>
+                <label class="checkbox-row">
+                  <input id="runtimeSchedulerEnabled" type="checkbox" />
+                  <span>scheduler_enabled（需重启）</span>
+                </label>
               </form>
             </section>
           </div>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>配置健康</h3>
+                <p>检查版本、可解析性、字段契约、未知配置和明文凭据风险；不会自动修改文件。</p>
+              </div>
+              <button id="refreshConfigHealthButton" class="secondary-button" type="button">重新检查</button>
+            </div>
+            <div id="configHealthDetails" class="readonly-grid"></div>
+            <div id="configHealthWarnings" class="health-alerts"></div>
+            <p id="configHealthMessage" class="form-message" role="status"></p>
+          </section>
         </section>
       </main>
     </div>

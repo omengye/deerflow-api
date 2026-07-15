@@ -1,6 +1,6 @@
 """Configuration for automatic thread title generation."""
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class TitleConfig(BaseModel):
@@ -24,6 +24,7 @@ class TitleConfig(BaseModel):
     )
     model_name: str | None = Field(
         default=None,
+        validation_alias=AliasChoices("model_name", "model"),
         description="Model name to use for title generation (None = use default model)",
     )
     prompt_template: str = Field(

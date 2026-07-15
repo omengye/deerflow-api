@@ -6,7 +6,9 @@ import logging
 import json
 import os
 import shutil
+import string
 import tempfile
+from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,13 +18,17 @@ from urllib.parse import urlparse
 import httpx
 import yaml
 from fastapi import APIRouter, Body, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config import FeishuSettings, settings
 from app.dependencies import get_client_manager
 from deerflow.config.app_config import AppConfig, pop_current_app_config, push_current_app_config
 from deerflow.config.extensions_config import ExtensionsConfig
+from deerflow.config.memory_config import MemoryConfig
 from deerflow.config.model_config import ModelConfig
+from deerflow.config.subagents_config import SubagentsAppConfig
+from deerflow.config.summarization_config import ContextSize, SummarizationConfig
+from deerflow.config.title_config import TitleConfig
 from deerflow.skills.manager import (
     ALLOWED_SUPPORT_SUBDIRS,
     append_history,
@@ -76,6 +82,23 @@ class AdminModelsUpdateRequest(BaseModel):
     reload: bool = True
 
 
+class AdminModelCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: dict[str, Any]
+    set_default: bool = False
+    reload: bool = True
+
+
+class AdminModelPatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    changes: dict[str, Any] = Field(default_factory=dict)
+    clear_api_key: bool = False
+    set_default: bool = False
+    reload: bool = True
+
+
 class AdminReloadRequest(BaseModel):
     include_extensions: bool = True
     reset_clients: bool = True
@@ -122,6 +145,34 @@ class AdminMcpTestRequest(BaseModel):
     timeout_seconds: float = Field(default=5.0, gt=0, le=30)
 
 
+class AdminTitleUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: TitleConfig
+    reload: bool = True
+
+
+class AdminSubagentsUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: SubagentsAppConfig
+    reload: bool = True
+
+
+class AdminMemoryUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: MemoryConfig
+    reload: bool = True
+
+
+class AdminSummarizationUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: SummarizationConfig
+    reload: bool = True
+
+
 _HOT_RUNTIME_FIELDS = {
     "model_name",
     "thinking_enabled",
@@ -137,6 +188,33 @@ _RESTART_RUNTIME_FIELDS = {
     "scheduler_enabled",
     "scheduler_poll_interval_seconds",
     "scheduler_timezone",
+}
+
+_KNOWN_TOP_LEVEL_CONFIG_KEYS = {
+    "config_version",
+    "log_level",
+    "api",
+    "stream_bridge",
+    "token_usage",
+    "models",
+    "default_model",
+    "sandbox",
+    "acp_agents",
+    "agents_api",
+    "skills",
+    "skill_evolution",
+    "memory",
+    "subagents",
+    "tool_groups",
+    "tool_search",
+    "tool_output",
+    "tools",
+    "guardrails",
+    "title",
+    "summarization",
+    "tracing",
+    "circuit_breaker",
+    "checkpointer",
 }
 
 
@@ -509,6 +587,11 @@ def _admin_config_response(raw_config: dict[str, Any], path: Path) -> dict[str, 
         logger.debug("Failed to resolve extensions config path", exc_info=True)
         extensions_config_path = None
 
+    sandbox = raw_config.get("sandbox") if isinstance(raw_config.get("sandbox"), dict) else {}
+    stream_bridge = raw_config.get("stream_bridge") if isinstance(raw_config.get("stream_bridge"), dict) else {}
+    acp_agents = raw_config.get("acp_agents") if isinstance(raw_config.get("acp_agents"), dict) else {}
+    raw_tools = raw_config.get("tools") if isinstance(raw_config.get("tools"), list) else []
+
     return {
         "config_path": str(path),
         "config_version": config_version,
@@ -516,6 +599,51 @@ def _admin_config_response(raw_config: dict[str, Any], path: Path) -> dict[str, 
         "api": _redact_value("api", api_config),
         "models": [_redact_value("model", model) for model in raw_models if isinstance(model, dict)],
         "default_model": raw_config.get("default_model"),
+        "system_summary": {
+            "sandbox": {
+                "use": sandbox.get("use"),
+                "image": sandbox.get("image"),
+                "replicas": sandbox.get("replicas"),
+                "idle_timeout": sandbox.get("idle_timeout"),
+                "mounts_count": len(sandbox.get("mounts") or []) if isinstance(sandbox.get("mounts"), list) else 0,
+                "environment_keys": sorted(str(key) for key in (sandbox.get("environment") or {}).keys())
+                if isinstance(sandbox.get("environment"), dict)
+                else [],
+                "security_opt": sandbox.get("security_opt") if isinstance(sandbox.get("security_opt"), list) else [],
+            },
+            "stream_bridge": {
+                "type": stream_bridge.get("type", "memory"),
+                "queue_maxsize": stream_bridge.get("queue_maxsize"),
+                "redis_configured": bool(stream_bridge.get("redis_url")),
+                "redis_maxlen": stream_bridge.get("redis_maxlen"),
+                "redis_retention_seconds": stream_bridge.get("redis_retention_seconds"),
+            },
+            "acp_agents": [
+                {
+                    "name": str(name),
+                    "description": config.get("description"),
+                    "model": config.get("model"),
+                    "auto_approve_permissions": bool(config.get("auto_approve_permissions")),
+                    "environment_keys": sorted(str(key) for key in (config.get("env") or {}).keys())
+                    if isinstance(config.get("env"), dict)
+                    else [],
+                }
+                for name, config in acp_agents.items()
+                if isinstance(config, dict)
+            ],
+            "tools": [
+                {
+                    "name": tool.get("name"),
+                    "group": tool.get("group"),
+                    "use": tool.get("use"),
+                    "configured_secret_fields": sorted(
+                        str(key) for key, value in tool.items() if _is_secret_key(str(key)) and value not in (None, "")
+                    ),
+                }
+                for tool in raw_tools
+                if isinstance(tool, dict)
+            ],
+        },
         "paths": {
             "skills_root": skills_root,
             "extensions_config": extensions_config_path,
@@ -610,6 +738,274 @@ def _validate_models(raw_models: list[dict[str, Any]]) -> list[ModelConfig]:
     return models
 
 
+def _model_dump(model: ModelConfig) -> dict[str, Any]:
+    return model.model_dump(exclude_none=True)
+
+
+def _reload_after_config_write(*, reload: bool, include_extensions: bool = False) -> dict[str, Any] | None:
+    if not reload:
+        return None
+    manager = get_client_manager()
+    ext_path = _resolve_extensions_config_path(create=False) if include_extensions else None
+    return manager.reload_runtime_config(
+        include_extensions=include_extensions,
+        reset_clients=True,
+        extensions_config_path=str(ext_path) if ext_path else None,
+    )
+
+
+def _validated_model_config(
+    config_data: dict[str, Any],
+    raw_models: list[dict[str, Any]],
+    default_model: str | None,
+) -> tuple[list[ModelConfig], str]:
+    models = _validate_models(raw_models)
+    model_names = {model.name for model in models}
+    resolved_default = default_model
+    if resolved_default is None:
+        current_default = config_data.get("default_model")
+        resolved_default = current_default if current_default in model_names else models[0].name
+    if resolved_default not in model_names:
+        raise HTTPException(status_code=400, detail=f"default_model '{resolved_default}' is not in models")
+    return models, resolved_default
+
+
+def _write_validated_models(
+    *,
+    config_data: dict[str, Any],
+    path: Path,
+    raw_models: list[dict[str, Any]],
+    default_model: str | None,
+    reload: bool,
+) -> tuple[list[ModelConfig], str, dict[str, Any] | None]:
+    models, resolved_default = _validated_model_config(config_data, raw_models, default_model)
+    config_data["models"] = [_model_dump(model) for model in models]
+    config_data["default_model"] = resolved_default
+    _atomic_write_config(config_data, path=path)
+    try:
+        reload_result = _reload_after_config_write(reload=reload, include_extensions=True)
+    except Exception as exc:
+        logger.exception("Admin model update wrote config but reload failed")
+        raise HTTPException(status_code=500, detail=f"Config saved but reload failed: {exc}") from exc
+    return models, resolved_default, reload_result
+
+
+def _validate_title_prompt(prompt_template: str) -> None:
+    allowed_fields = {"max_words", "user_msg", "assistant_msg"}
+    try:
+        fields = {
+            field_name
+            for _, field_name, _, _ in string.Formatter().parse(prompt_template)
+            if field_name is not None
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid title prompt template: {exc}") from exc
+    unknown = sorted(fields - allowed_fields)
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unsupported title prompt fields: {', '.join(unknown)}")
+
+
+def _validate_configured_model_name(config_data: dict[str, Any], model_name: str | None, *, field: str) -> None:
+    if model_name is None or model_name == "inherit":
+        return
+    configured = {
+        str(model.get("name"))
+        for model in config_data.get("models", [])
+        if isinstance(model, dict) and model.get("name")
+    }
+    if model_name not in configured:
+        raise HTTPException(status_code=400, detail=f"{field} '{model_name}' is not configured")
+
+
+def _validate_subagent_models(config_data: dict[str, Any], config: SubagentsAppConfig) -> None:
+    for name, override in config.agents.items():
+        _validate_configured_model_name(config_data, override.model, field=f"subagents.agents.{name}.model")
+    for name, custom in config.custom_agents.items():
+        _validate_configured_model_name(config_data, custom.model, field=f"subagents.custom_agents.{name}.model")
+
+
+def _validate_context_size(value: ContextSize, *, field: str) -> None:
+    if value.type == "fraction":
+        if not isinstance(value.value, (int, float)) or not 0 < float(value.value) <= 1:
+            raise HTTPException(status_code=400, detail=f"{field}.value must be greater than 0 and at most 1")
+        return
+    if not isinstance(value.value, (int, float)) or float(value.value) < 1 or float(value.value) % 1 != 0:
+        raise HTTPException(status_code=400, detail=f"{field}.value must be a positive integer")
+
+
+def _validate_summarization_config(config: SummarizationConfig) -> None:
+    triggers = config.trigger if isinstance(config.trigger, list) else [config.trigger] if config.trigger else []
+    for index, trigger in enumerate(triggers):
+        _validate_context_size(trigger, field=f"summarization.trigger[{index}]")
+    _validate_context_size(config.keep, field="summarization.keep")
+
+
+def _config_example_path(config_path: Path) -> Path | None:
+    candidates = [config_path.parent / "config.example.yaml", Path(__file__).resolve().parents[2] / "config.example.yaml"]
+    return next((candidate for candidate in candidates if candidate.exists()), None)
+
+
+def _config_version(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _validation_errors(exc: Exception) -> list[dict[str, Any]]:
+    if isinstance(exc, ValidationError):
+        return [
+            {
+                "path": ".".join(str(part) for part in error.get("loc", ())),
+                "type": error.get("type", "validation_error"),
+                "message": error.get("msg", "Invalid configuration value"),
+            }
+            for error in exc.errors(include_input=False, include_url=False)
+        ]
+    return [{"path": "", "type": type(exc).__name__, "message": str(exc)}]
+
+
+def _literal_secret_summary(value: Any, *, section: str | None = None) -> tuple[int, set[str]]:
+    count = 0
+    sections: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            current_section = section or str(key)
+            if _is_secret_key(str(key)):
+                if item not in (None, "") and not (isinstance(item, str) and item.strip().startswith(("$", "${"))):
+                    count += 1
+                    sections.add(current_section)
+                continue
+            nested_count, nested_sections = _literal_secret_summary(item, section=current_section)
+            count += nested_count
+            sections.update(nested_sections)
+    elif isinstance(value, list):
+        for item in value:
+            nested_count, nested_sections = _literal_secret_summary(item, section=section)
+            count += nested_count
+            sections.update(nested_sections)
+    return count, sections
+
+
+def _config_health_response(config_data: dict[str, Any], path: Path) -> dict[str, Any]:
+    warnings: list[dict[str, str]] = []
+    validation_errors: list[dict[str, Any]] = []
+    try:
+        AppConfig.from_file(str(path))
+        valid = True
+    except Exception as exc:
+        valid = False
+        validation_errors = _validation_errors(exc)
+        logger.debug("Admin config health validation failed", exc_info=True)
+
+    example_path = _config_example_path(path)
+    example_data: dict[str, Any] = {}
+    if example_path is not None:
+        try:
+            loaded = yaml.safe_load(example_path.read_text(encoding="utf-8")) or {}
+            if isinstance(loaded, dict):
+                example_data = loaded
+        except Exception:
+            logger.debug("Failed to read config.example.yaml for admin health", exc_info=True)
+
+    current_version = _config_version(config_data.get("config_version"))
+    latest_version = _config_version(example_data.get("config_version")) or current_version
+    if current_version < latest_version:
+        warnings.append(
+            {
+                "code": "config_outdated",
+                "severity": "warning",
+                "path": "config_version",
+                "message": f"config.yaml version {current_version} is older than {latest_version}",
+            }
+        )
+
+    title = config_data.get("title") if isinstance(config_data.get("title"), dict) else {}
+    if "model" in title:
+        warnings.append(
+            {
+                "code": "legacy_title_model",
+                "severity": "warning",
+                "path": "title.model",
+                "message": "Use title.model_name; title.model is retained only for compatibility",
+            }
+        )
+
+    guardrails = config_data.get("guardrails") if isinstance(config_data.get("guardrails"), dict) else {}
+    if "providers" in guardrails and "provider" not in guardrails:
+        warnings.append(
+            {
+                "code": "guardrails_provider_contract",
+                "severity": "warning",
+                "path": "guardrails.providers",
+                "message": "Runtime currently expects guardrails.provider rather than guardrails.providers",
+            }
+        )
+
+    tracing = config_data.get("tracing") if isinstance(config_data.get("tracing"), dict) else {}
+    if "enabled" in tracing:
+        warnings.append(
+            {
+                "code": "tracing_top_level_enabled_ignored",
+                "severity": "info",
+                "path": "tracing.enabled",
+                "message": "Tracing effective state is controlled by each provider's enabled field",
+            }
+        )
+
+    configured_models = {
+        str(model.get("name"))
+        for model in config_data.get("models", [])
+        if isinstance(model, dict) and model.get("name")
+    }
+    title_model = title.get("model_name") or title.get("model")
+    if title_model and title_model not in configured_models:
+        warnings.append(
+            {
+                "code": "title_model_missing",
+                "severity": "warning",
+                "path": "title.model_name",
+                "message": "Title model does not reference a configured model name",
+            }
+        )
+
+    missing_sections = sorted(
+        key for key, value in example_data.items() if isinstance(value, (dict, list)) and key not in config_data
+    )
+    unknown_sections = sorted(str(key) for key in config_data if key not in _KNOWN_TOP_LEVEL_CONFIG_KEYS)
+    literal_secret_count, literal_secret_sections = _literal_secret_summary(config_data)
+    if literal_secret_count:
+        warnings.append(
+            {
+                "code": "literal_secrets",
+                "severity": "info",
+                "path": "",
+                "message": f"{literal_secret_count} literal secret value(s) are stored in config.yaml",
+            }
+        )
+
+    if not valid:
+        status = "error"
+    elif any(warning["severity"] == "warning" for warning in warnings):
+        status = "warning"
+    else:
+        status = "ok"
+    return {
+        "status": status,
+        "valid": valid,
+        "config_path": str(path),
+        "writable": os.access(path, os.W_OK),
+        "current_version": current_version,
+        "latest_version": latest_version,
+        "outdated": current_version < latest_version,
+        "missing_sections": missing_sections,
+        "unknown_sections": unknown_sections,
+        "literal_secrets": {"count": literal_secret_count, "sections": sorted(literal_secret_sections)},
+        "warnings": warnings,
+        "validation_errors": validation_errors,
+    }
+
+
 def _runtime_changes(req: AdminRuntimePatchRequest) -> dict[str, Any]:
     fields = req.model_fields_set - {"reload"}
     changes = {field: getattr(req, field) for field in fields}
@@ -696,6 +1092,12 @@ async def admin_me():
             "config_read": True,
             "config_reload": True,
             "models_write": True,
+            "model_patch": True,
+            "title_write": True,
+            "subagents_write": True,
+            "memory_write": True,
+            "summarization_write": True,
+            "config_health": True,
             "custom_skills_write": True,
             "runtime_write": True,
             "mcp_admin": True,
@@ -710,6 +1112,111 @@ async def get_admin_config():
     path = _config_path()
     raw_config = _load_config_data(path)
     return _admin_config_response(raw_config, path)
+
+
+@router.get("/config/health")
+async def get_admin_config_health():
+    """Validate config.yaml and return safe compatibility/security diagnostics."""
+    path = _config_path()
+    return _config_health_response(_load_config_data(path), path)
+
+
+@router.get("/title")
+async def get_admin_title():
+    """Return validated automatic-title configuration."""
+    config_data = _load_config_data(_config_path())
+    config = TitleConfig.model_validate(config_data.get("title") or {})
+    return {"config": config.model_dump()}
+
+
+@router.put("/title")
+async def update_admin_title(req: AdminTitleUpdateRequest = Body()):
+    """Update automatic-title configuration and optionally reload clients."""
+    path = _config_path()
+    config_data = _load_config_data(path)
+    _validate_title_prompt(req.config.prompt_template)
+    _validate_configured_model_name(config_data, req.config.model_name, field="title.model_name")
+    config_data["title"] = req.config.model_dump(exclude_none=True)
+    _atomic_write_config(config_data, path=path)
+    try:
+        reload_result = _reload_after_config_write(reload=req.reload)
+    except Exception as exc:
+        logger.exception("Admin title update wrote config but reload failed")
+        raise HTTPException(status_code=500, detail=f"Title config saved but reload failed: {exc}") from exc
+    return {"success": True, "config": req.config.model_dump(), "reload": reload_result}
+
+
+@router.get("/subagents")
+async def get_admin_subagents():
+    """Return validated built-in and custom subagent configuration."""
+    config_data = _load_config_data(_config_path())
+    config = SubagentsAppConfig.model_validate(config_data.get("subagents") or {})
+    return {"config": config.model_dump()}
+
+
+@router.put("/subagents")
+async def update_admin_subagents(req: AdminSubagentsUpdateRequest = Body()):
+    """Update subagent configuration and optionally reload clients."""
+    path = _config_path()
+    config_data = _load_config_data(path)
+    _validate_subagent_models(config_data, req.config)
+    config_data["subagents"] = req.config.model_dump(exclude_none=True)
+    _atomic_write_config(config_data, path=path)
+    try:
+        reload_result = _reload_after_config_write(reload=req.reload)
+    except Exception as exc:
+        logger.exception("Admin subagents update wrote config but reload failed")
+        raise HTTPException(status_code=500, detail=f"Subagents config saved but reload failed: {exc}") from exc
+    return {"success": True, "config": req.config.model_dump(), "reload": reload_result}
+
+
+@router.get("/memory")
+async def get_admin_memory():
+    """Return validated global-memory configuration."""
+    config_data = _load_config_data(_config_path())
+    config = MemoryConfig.model_validate(config_data.get("memory") or {})
+    return {"config": config.model_dump()}
+
+
+@router.put("/memory")
+async def update_admin_memory(req: AdminMemoryUpdateRequest = Body()):
+    """Update global-memory configuration and reload new clients."""
+    path = _config_path()
+    config_data = _load_config_data(path)
+    _validate_configured_model_name(config_data, req.config.model_name, field="memory.model_name")
+    config_data["memory"] = req.config.model_dump(exclude_none=True)
+    _atomic_write_config(config_data, path=path)
+    try:
+        reload_result = _reload_after_config_write(reload=req.reload)
+    except Exception as exc:
+        logger.exception("Admin memory update wrote config but reload failed")
+        raise HTTPException(status_code=500, detail=f"Memory config saved but reload failed: {exc}") from exc
+    return {"success": True, "config": req.config.model_dump(), "reload": reload_result}
+
+
+@router.get("/summarization")
+async def get_admin_summarization():
+    """Return validated conversation-summarization configuration."""
+    config_data = _load_config_data(_config_path())
+    config = SummarizationConfig.model_validate(config_data.get("summarization") or {})
+    return {"config": config.model_dump()}
+
+
+@router.put("/summarization")
+async def update_admin_summarization(req: AdminSummarizationUpdateRequest = Body()):
+    """Update conversation-summarization configuration and reload new clients."""
+    path = _config_path()
+    config_data = _load_config_data(path)
+    _validate_configured_model_name(config_data, req.config.model_name, field="summarization.model_name")
+    _validate_summarization_config(req.config)
+    config_data["summarization"] = req.config.model_dump(exclude_none=True)
+    _atomic_write_config(config_data, path=path)
+    try:
+        reload_result = _reload_after_config_write(reload=req.reload)
+    except Exception as exc:
+        logger.exception("Admin summarization update wrote config but reload failed")
+        raise HTTPException(status_code=500, detail=f"Summarization config saved but reload failed: {exc}") from exc
+    return {"success": True, "config": req.config.model_dump(), "reload": reload_result}
 
 
 @router.put("/models")
@@ -727,35 +1234,143 @@ async def update_admin_models(req: AdminModelsUpdateRequest = Body()):
     for model in req.models:
         name = model.get("name")
         existing = existing_models.get(str(name)) if name is not None else None
-        restored_models.append(_restore_redacted_values(model, existing, path=str(name or "<unnamed-model>")))
+        incoming = dict(model)
+        # Compatibility safety: older clients replace the full models list. If
+        # they omit api_key, preserve the stored value instead of deleting it.
+        if existing is not None and "api_key" not in incoming and "api_key" in existing:
+            incoming["api_key"] = existing["api_key"]
+        restored_models.append(_restore_redacted_values(incoming, existing, path=str(name or "<unnamed-model>")))
 
-    models = _validate_models(restored_models)
-    model_names = {model.name for model in models}
-    default_model = req.default_model
-    if default_model is None:
-        current_default = config_data.get("default_model")
-        default_model = current_default if current_default in model_names else models[0].name
-    if default_model not in model_names:
-        raise HTTPException(status_code=400, detail=f"default_model '{default_model}' is not in models")
-
-    config_data["models"] = [model.model_dump(exclude_none=True) for model in models]
-    config_data["default_model"] = default_model
-    _atomic_write_config(config_data, path=path)
-
-    reload_result: dict[str, Any] | None = None
-    if req.reload:
-        try:
-            manager = get_client_manager()
-            reload_result = manager.reload_runtime_config(include_extensions=True, reset_clients=True)
-        except Exception as exc:
-            logger.exception("Admin model update wrote config but reload failed")
-            raise HTTPException(status_code=500, detail=f"Config saved but reload failed: {exc}") from exc
+    try:
+        models, default_model, reload_result = _write_validated_models(
+            config_data=config_data,
+            path=path,
+            raw_models=restored_models,
+            default_model=req.default_model,
+            reload=req.reload,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Admin model update wrote config but reload failed")
+        raise HTTPException(status_code=500, detail=f"Config saved but reload failed: {exc}") from exc
 
     return {
         "success": True,
         "models": [_model_summary(model) for model in models],
         "default_model": default_model,
         "reloaded": bool(req.reload),
+        "reload": reload_result,
+    }
+
+
+@router.post("/models")
+async def create_admin_model(req: AdminModelCreateRequest = Body()):
+    """Create one model without requiring clients to replace the full model list."""
+    path = _config_path()
+    config_data = _load_config_data(path)
+    raw_models = [dict(model) for model in config_data.get("models", []) if isinstance(model, dict)]
+    incoming = _restore_redacted_values(req.model, None, path=str(req.model.get("name") or "<new-model>"))
+    candidate = _validate_models([incoming])[0]
+    if any(model.get("name") == candidate.name for model in raw_models):
+        raise HTTPException(status_code=409, detail=f"Model '{candidate.name}' already exists")
+    raw_models.append(_model_dump(candidate))
+    default_model = candidate.name if req.set_default or not config_data.get("default_model") else config_data.get("default_model")
+    models, default_model, reload_result = _write_validated_models(
+        config_data=config_data,
+        path=path,
+        raw_models=raw_models,
+        default_model=default_model,
+        reload=req.reload,
+    )
+    return {
+        "success": True,
+        "model": _model_summary(next(model for model in models if model.name == candidate.name)),
+        "default_model": default_model,
+        "reloaded": bool(req.reload),
+        "reload": reload_result,
+    }
+
+
+@router.patch("/models/{model_name}")
+async def patch_admin_model(model_name: str, req: AdminModelPatchRequest = Body()):
+    """Patch one model; omitted fields, including api_key, retain their stored values."""
+    if not req.changes and not req.clear_api_key and not req.set_default:
+        raise HTTPException(status_code=400, detail="At least one model change is required")
+
+    path = _config_path()
+    config_data = _load_config_data(path)
+    raw_models = [dict(model) for model in config_data.get("models", []) if isinstance(model, dict)]
+    index = next((i for i, model in enumerate(raw_models) if str(model.get("name")) == model_name), None)
+    if index is None:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+
+    existing = raw_models[index]
+    changes = deepcopy(req.changes)
+    if req.clear_api_key and changes.get("api_key") not in (None, ""):
+        raise HTTPException(status_code=400, detail="api_key and clear_api_key cannot be used together")
+    if changes.get("api_key") in (None, ""):
+        changes.pop("api_key", None)
+
+    merged = deepcopy(existing)
+    for key, value in changes.items():
+        merged[key] = _restore_redacted_values(value, existing.get(key), path=f"{model_name}.{key}")
+    if req.clear_api_key:
+        merged.pop("api_key", None)
+
+    candidate = _validate_models([merged])[0]
+    if candidate.name != model_name and any(
+        i != index and str(model.get("name")) == candidate.name for i, model in enumerate(raw_models)
+    ):
+        raise HTTPException(status_code=409, detail=f"Model '{candidate.name}' already exists")
+    raw_models[index] = _model_dump(candidate)
+
+    default_model = config_data.get("default_model")
+    if req.set_default or default_model == model_name:
+        default_model = candidate.name
+    models, default_model, reload_result = _write_validated_models(
+        config_data=config_data,
+        path=path,
+        raw_models=raw_models,
+        default_model=default_model,
+        reload=req.reload,
+    )
+    return {
+        "success": True,
+        "model": _model_summary(next(model for model in models if model.name == candidate.name)),
+        "default_model": default_model,
+        "reloaded": bool(req.reload),
+        "reload": reload_result,
+    }
+
+
+@router.delete("/models/{model_name}")
+async def delete_admin_model(model_name: str, reload: bool = True):
+    """Delete one model and select a safe replacement default when necessary."""
+    path = _config_path()
+    config_data = _load_config_data(path)
+    raw_models = [dict(model) for model in config_data.get("models", []) if isinstance(model, dict)]
+    kept = [model for model in raw_models if str(model.get("name")) != model_name]
+    if len(kept) == len(raw_models):
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+    if not kept:
+        raise HTTPException(status_code=400, detail="At least one model is required")
+    default_model = config_data.get("default_model")
+    if default_model == model_name:
+        default_model = str(kept[0].get("name"))
+    models, default_model, reload_result = _write_validated_models(
+        config_data=config_data,
+        path=path,
+        raw_models=kept,
+        default_model=default_model,
+        reload=reload,
+    )
+    return {
+        "success": True,
+        "deleted": model_name,
+        "models": [_model_summary(model) for model in models],
+        "default_model": default_model,
+        "reloaded": bool(reload),
         "reload": reload_result,
     }
 

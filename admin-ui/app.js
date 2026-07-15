@@ -40,6 +40,11 @@
     health: null,
     adminMe: null,
     adminConfig: null,
+    titleConfig: null,
+    subagentsConfig: null,
+    memoryConfig: null,
+    summarizationConfig: null,
+    configHealth: null,
     feishu: null,
     customSkills: [],
     currentView: "overview",
@@ -50,6 +55,7 @@
   const views = {
     overview: "总览",
     models: "大模型",
+    agent: "Agent 配置",
     skills: "Skills",
     mcp: "MCP",
     feishu: "Feishu",
@@ -112,8 +118,56 @@
     draftModelId: document.getElementById("draftModelId"),
     draftBaseUrl: document.getElementById("draftBaseUrl"),
     draftApiKey: document.getElementById("draftApiKey"),
+    draftClearApiKeyRow: document.getElementById("draftClearApiKeyRow"),
+    draftClearApiKey: document.getElementById("draftClearApiKey"),
     draftThinking: document.getElementById("draftThinking"),
+    draftReasoningEffort: document.getElementById("draftReasoningEffort"),
     draftVision: document.getElementById("draftVision"),
+    draftSetDefault: document.getElementById("draftSetDefault"),
+    draftModelAdvanced: document.getElementById("draftModelAdvanced"),
+    titleEditForm: document.getElementById("titleEditForm"),
+    saveTitleButton: document.getElementById("saveTitleButton"),
+    titleEnabled: document.getElementById("titleEnabled"),
+    titleModelName: document.getElementById("titleModelName"),
+    titleMaxWords: document.getElementById("titleMaxWords"),
+    titleMaxChars: document.getElementById("titleMaxChars"),
+    titlePromptTemplate: document.getElementById("titlePromptTemplate"),
+    titleMessage: document.getElementById("titleMessage"),
+    subagentsEditForm: document.getElementById("subagentsEditForm"),
+    saveSubagentsButton: document.getElementById("saveSubagentsButton"),
+    subagentsEnabled: document.getElementById("subagentsEnabled"),
+    subagentsTimeout: document.getElementById("subagentsTimeout"),
+    subagentsMaxTurns: document.getElementById("subagentsMaxTurns"),
+    subagentsAgentsEditor: document.getElementById("subagentsAgentsEditor"),
+    subagentsCustomEditor: document.getElementById("subagentsCustomEditor"),
+    subagentsMessage: document.getElementById("subagentsMessage"),
+    agentSystemSummary: document.getElementById("agentSystemSummary"),
+    memoryEditForm: document.getElementById("memoryEditForm"),
+    saveMemoryButton: document.getElementById("saveMemoryButton"),
+    memoryEnabled: document.getElementById("memoryEnabled"),
+    memoryInjectionEnabled: document.getElementById("memoryInjectionEnabled"),
+    memoryModelName: document.getElementById("memoryModelName"),
+    memoryDebounce: document.getElementById("memoryDebounce"),
+    memoryMaxFacts: document.getElementById("memoryMaxFacts"),
+    memoryConfidence: document.getElementById("memoryConfidence"),
+    memoryMaxInjectionTokens: document.getElementById("memoryMaxInjectionTokens"),
+    memoryStoragePath: document.getElementById("memoryStoragePath"),
+    memoryStorageClass: document.getElementById("memoryStorageClass"),
+    memoryMessage: document.getElementById("memoryMessage"),
+    summarizationEditForm: document.getElementById("summarizationEditForm"),
+    saveSummarizationButton: document.getElementById("saveSummarizationButton"),
+    summarizationEnabled: document.getElementById("summarizationEnabled"),
+    summarizationModelName: document.getElementById("summarizationModelName"),
+    summarizationTrigger: document.getElementById("summarizationTrigger"),
+    summarizationKeepType: document.getElementById("summarizationKeepType"),
+    summarizationKeepValue: document.getElementById("summarizationKeepValue"),
+    summarizationTrimTokens: document.getElementById("summarizationTrimTokens"),
+    summarizationSkillCount: document.getElementById("summarizationSkillCount"),
+    summarizationSkillTokens: document.getElementById("summarizationSkillTokens"),
+    summarizationSkillTokensPerSkill: document.getElementById("summarizationSkillTokensPerSkill"),
+    summarizationSkillTools: document.getElementById("summarizationSkillTools"),
+    summarizationPrompt: document.getElementById("summarizationPrompt"),
+    summarizationMessage: document.getElementById("summarizationMessage"),
     skillDraftPanel: document.getElementById("skillDraftPanel"),
     openSkillDraftButton: document.getElementById("openSkillDraftButton"),
     closeSkillDraftButton: document.getElementById("closeSkillDraftButton"),
@@ -148,6 +202,13 @@
     runtimeThinking: document.getElementById("runtimeThinking"),
     runtimeSubagent: document.getElementById("runtimeSubagent"),
     runtimePlanMode: document.getElementById("runtimePlanMode"),
+    runtimeSchedulerEnabled: document.getElementById("runtimeSchedulerEnabled"),
+    runtimeSchedulerPoll: document.getElementById("runtimeSchedulerPoll"),
+    runtimeSchedulerTimezone: document.getElementById("runtimeSchedulerTimezone"),
+    refreshConfigHealthButton: document.getElementById("refreshConfigHealthButton"),
+    configHealthDetails: document.getElementById("configHealthDetails"),
+    configHealthWarnings: document.getElementById("configHealthWarnings"),
+    configHealthMessage: document.getElementById("configHealthMessage"),
   };
 
   function defaultBaseUrl() {
@@ -163,10 +224,17 @@
 
   function setBusy(button, busy, text) {
     if (!button) return;
+    if (!button.dataset.idleText) {
+      button.dataset.idleText = button.textContent;
+    }
     button.disabled = busy;
-    if (text) {
-      button.dataset.idleText = button.dataset.idleText || button.textContent;
-      button.textContent = busy ? text : button.dataset.idleText;
+    button.classList.toggle("is-busy", busy);
+    if (busy) {
+      button.setAttribute("aria-busy", "true");
+      if (text) button.textContent = text;
+    } else {
+      button.removeAttribute("aria-busy");
+      button.textContent = button.dataset.idleText;
     }
   }
 
@@ -316,6 +384,11 @@
     const tasks = await Promise.allSettled([
       loadAdminMe(),
       loadAdminConfig(),
+      loadTitleConfig(),
+      loadSubagentsConfig(),
+      loadMemoryConfig(),
+      loadSummarizationConfig(),
+      loadConfigHealth(),
       loadHealth(),
       loadModels(),
       loadSkills(),
@@ -334,6 +407,7 @@
     }
 
     renderOverview();
+    renderAgentConfig();
     setBusy(el.refreshButton, false);
   }
 
@@ -347,6 +421,43 @@
     const data = await request("/api/admin/config");
     state.adminConfig = data;
     renderRuntimeConfig();
+    renderAgentSystemSummary();
+    return data;
+  }
+
+  async function loadTitleConfig() {
+    const data = await request("/api/admin/title");
+    state.titleConfig = data?.config && typeof data.config === "object" ? data.config : {};
+    renderTitleConfig();
+    return data;
+  }
+
+  async function loadSubagentsConfig() {
+    const data = await request("/api/admin/subagents");
+    state.subagentsConfig = data?.config && typeof data.config === "object" ? data.config : {};
+    renderSubagentsConfig();
+    return data;
+  }
+
+  async function loadMemoryConfig() {
+    const data = await request("/api/admin/memory");
+    state.memoryConfig = data?.config && typeof data.config === "object" ? data.config : {};
+    renderMemoryConfig();
+    return data;
+  }
+
+  async function loadSummarizationConfig() {
+    const data = await request("/api/admin/summarization");
+    state.summarizationConfig = data?.config && typeof data.config === "object" ? data.config : {};
+    renderSummarizationConfig();
+    return data;
+  }
+
+  async function loadConfigHealth() {
+    if (el.configHealthMessage) el.configHealthMessage.textContent = "";
+    const data = await request("/api/admin/config/health");
+    state.configHealth = data;
+    renderConfigHealth();
     return data;
   }
 
@@ -360,6 +471,7 @@
     const data = await request("/api/models");
     state.models = Array.isArray(data?.models) ? data.models : [];
     renderModels();
+    refreshAgentModelSelectors();
   }
 
   async function loadSkills() {
@@ -388,6 +500,153 @@
     state.feishu = data;
     renderFeishu();
     return data;
+  }
+
+  function modelOptions(selected, includeDefault = true) {
+    const options = [];
+    if (includeDefault) options.push(`<option value="">使用默认模型</option>`);
+    state.models.forEach((model) => {
+      const value = String(model.name || "");
+      options.push(`<option value="${escapeHtml(value)}"${value === selected ? " selected" : ""}>${escapeHtml(model.display_name || value)}</option>`);
+    });
+    if (selected && !state.models.some((model) => model.name === selected)) {
+      options.push(`<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected)}（当前配置）</option>`);
+    }
+    return options.join("");
+  }
+
+  function renderAgentConfig() {
+    renderTitleConfig();
+    renderSubagentsConfig();
+    renderMemoryConfig();
+    renderSummarizationConfig();
+  }
+
+  function refreshAgentModelSelectors() {
+    const fields = [
+      [el.titleModelName, state.titleConfig?.model_name],
+      [el.memoryModelName, state.memoryConfig?.model_name],
+      [el.summarizationModelName, state.summarizationConfig?.model_name],
+    ];
+    fields.forEach(([field, configured]) => {
+      if (!field) return;
+      const selected = field.value || configured || "";
+      field.innerHTML = modelOptions(selected);
+    });
+  }
+
+  function renderTitleConfig() {
+    const title = state.titleConfig;
+    if (title && el.titleEditForm) {
+      el.titleEnabled.checked = Boolean(title.enabled);
+      el.titleModelName.innerHTML = modelOptions(title.model_name || "");
+      el.titleMaxWords.value = title.max_words ?? 6;
+      el.titleMaxChars.value = title.max_chars ?? 60;
+      el.titlePromptTemplate.value = title.prompt_template || "";
+    }
+  }
+
+  function renderSubagentsConfig() {
+    const subagents = state.subagentsConfig;
+    if (subagents && el.subagentsEditForm) {
+      el.subagentsEnabled.checked = Boolean(subagents.enabled);
+      el.subagentsTimeout.value = subagents.timeout_seconds ?? 900;
+      el.subagentsMaxTurns.value = subagents.max_turns ?? "";
+      el.subagentsAgentsEditor.value = JSON.stringify(subagents.agents || {}, null, 2);
+      el.subagentsCustomEditor.value = JSON.stringify(subagents.custom_agents || {}, null, 2);
+    }
+  }
+
+  function renderMemoryConfig() {
+    const config = state.memoryConfig;
+    if (!config || !el.memoryEditForm) return;
+    el.memoryEnabled.checked = Boolean(config.enabled);
+    el.memoryInjectionEnabled.checked = Boolean(config.injection_enabled);
+    el.memoryModelName.innerHTML = modelOptions(config.model_name || "");
+    el.memoryDebounce.value = config.debounce_seconds ?? 30;
+    el.memoryMaxFacts.value = config.max_facts ?? 100;
+    el.memoryConfidence.value = config.fact_confidence_threshold ?? 0.7;
+    el.memoryMaxInjectionTokens.value = config.max_injection_tokens ?? 2000;
+    el.memoryStoragePath.value = config.storage_path || "";
+    el.memoryStorageClass.value = config.storage_class || "";
+  }
+
+  function renderSummarizationConfig() {
+    const config = state.summarizationConfig;
+    if (!config || !el.summarizationEditForm) return;
+    const keep = config.keep || { type: "messages", value: 20 };
+    el.summarizationEnabled.checked = Boolean(config.enabled);
+    el.summarizationModelName.innerHTML = modelOptions(config.model_name || "");
+    el.summarizationTrigger.value = JSON.stringify(config.trigger ?? null, null, 2);
+    el.summarizationKeepType.value = keep.type || "messages";
+    el.summarizationKeepValue.value = keep.value ?? 20;
+    el.summarizationTrimTokens.value = config.trim_tokens_to_summarize ?? "";
+    el.summarizationSkillCount.value = config.preserve_recent_skill_count ?? 5;
+    el.summarizationSkillTokens.value = config.preserve_recent_skill_tokens ?? 25000;
+    el.summarizationSkillTokensPerSkill.value = config.preserve_recent_skill_tokens_per_skill ?? 5000;
+    el.summarizationSkillTools.value = Array.isArray(config.skill_file_read_tool_names)
+      ? config.skill_file_read_tool_names.join(",")
+      : "";
+    el.summarizationPrompt.value = config.summary_prompt || "";
+  }
+
+  function renderConfigHealth() {
+    if (!el.configHealthDetails || !el.configHealthWarnings) return;
+    const health = state.configHealth;
+    if (!health) {
+      el.configHealthDetails.innerHTML = `<div><span>状态</span><strong>未检查</strong></div>`;
+      el.configHealthWarnings.innerHTML = "";
+      return;
+    }
+    const statusLabels = { ok: "正常", warning: "有警告", error: "配置错误" };
+    const rows = [
+      ["状态", statusLabels[health.status] || health.status],
+      ["配置可解析", health.valid ? "是" : "否"],
+      ["配置版本", `${health.current_version} / ${health.latest_version}`],
+      ["文件可写", health.writable ? "是" : "否"],
+      ["缺失模块", health.missing_sections?.length ? health.missing_sections.join(", ") : "无"],
+      ["未知模块", health.unknown_sections?.length ? health.unknown_sections.join(", ") : "无"],
+      ["明文凭据", `${health.literal_secrets?.count || 0} 项`],
+    ];
+    el.configHealthDetails.innerHTML = rows
+      .map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`)
+      .join("");
+    const warnings = Array.isArray(health.warnings) ? health.warnings : [];
+    const errors = Array.isArray(health.validation_errors) ? health.validation_errors : [];
+    el.configHealthWarnings.innerHTML = [
+      ...errors.map((error) => ({ severity: "error", path: error.path, message: error.message })),
+      ...warnings,
+    ]
+      .map((item) => {
+        const label = item.severity === "error" ? "错误" : item.severity === "warning" ? "警告" : "提示";
+        const path = item.path ? `<code>${escapeHtml(item.path)}</code>` : "";
+        return `<div class="health-alert ${escapeHtml(item.severity || "info")}"><strong>${label}</strong>${path}<span>${escapeHtml(item.message)}</span></div>`;
+      })
+      .join("");
+    el.configHealthMessage.textContent = warnings.length || errors.length ? "检查完成，请评估以上提示。" : "检查完成，未发现配置问题。";
+  }
+
+  function renderAgentSystemSummary() {
+    if (!el.agentSystemSummary) return;
+    const summary = state.adminConfig?.system_summary || {};
+    const sandbox = summary.sandbox || {};
+    const bridge = summary.stream_bridge || {};
+    const acpAgents = Array.isArray(summary.acp_agents) ? summary.acp_agents : [];
+    const tools = Array.isArray(summary.tools) ? summary.tools : [];
+    const riskyTools = tools.filter((tool) => ["bash", "file:write"].includes(tool.group)).length;
+    const autoApproved = acpAgents.filter((agent) => agent.auto_approve_permissions).length;
+    const rows = [
+      ["Sandbox", sandbox.use || "未配置"],
+      ["Sandbox 镜像", sandbox.image || "默认"],
+      ["挂载数量", sandbox.mounts_count ?? 0],
+      ["Stream Bridge", bridge.type || "memory"],
+      ["Redis", bridge.redis_configured ? "已配置" : "未配置"],
+      ["ACP Agents", `${acpAgents.length} 个；自动批准权限 ${autoApproved} 个`],
+      ["内置 Tools", `${tools.length} 个；写入/执行类 ${riskyTools} 个`],
+    ];
+    el.agentSystemSummary.innerHTML = rows
+      .map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`)
+      .join("");
   }
 
   function renderOverview() {
@@ -440,6 +699,9 @@
       ["Plan mode", formatConfigValue(api.plan_mode)],
       ["并发子任务", formatConfigValue(api.max_concurrent_subagents)],
       ["请求超时", `${formatConfigValue(api.chat_request_timeout)} 秒`],
+      ["Scheduler", formatConfigValue(api.scheduler_enabled)],
+      ["Scheduler 时区", formatConfigValue(api.scheduler_timezone)],
+      ["Scheduler 轮询", `${formatConfigValue(api.scheduler_poll_interval_seconds)} 秒`],
       ["数据目录", config.paths?.data_dir || api.data_dir || "--"],
       ["Skills", config.paths?.skills_root || "--"],
       ["Extensions", config.paths?.extensions_config || "--"],
@@ -469,6 +731,9 @@
     el.runtimeThinking.checked = Boolean(api.thinking_enabled);
     el.runtimeSubagent.checked = Boolean(api.subagent_enabled);
     el.runtimePlanMode.checked = Boolean(api.plan_mode);
+    el.runtimeSchedulerEnabled.checked = Boolean(api.scheduler_enabled);
+    el.runtimeSchedulerPoll.value = api.scheduler_poll_interval_seconds ?? "";
+    el.runtimeSchedulerTimezone.value = api.scheduler_timezone || "";
   }
 
   function renderFeishu() {
@@ -541,15 +806,18 @@
     el.modelsTableBody.innerHTML = state.models
       .map((model) => {
         const name = escapeHtml(model.name);
+        const isDefault = state.adminConfig?.default_model === model.name;
         return `
           <tr>
-            <td class="mono">${name}</td>
+            <td class="mono">${name} ${isDefault ? badge("默认", "ok") : ""}</td>
             <td>${escapeHtml(model.display_name || model.name)}</td>
             <td>${badge(model.supports_thinking ? "支持" : "不支持", model.supports_thinking ? "ok" : "neutral")}</td>
             <td>${badge(model.supports_vision ? "支持" : "不支持", model.supports_vision ? "ok" : "neutral")}</td>
             <td>
               <div class="row-actions">
                 <button class="secondary-button" data-model-action="edit" data-model-name="${name}" type="button">编辑</button>
+                ${isDefault ? "" : `<button class="ghost-button" data-model-action="default" data-model-name="${name}" type="button">设为默认</button>`}
+                <button class="danger-button" data-model-action="delete" data-model-name="${name}" type="button">删除</button>
               </div>
             </td>
           </tr>
@@ -748,12 +1016,15 @@
       thinking_enabled: el.runtimeThinking.checked,
       subagent_enabled: el.runtimeSubagent.checked,
       plan_mode: el.runtimePlanMode.checked,
+      scheduler_enabled: el.runtimeSchedulerEnabled.checked,
+      scheduler_timezone: el.runtimeSchedulerTimezone.value.trim() || "Asia/Shanghai",
       reload: true,
     };
     addNumberField(body, "max_concurrent_subagents", el.runtimeMaxSubagents.value);
     addNumberField(body, "chat_request_timeout", el.runtimeChatTimeout.value);
     addNumberField(body, "max_upload_size_mb", el.runtimeMaxUploadSize.value);
     addNumberField(body, "max_uploads_per_request", el.runtimeMaxUploads.value);
+    addNumberField(body, "scheduler_poll_interval_seconds", el.runtimeSchedulerPoll.value);
     setBusy(el.saveRuntimeButton, true, "保存中");
     try {
       const data = await request("/api/admin/runtime", { method: "PATCH", body });
@@ -776,6 +1047,206 @@
     if (!trimmed) return;
     const number = Number(trimmed);
     if (Number.isFinite(number)) target[key] = number;
+  }
+
+  async function saveTitleConfig() {
+    el.titleMessage.textContent = "";
+    const config = {
+      enabled: el.titleEnabled.checked,
+      model_name: el.titleModelName.value || null,
+      max_words: Number(el.titleMaxWords.value || 6),
+      max_chars: Number(el.titleMaxChars.value || 60),
+      prompt_template: el.titlePromptTemplate.value,
+    };
+    setBusy(el.saveTitleButton, true, "保存中");
+    try {
+      const data = await request("/api/admin/title", {
+        method: "PUT",
+        body: { config, reload: true },
+        timeoutMs: 20000,
+      });
+      state.titleConfig = data.config;
+      renderTitleConfig();
+      const active = data.reload?.active_threads ? `；当前活动线程 ${data.reload.active_threads} 个保持原状态` : "";
+      el.titleMessage.textContent = `Title 配置已保存${active}。`;
+      showToast("Title 配置已保存。");
+    } catch (error) {
+      el.titleMessage.textContent = `保存失败：${error.message}`;
+    } finally {
+      setBusy(el.saveTitleButton, false);
+    }
+  }
+
+  async function saveSubagentsConfig() {
+    el.subagentsMessage.textContent = "";
+    let agents;
+    let customAgents;
+    try {
+      agents = parseJsonObject(el.subagentsAgentsEditor.value, "agents");
+      customAgents = parseJsonObject(el.subagentsCustomEditor.value, "custom_agents");
+    } catch (error) {
+      el.subagentsMessage.textContent = error.message;
+      return;
+    }
+    const maxTurns = String(el.subagentsMaxTurns.value || "").trim();
+    const config = {
+      enabled: el.subagentsEnabled.checked,
+      timeout_seconds: Number(el.subagentsTimeout.value || 900),
+      max_turns: maxTurns ? Number(maxTurns) : null,
+      agents,
+      custom_agents: customAgents,
+    };
+    setBusy(el.saveSubagentsButton, true, "保存中");
+    try {
+      const data = await request("/api/admin/subagents", {
+        method: "PUT",
+        body: { config, reload: true },
+        timeoutMs: 20000,
+      });
+      state.subagentsConfig = data.config;
+      renderSubagentsConfig();
+      const active = data.reload?.active_threads ? `；当前活动线程 ${data.reload.active_threads} 个保持原状态` : "";
+      el.subagentsMessage.textContent = `Subagents 配置已保存${active}。`;
+      showToast("Subagents 配置已保存。");
+    } catch (error) {
+      el.subagentsMessage.textContent = `保存失败：${error.message}`;
+    } finally {
+      setBusy(el.saveSubagentsButton, false);
+    }
+  }
+
+  async function saveMemoryConfig() {
+    el.memoryMessage.textContent = "";
+    if (!el.memoryEditForm.checkValidity()) {
+      el.memoryEditForm.reportValidity();
+      el.memoryMessage.textContent = "请修正超出允许范围的 Memory 配置。";
+      return;
+    }
+    const storageClass = el.memoryStorageClass.value.trim();
+    if (!storageClass) {
+      el.memoryMessage.textContent = "storage_class 不能为空。";
+      el.memoryStorageClass.focus();
+      return;
+    }
+    const config = {
+      enabled: el.memoryEnabled.checked,
+      injection_enabled: el.memoryInjectionEnabled.checked,
+      model_name: el.memoryModelName.value || null,
+      debounce_seconds: Number(el.memoryDebounce.value || 30),
+      max_facts: Number(el.memoryMaxFacts.value || 100),
+      fact_confidence_threshold: Number(el.memoryConfidence.value || 0.7),
+      max_injection_tokens: Number(el.memoryMaxInjectionTokens.value || 2000),
+      storage_path: el.memoryStoragePath.value.trim(),
+      storage_class: storageClass,
+    };
+    setBusy(el.saveMemoryButton, true, "保存中");
+    try {
+      const data = await request("/api/admin/memory", {
+        method: "PUT",
+        body: { config, reload: true },
+        timeoutMs: 20000,
+      });
+      state.memoryConfig = data.config;
+      renderMemoryConfig();
+      const active = data.reload?.active_threads ? `；当前活动线程 ${data.reload.active_threads} 个保持原状态` : "";
+      el.memoryMessage.textContent = `Memory 配置已保存${active}。`;
+      await loadConfigHealth();
+      showToast("Memory 配置已保存。");
+    } catch (error) {
+      el.memoryMessage.textContent = `保存失败：${error.message}`;
+    } finally {
+      setBusy(el.saveMemoryButton, false);
+    }
+  }
+
+  function parseSummarizationTrigger() {
+    const raw = el.summarizationTrigger.value.trim();
+    if (!raw) return null;
+    let trigger;
+    try {
+      trigger = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`trigger 不是有效 JSON：${error.message}`);
+    }
+    if (trigger !== null && (typeof trigger !== "object" || Array.isArray(trigger) && trigger.some((item) => !item || typeof item !== "object" || Array.isArray(item)))) {
+      throw new Error("trigger 必须是 JSON object、object 数组或 null。");
+    }
+    return trigger;
+  }
+
+  function summarizationKeepConfig() {
+    const type = el.summarizationKeepType.value;
+    const raw = el.summarizationKeepValue.value.trim();
+    const value = Number(raw);
+    if (!raw || !Number.isFinite(value)) {
+      throw new Error("keep.value 必须是数字。");
+    }
+    if (type === "fraction") {
+      if (value <= 0 || value > 1) throw new Error("fraction 类型的 keep.value 必须大于 0 且不超过 1。");
+    } else if (value < 1 || !Number.isInteger(value)) {
+      throw new Error(`${type} 类型的 keep.value 必须是正整数。`);
+    }
+    return { type, value };
+  }
+
+  async function saveSummarizationConfig() {
+    el.summarizationMessage.textContent = "";
+    if (!el.summarizationEditForm.checkValidity()) {
+      el.summarizationEditForm.reportValidity();
+      el.summarizationMessage.textContent = "请修正超出允许范围的 Summarization 配置。";
+      return;
+    }
+    let trigger;
+    let keep;
+    try {
+      trigger = parseSummarizationTrigger();
+      keep = summarizationKeepConfig();
+    } catch (error) {
+      el.summarizationMessage.textContent = error.message;
+      return;
+    }
+    const trimTokens = el.summarizationTrimTokens.value.trim();
+    const config = {
+      enabled: el.summarizationEnabled.checked,
+      model_name: el.summarizationModelName.value || null,
+      trigger,
+      keep,
+      trim_tokens_to_summarize: trimTokens ? Number(trimTokens) : null,
+      preserve_recent_skill_count: Number(el.summarizationSkillCount.value || 0),
+      preserve_recent_skill_tokens: Number(el.summarizationSkillTokens.value || 0),
+      preserve_recent_skill_tokens_per_skill: Number(el.summarizationSkillTokensPerSkill.value || 0),
+      skill_file_read_tool_names: [...new Set(el.summarizationSkillTools.value.split(",").map((item) => item.trim()).filter(Boolean))],
+      summary_prompt: el.summarizationPrompt.value.trim() || null,
+    };
+    setBusy(el.saveSummarizationButton, true, "保存中");
+    try {
+      const data = await request("/api/admin/summarization", {
+        method: "PUT",
+        body: { config, reload: true },
+        timeoutMs: 20000,
+      });
+      state.summarizationConfig = data.config;
+      renderSummarizationConfig();
+      const active = data.reload?.active_threads ? `；当前活动线程 ${data.reload.active_threads} 个保持原状态` : "";
+      el.summarizationMessage.textContent = `Summarization 配置已保存${active}。`;
+      await loadConfigHealth();
+      showToast("Summarization 配置已保存。");
+    } catch (error) {
+      el.summarizationMessage.textContent = `保存失败：${error.message}`;
+    } finally {
+      setBusy(el.saveSummarizationButton, false);
+    }
+  }
+
+  async function refreshConfigHealth() {
+    setBusy(el.refreshConfigHealthButton, true, "检查中");
+    try {
+      await loadConfigHealth();
+    } catch (error) {
+      el.configHealthMessage.textContent = `检查失败：${error.message}`;
+    } finally {
+      setBusy(el.refreshConfigHealthButton, false);
+    }
   }
 
   async function setMcpEnabled(enabled) {
@@ -885,7 +1356,6 @@
     const use = modelUseValue() || (el.draftUse.value === customModelUseValue ? "package.module:ClassName" : defaultModelUse);
     const model = el.draftModelId.value.trim() || name;
     const baseUrl = el.draftBaseUrl.value.trim();
-    const editingModel = getEditableModel(state.editingModelName);
     const apiKey = el.draftApiKey.value.trim();
     const lines = [
       `- name: ${yamlValue(name)}`,
@@ -897,16 +1367,18 @@
       lines.push(`  api_key: ${yamlValue(apiKey)}`);
     } else if (state.editingModelName) {
       lines.push(
-        isConfiguredSecret(editingModel?.api_key)
-          ? "  # api_key 留空保存时会保留现有值"
-          : "  # api_key 未配置；填写后会写入",
+        el.draftClearApiKey.checked
+          ? "  # api_key 将被明确清除"
+          : "  # api_key 未提交，由后端保留现有值",
       );
     } else {
-      lines.push(`  api_key: ${yamlValue("$MODEL_API_KEY")}`);
+      lines.push("  # api_key 未配置；如 Provider 需要凭据请填写");
     }
     if (baseUrl) lines.push(`  base_url: ${yamlValue(baseUrl)}`);
     lines.push(`  supports_thinking: ${el.draftThinking.checked ? "true" : "false"}`);
+    lines.push(`  supports_reasoning_effort: ${el.draftReasoningEffort.checked ? "true" : "false"}`);
     lines.push(`  supports_vision: ${el.draftVision.checked ? "true" : "false"}`);
+    if (el.draftModelAdvanced.value.trim()) lines.push("  # 高级参数将按 JSON 内容合并");
     el.modelYamlPreview.textContent = lines.join("\n");
   }
 
@@ -917,10 +1389,6 @@
 
   function isConfiguredSecret(value) {
     return Boolean(value && typeof value === "object" && value.configured !== false && "redacted" in value);
-  }
-
-  function hasConfigField(config, field) {
-    return Boolean(config && Object.prototype.hasOwnProperty.call(config, field));
   }
 
   function secretInputValue(value) {
@@ -935,6 +1403,11 @@
     state.editingModelName = null;
     el.modelDraftForm.reset();
     setModelUse(defaultModelUse);
+    el.draftClearApiKey.checked = false;
+    el.draftApiKey.disabled = false;
+    el.draftClearApiKeyRow.classList.add("hidden");
+    el.draftSetDefault.checked = false;
+    el.draftModelAdvanced.value = "{}";
     el.draftApiKey.placeholder = "$DASHSCOPE_API_KEY；编辑时留空保留原值";
     el.modelDraftMessage.textContent = "";
     updateModelDraft();
@@ -956,9 +1429,15 @@
     setModelUse(model.use || defaultModelUse);
     el.draftModelId.value = model.model || model.name || "";
     el.draftBaseUrl.value = model.base_url || "";
-    el.draftApiKey.value = secretInputValue(model.api_key);
+    el.draftApiKey.value = "";
+    el.draftApiKey.disabled = false;
+    el.draftClearApiKey.checked = false;
+    el.draftClearApiKeyRow.classList.remove("hidden");
     el.draftThinking.checked = Boolean(model.supports_thinking);
+    el.draftReasoningEffort.checked = Boolean(model.supports_reasoning_effort);
     el.draftVision.checked = Boolean(model.supports_vision);
+    el.draftSetDefault.checked = state.adminConfig?.default_model === model.name;
+    el.draftModelAdvanced.value = JSON.stringify(modelAdvancedConfig(model), null, 2);
     el.draftApiKey.placeholder = isConfiguredSecret(model.api_key) ? "留空保留现有 api_key" : "$DASHSCOPE_API_KEY";
     el.modelDraftMessage.textContent = `正在编辑 ${model.name}。api_key 留空会保留原值。`;
     el.modelDraftPanel.classList.remove("hidden");
@@ -966,7 +1445,37 @@
     el.modelDraftPanel.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  function modelDraftPayload(existingModel) {
+  const basicModelFields = new Set([
+    "name",
+    "display_name",
+    "use",
+    "model",
+    "api_key",
+    "base_url",
+    "supports_thinking",
+    "supports_reasoning_effort",
+    "supports_vision",
+  ]);
+
+  function modelAdvancedConfig(model) {
+    if (!model || typeof model !== "object") return {};
+    return Object.fromEntries(Object.entries(model).filter(([key]) => !basicModelFields.has(key)));
+  }
+
+  function parseJsonObject(value, label) {
+    let parsed;
+    try {
+      parsed = JSON.parse(String(value || "{}").trim() || "{}");
+    } catch (error) {
+      throw new Error(`${label} 不是有效 JSON：${error.message}`);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`${label} 必须是 JSON object。`);
+    }
+    return parsed;
+  }
+
+  function modelDraftPayload(editing) {
     const name = el.draftModelName.value.trim();
     if (!name) {
       throw new Error("name 不能为空。");
@@ -979,44 +1488,22 @@
     const model = el.draftModelId.value.trim() || name;
     const baseUrl = el.draftBaseUrl.value.trim();
     const apiKey = el.draftApiKey.value.trim();
+    const advanced = parseJsonObject(el.draftModelAdvanced.value, "高级参数");
     const payload = {
+      ...advanced,
       name,
       display_name: displayName,
       use,
       model,
       supports_thinking: el.draftThinking.checked,
+      supports_reasoning_effort: el.draftReasoningEffort.checked,
       supports_vision: el.draftVision.checked,
     };
-    if (baseUrl) payload.base_url = baseUrl;
+    if (baseUrl || editing) payload.base_url = baseUrl || null;
     if (apiKey) {
       payload.api_key = apiKey;
-    } else if (hasConfigField(existingModel, "api_key")) {
-      payload.api_key = existingModel.api_key;
-    } else if (!existingModel) {
-      payload.api_key = "$MODEL_API_KEY";
     }
     return payload;
-  }
-
-  function summarizeModel(model) {
-    return {
-      name: model?.name || "",
-      display_name: model?.display_name || model?.name || "",
-      supports_thinking: Boolean(model?.supports_thinking),
-      supports_vision: Boolean(model?.supports_vision),
-    };
-  }
-
-  function applySavedModelState(models, defaultModel, responseModels) {
-    state.adminConfig = {
-      ...(state.adminConfig || {}),
-      models,
-      default_model: defaultModel,
-    };
-    state.models = Array.isArray(responseModels) ? responseModels : models.map(summarizeModel);
-    renderRuntimeConfig();
-    renderModels();
-    renderOverview();
   }
 
   async function reloadModelsAfterSave(modelName, sequence) {
@@ -1043,45 +1530,34 @@
       await loadAdminConfig();
     }
 
-    const currentModels = Array.isArray(state.adminConfig?.models) ? [...state.adminConfig.models] : [];
-    const name = el.draftModelName.value.trim();
-    const originalName = state.editingModelName || name;
-    const index = currentModels.findIndex((model) => model && model.name === originalName);
+    const editing = Boolean(state.editingModelName);
     let payload;
     try {
-      payload = modelDraftPayload(index >= 0 ? currentModels[index] : null);
+      payload = modelDraftPayload(editing);
     } catch (error) {
       el.modelDraftMessage.textContent = error.message;
       return;
     }
 
-    if (index >= 0) {
-      currentModels[index] = { ...currentModels[index], ...payload };
-    } else {
-      currentModels.push(payload);
-    }
-
-    const modelNames = currentModels.map((model) => model?.name).filter(Boolean);
-    let defaultModel = state.adminConfig?.default_model || currentModels[0]?.name || payload.name;
-    if (state.editingModelName && defaultModel === state.editingModelName) {
-      defaultModel = payload.name;
-    } else if (!modelNames.includes(defaultModel)) {
-      defaultModel = currentModels[0]?.name || payload.name;
-    }
     const reloadSequence = state.modelReloadSequence + 1;
     state.modelReloadSequence = reloadSequence;
     setBusy(el.saveModelButton, true, "保存中");
     try {
-      const data = await request("/api/admin/models", {
-        method: "PUT",
-        body: {
-          models: currentModels,
-          default_model: defaultModel,
-          reload: false,
-        },
+      const path = editing ? `/api/admin/models/${encodeURIComponent(state.editingModelName)}` : "/api/admin/models";
+      await request(path, {
+        method: editing ? "PATCH" : "POST",
+        body: editing
+          ? {
+              changes: payload,
+              clear_api_key: el.draftClearApiKey.checked,
+              set_default: el.draftSetDefault.checked,
+              reload: false,
+            }
+          : { model: payload, set_default: el.draftSetDefault.checked, reload: false },
+        timeoutMs: 15000,
       });
-      applySavedModelState(currentModels, defaultModel, data?.models);
       state.editingModelName = payload.name;
+      await Promise.all([loadAdminConfig(), loadModels()]);
       el.modelDraftMessage.textContent = `${payload.name} 已保存，正在重新加载配置。`;
       showToast("模型配置已保存。");
       reloadModelsAfterSave(payload.name, reloadSequence);
@@ -1089,6 +1565,37 @@
       el.modelDraftMessage.textContent = `保存失败：${error.message}`;
     } finally {
       setBusy(el.saveModelButton, false);
+    }
+  }
+
+  async function setDefaultModel(name) {
+    try {
+      await request(`/api/admin/models/${encodeURIComponent(name)}`, {
+        method: "PATCH",
+        body: { changes: {}, set_default: true, reload: false },
+        timeoutMs: 15000,
+      });
+      await Promise.all([loadAdminConfig(), loadModels()]);
+      showToast(`${name} 已设为默认模型。`);
+      reloadModelsAfterSave(name, ++state.modelReloadSequence);
+    } catch (error) {
+      showToast(`设置默认模型失败：${error.message}`);
+    }
+  }
+
+  async function deleteModel(name) {
+    if (!window.confirm(`确定删除模型 ${name}？该操作不会删除 Provider 侧的模型。`)) return;
+    try {
+      await request(`/api/admin/models/${encodeURIComponent(name)}?reload=false`, {
+        method: "DELETE",
+        timeoutMs: 15000,
+      });
+      if (state.editingModelName === name) resetModelDraft();
+      await Promise.all([loadAdminConfig(), loadModels()]);
+      showToast(`${name} 已删除。`);
+      reloadModelsAfterSave(name, ++state.modelReloadSequence);
+    } catch (error) {
+      showToast(`删除模型失败：${error.message}`);
     }
   }
 
@@ -1289,6 +1796,11 @@
     el.testMcpButton.addEventListener("click", testMcpServer);
     el.reloadConfigButton.addEventListener("click", reloadConfig);
     el.saveRuntimeButton.addEventListener("click", saveRuntimeConfig);
+    el.saveTitleButton.addEventListener("click", saveTitleConfig);
+    el.saveSubagentsButton.addEventListener("click", saveSubagentsConfig);
+    el.saveMemoryButton.addEventListener("click", saveMemoryConfig);
+    el.saveSummarizationButton.addEventListener("click", saveSummarizationConfig);
+    el.refreshConfigHealthButton.addEventListener("click", refreshConfigHealth);
     el.saveFeishuButton.addEventListener("click", saveFeishuConfig);
     el.restartFeishuButton.addEventListener("click", restartFeishuChannel);
 
@@ -1309,6 +1821,10 @@
         openModelEditor(button.dataset.modelName).catch((error) => {
           showToast(`读取模型配置失败：${error.message}`);
         });
+      } else if (button.dataset.modelAction === "default") {
+        setDefaultModel(button.dataset.modelName);
+      } else if (button.dataset.modelAction === "delete") {
+        deleteModel(button.dataset.modelName);
       }
     });
 
@@ -1318,6 +1834,11 @@
     });
     el.closeModelDraftButton.addEventListener("click", () => el.modelDraftPanel.classList.add("hidden"));
     el.modelDraftForm.addEventListener("input", updateModelDraft);
+    el.draftClearApiKey.addEventListener("change", () => {
+      el.draftApiKey.disabled = el.draftClearApiKey.checked;
+      if (el.draftClearApiKey.checked) el.draftApiKey.value = "";
+      updateModelDraft();
+    });
     el.draftUse.addEventListener("change", () => {
       updateModelUseCustomVisibility();
       updateModelDraft();

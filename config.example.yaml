@@ -267,7 +267,7 @@ guardrails:
 
 title:
   enabled: true
-  model: qwen3.6-plus
+  model_name: qwen3.6-plus
 
 summarization:
   enabled: false
