@@ -4,6 +4,7 @@ import logging
 import atexit
 import sqlite3
 import threading
+from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,14 @@ class ClientManager:
         self.run_manager = RunManager()
         self._stream_bridge_cm = None
         self.stream_bridge = MemoryStreamBridge(queue_maxsize=512)
+        self._reconnect_grace_seconds = 600
+        self._completed_replay_seconds = 1800
+        self._run_metadata_retention_seconds = 3600
+        self._stream_subscribers: dict[str, int] = {}
+        self._disconnect_expiry_handles: dict[str, asyncio.TimerHandle] = {}
+        self._completed_expiry_handles: dict[str, asyncio.TimerHandle] = {}
+        self._metadata_cleanup_handles: dict[str, asyncio.TimerHandle] = {}
+        self._lifecycle_tasks: set[asyncio.Task] = set()
         self.scheduler_service = None
         self.feishu_channel = None
 
@@ -150,6 +159,13 @@ class ClientManager:
         if self._stream_bridge_cm is None:
             self._stream_bridge_cm = make_stream_bridge(config.stream_bridge)
             self.stream_bridge = await self._stream_bridge_cm.__aenter__()
+        if config.stream_bridge is not None:
+            self._reconnect_grace_seconds = config.stream_bridge.reconnect_grace_seconds
+            self._completed_replay_seconds = config.stream_bridge.completed_replay_seconds
+            self._run_metadata_retention_seconds = max(
+                config.stream_bridge.run_metadata_retention_seconds,
+                self._completed_replay_seconds,
+            )
 
         self._assert_storage_ready()
 
@@ -549,8 +565,7 @@ class ClientManager:
             self.mark_thread_done(thread_id)
             try:
                 await self.stream_bridge.publish_end(run_id)
-                asyncio.create_task(self.stream_bridge.cleanup(run_id, delay=300))
-                asyncio.create_task(self.run_manager.cleanup(run_id, delay=300))
+                self._schedule_completed_run_retention(run_id)
             except RuntimeError as exc:
                 if "Event loop is closed" not in str(exc):
                     raise
@@ -559,6 +574,107 @@ class ClientManager:
     async def cancel_run(self, run_id: str, *, action: str = "interrupt") -> bool:
         """Cancel an in-flight run."""
         return await self.run_manager.cancel(run_id, action=action)
+
+    async def attach_run_stream(self, run_id: str) -> None:
+        """Register an SSE subscriber and cancel a pending disconnect expiry."""
+        self._stream_subscribers[run_id] = self._stream_subscribers.get(run_id, 0) + 1
+        handle = self._disconnect_expiry_handles.pop(run_id, None)
+        if handle is not None:
+            handle.cancel()
+
+    async def detach_run_stream(self, run_id: str) -> None:
+        """Detach an SSE subscriber and start the reconnect grace window."""
+        remaining = max(0, self._stream_subscribers.get(run_id, 0) - 1)
+        if remaining:
+            self._stream_subscribers[run_id] = remaining
+            return
+        self._stream_subscribers.pop(run_id, None)
+
+        record = self.run_manager.get(run_id)
+        if record is None or record.on_disconnect != DisconnectMode.continue_:
+            return
+        if record.status not in {RunStatus.pending, RunStatus.running}:
+            return
+
+        previous = self._disconnect_expiry_handles.pop(run_id, None)
+        if previous is not None:
+            previous.cancel()
+        loop = asyncio.get_running_loop()
+        self._disconnect_expiry_handles[run_id] = loop.call_later(
+            self._reconnect_grace_seconds,
+            self._on_disconnect_grace_elapsed,
+            run_id,
+        )
+
+    def _on_disconnect_grace_elapsed(self, run_id: str) -> None:
+        self._disconnect_expiry_handles.pop(run_id, None)
+        if self._stream_subscribers.get(run_id, 0) > 0:
+            return
+        record = self.run_manager.get(run_id)
+        if record is None or record.status not in {RunStatus.pending, RunStatus.running}:
+            return
+        self._spawn_lifecycle_task(self._expire_run_replay(run_id, reason="disconnect_timeout"))
+
+    async def _expire_run_replay(self, run_id: str, *, reason: str) -> None:
+        record = self.run_manager.get(run_id)
+        if record is not None:
+            record.metadata["replay_expired"] = True
+            record.metadata["replay_expired_reason"] = reason
+        await self.stream_bridge.expire(run_id)
+        logger.info("Run replay expired: run=%s reason=%s", run_id, reason)
+
+    def _schedule_completed_run_retention(self, run_id: str) -> None:
+        disconnect_handle = self._disconnect_expiry_handles.pop(run_id, None)
+        if disconnect_handle is not None:
+            disconnect_handle.cancel()
+
+        completed_handle = self._completed_expiry_handles.pop(run_id, None)
+        if completed_handle is not None:
+            completed_handle.cancel()
+        metadata_handle = self._metadata_cleanup_handles.pop(run_id, None)
+        if metadata_handle is not None:
+            metadata_handle.cancel()
+
+        loop = asyncio.get_running_loop()
+        self._completed_expiry_handles[run_id] = loop.call_later(
+            self._completed_replay_seconds,
+            self._on_completed_replay_elapsed,
+            run_id,
+        )
+        self._metadata_cleanup_handles[run_id] = loop.call_later(
+            self._run_metadata_retention_seconds,
+            self._on_run_metadata_elapsed,
+            run_id,
+        )
+
+    def _on_completed_replay_elapsed(self, run_id: str) -> None:
+        self._completed_expiry_handles.pop(run_id, None)
+        self._spawn_lifecycle_task(self._expire_run_replay(run_id, reason="completed_retention"))
+
+    def _on_run_metadata_elapsed(self, run_id: str) -> None:
+        self._metadata_cleanup_handles.pop(run_id, None)
+        self._spawn_lifecycle_task(self._cleanup_run_lifecycle(run_id))
+
+    async def _cleanup_run_lifecycle(self, run_id: str) -> None:
+        await self.stream_bridge.cleanup(run_id)
+        await self.run_manager.cleanup(run_id, delay=0)
+        self._stream_subscribers.pop(run_id, None)
+
+    def _spawn_lifecycle_task(self, coroutine: Coroutine[Any, Any, Any]) -> None:
+        task = asyncio.create_task(coroutine)
+        self._lifecycle_tasks.add(task)
+        task.add_done_callback(self._on_lifecycle_task_done)
+
+    def _on_lifecycle_task_done(self, task: asyncio.Task) -> None:
+        self._lifecycle_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "Run lifecycle task failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
 
     def mark_thread_running(self, thread_id: str):
         with self._thread_lock:
@@ -716,6 +832,20 @@ class ClientManager:
                 logger.warning("Error closing sync SQLite connection", exc_info=True)
             finally:
                 self._sync_sqlite_conn = None
+        for handles in (
+            self._disconnect_expiry_handles,
+            self._completed_expiry_handles,
+            self._metadata_cleanup_handles,
+        ):
+            for handle in handles.values():
+                handle.cancel()
+            handles.clear()
+        if self._lifecycle_tasks:
+            for task in self._lifecycle_tasks:
+                task.cancel()
+            await asyncio.gather(*self._lifecycle_tasks, return_exceptions=True)
+            self._lifecycle_tasks.clear()
+
         if self._stream_bridge_cm is not None:
             try:
                 await self._stream_bridge_cm.__aexit__(None, None, None)
@@ -726,6 +856,7 @@ class ClientManager:
                 self.stream_bridge = MemoryStreamBridge(queue_maxsize=512)
         self._checkpointer = None
         self._running_threads.clear()
+        self._stream_subscribers.clear()
 
 
 def get_client_manager() -> ClientManager:

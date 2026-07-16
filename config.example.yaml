@@ -48,6 +48,12 @@ stream_bridge:
   redis_key_prefix: deerflow:stream
   redis_maxlen: 10000
   redis_retention_seconds: 3600
+  # Keep buffering while an active run has no connected client.
+  reconnect_grace_seconds: 600
+  # Keep completed events available for Last-Event-ID replay.
+  completed_replay_seconds: 1800
+  # Keep run status long enough to return REPLAY_EXPIRED instead of starting a duplicate run.
+  run_metadata_retention_seconds: 3600
 
 token_usage:
   enabled: false

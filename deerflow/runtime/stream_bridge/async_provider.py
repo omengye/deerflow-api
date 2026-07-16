@@ -57,7 +57,7 @@ async def make_stream_bridge(config=None) -> AsyncIterator[StreamBridge]:
         )
         await bridge.ping()
         logger.info(
-            "Stream bridge initialised: redis (key_prefix=%s maxlen=%d retention_seconds=%d)",
+            "Stream bridge initialised: redis (key_prefix=%s maxlen=%d safety_ttl_seconds=%d)",
             config.redis_key_prefix,
             config.redis_maxlen,
             config.redis_retention_seconds,

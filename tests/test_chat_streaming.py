@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Iterable, Iterator
 from typing import Any, cast
 from unittest.mock import patch
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from app.dependencies import ClientManager
 from app.routers import chat
@@ -334,6 +334,55 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[2]["delta"], "second")
         self.assertIsNotNone(parsed[2][0])
         self.assertNotEqual(parsed[2][0], first_entry.id)
+
+    async def test_chat_agui_returns_replay_expired_for_retained_run_metadata(self) -> None:
+        fake_manager = _FakeManager(_FakeClient())
+        record = await fake_manager.run_manager.create_or_reject(
+            "thread-1",
+            run_id="run-1",
+            on_disconnect=DisconnectMode.continue_,
+            metadata={"entrypoint": "chat_agui", "replay_expired": True},
+        )
+        await fake_manager.run_manager.set_status(record.run_id, RunStatus.success)
+
+        original_get_client_manager = chat.get_client_manager
+        chat.get_client_manager = lambda: fake_manager
+        try:
+            with self.assertRaises(HTTPException) as raised:
+                await chat.chat_agui(_fake_request({"last-event-id": "1-0"}), self._agui_request())
+        finally:
+            chat.get_client_manager = original_get_client_manager
+
+        self.assertEqual(raised.exception.status_code, 410)
+        self.assertEqual(raised.exception.detail["code"], "REPLAY_EXPIRED")
+
+    async def test_chat_agui_reconnect_disconnect_uses_original_continue_policy(self) -> None:
+        fake_manager = _FakeManager(_FakeClient())
+        record = await fake_manager.run_manager.create_or_reject(
+            "thread-1",
+            run_id="run-1",
+            on_disconnect=DisconnectMode.continue_,
+            metadata={"entrypoint": "chat_agui"},
+        )
+        await fake_manager.run_manager.set_status(record.run_id, RunStatus.running)
+
+        async def cancelled_subscription(*_args: object, **_kwargs: object):
+            raise asyncio.CancelledError
+            yield  # pragma: no cover
+
+        fake_manager.stream_bridge.subscribe = cancelled_subscription  # type: ignore[method-assign]
+        original_get_client_manager = chat.get_client_manager
+        chat.get_client_manager = lambda: fake_manager
+        try:
+            response = await chat.chat_agui(_fake_request(), self._agui_request())
+            iterator = response.body_iterator
+            await anext(iterator)
+            with self.assertRaises(asyncio.CancelledError):
+                await anext(iterator)
+        finally:
+            chat.get_client_manager = original_get_client_manager
+
+        self.assertEqual(record.status, RunStatus.running)
 
     async def test_deerflow_client_astream_uses_agent_astream(self) -> None:
         class FakeAgent:

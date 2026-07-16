@@ -157,6 +157,17 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
     if record is not None:
         if record.thread_id != thread_id:
             raise HTTPException(status_code=409, detail=f"Run {run_id} belongs to a different thread")
+        if record.metadata.get("replay_expired"):
+            raise HTTPException(
+                status_code=410,
+                detail={
+                    "code": "REPLAY_EXPIRED",
+                    "message": f"Replay data for run {run_id} has expired",
+                    "run_id": run_id,
+                    "thread_id": thread_id,
+                    "status": record.status.value,
+                },
+            )
         kwargs = dict(record.kwargs)
     else:
         kwargs = requested_kwargs
@@ -183,6 +194,7 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
     agent_name: str = client.agent_name
 
     async def event_generator():
+        attached = False
         open_text_message_id: str | None = None
         # Maps tool_call_id → serialized args JSON already sent as delta.
         # Used to compute incremental deltas across streaming chunks.
@@ -211,6 +223,10 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
             )
 
         try:
+            attach = getattr(manager, "attach_run_stream", None)
+            if attach is not None:
+                await attach(record.run_id)
+                attached = True
             yield emit({"type": "RUN_STARTED", "threadId": thread_id, "runId": run_id, **({"parentRunId": req.parent_run_id} if req.parent_run_id else {})})
             async for entry in manager.stream_bridge.subscribe(record.run_id, last_event_id=last_event_id):
                 if entry is HEARTBEAT_SENTINEL:
@@ -318,7 +334,7 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
             else:
                 yield emit({"type": "RUN_FINISHED", "threadId": thread_id, "runId": run_id})
         except asyncio.CancelledError:
-            if (req.on_disconnect or "cancel") == "cancel":
+            if record.on_disconnect.value == "cancel":
                 await manager.cancel_run(record.run_id)
             raise
         except Exception:
@@ -335,6 +351,11 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
             for text_event in _close_subagent_text_messages(open_subagent_text_message_ids):
                 yield emit(text_event)
             yield emit({"type": "RUN_ERROR", "message": "Internal server error"})
+        finally:
+            if attached:
+                detach = getattr(manager, "detach_run_stream", None)
+                if detach is not None:
+                    await detach(record.run_id)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers=_SSE_RESPONSE_HEADERS)
 

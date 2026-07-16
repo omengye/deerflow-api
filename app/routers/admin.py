@@ -648,6 +648,9 @@ def _admin_config_response(raw_config: dict[str, Any], path: Path) -> dict[str, 
                 "redis_configured": bool(stream_bridge.get("redis_url")),
                 "redis_maxlen": stream_bridge.get("redis_maxlen"),
                 "redis_retention_seconds": stream_bridge.get("redis_retention_seconds"),
+                "reconnect_grace_seconds": stream_bridge.get("reconnect_grace_seconds"),
+                "completed_replay_seconds": stream_bridge.get("completed_replay_seconds"),
+                "run_metadata_retention_seconds": stream_bridge.get("run_metadata_retention_seconds"),
             },
             "acp_agents": [
                 {

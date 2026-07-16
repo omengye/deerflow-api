@@ -30,7 +30,22 @@ class StreamBridgeConfig(BaseModel):
     redis_retention_seconds: int = Field(
         default=3600,
         ge=0,
-        description="Minimum seconds to retain a completed Redis stream after cleanup is requested.",
+        description="Redis safety TTL refreshed while events are being written. Lifecycle retention is controlled by the replay settings below.",
+    )
+    reconnect_grace_seconds: int = Field(
+        default=600,
+        ge=0,
+        description="Seconds to keep buffering events after the last client disconnects from an active run.",
+    )
+    completed_replay_seconds: int = Field(
+        default=1800,
+        ge=0,
+        description="Seconds to retain a completed run's event stream for replay.",
+    )
+    run_metadata_retention_seconds: int = Field(
+        default=3600,
+        ge=0,
+        description="Seconds to retain run metadata after completion. Values shorter than completed_replay_seconds are extended at runtime.",
     )
     queue_maxsize: int = Field(
         default=256,

@@ -34,6 +34,7 @@ class RedisStreamBridge(StreamBridge):
         self._key_prefix = key_prefix.rstrip(":")
         self._maxlen = maxlen
         self._retention_seconds = retention_seconds
+        self._expired_runs: set[str] = set()
         self._owns_client = client is None
         if client is None:
             try:
@@ -74,6 +75,8 @@ class RedisStreamBridge(StreamBridge):
         )
 
     async def publish(self, run_id: str, event: str, data: Any) -> None:
+        if run_id in self._expired_runs:
+            return
         key = self._key(run_id)
         await self._xadd(
             key,
@@ -85,9 +88,15 @@ class RedisStreamBridge(StreamBridge):
         await self._expire(key)
 
     async def publish_end(self, run_id: str) -> None:
+        if run_id in self._expired_runs:
+            return
         key = self._key(run_id)
         await self._xadd(key, {"event": _END_EVENT, "data": "{}"})
         await self._expire(key)
+
+    async def expire(self, run_id: str) -> None:
+        self._expired_runs.add(run_id)
+        await self._redis.delete(self._key(run_id))
 
     async def subscribe(
         self,
@@ -97,6 +106,9 @@ class RedisStreamBridge(StreamBridge):
         heartbeat_interval: float = 15.0,
     ) -> AsyncIterator[StreamEvent]:
         key = self._key(run_id)
+        if run_id in self._expired_runs:
+            yield END_SENTINEL
+            return
         redis_id = last_event_id or "0-0"
         block_ms = max(1, int(heartbeat_interval * 1000))
 
@@ -125,12 +137,13 @@ class RedisStreamBridge(StreamBridge):
                     yield StreamEvent(id=entry_id, event=str(event), data=data)
 
     async def cleanup(self, run_id: str, *, delay: float = 0) -> None:
-        effective_delay = max(delay, float(self._retention_seconds))
-        if effective_delay > 0:
-            await asyncio.sleep(effective_delay)
+        if delay > 0:
+            await asyncio.sleep(delay)
         await self._redis.delete(self._key(run_id))
+        self._expired_runs.discard(run_id)
 
     async def close(self) -> None:
+        self._expired_runs.clear()
         if not self._owns_client:
             return
         close = getattr(self._redis, "aclose", None)

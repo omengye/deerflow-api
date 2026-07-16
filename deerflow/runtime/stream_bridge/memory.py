@@ -19,6 +19,7 @@ class _RunStream:
     events: list[StreamEvent] = field(default_factory=list)
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     ended: bool = False
+    expired: bool = False
     start_offset: int = 0
 
 
@@ -67,6 +68,8 @@ class MemoryStreamBridge(StreamBridge):
 
     async def publish(self, run_id: str, event: str, data: Any) -> None:
         stream = self._get_or_create_stream(run_id)
+        if stream.expired:
+            return
         entry = StreamEvent(id=self._next_id(run_id), event=event, data=data)
         async with stream.condition:
             stream.events.append(entry)
@@ -79,6 +82,17 @@ class MemoryStreamBridge(StreamBridge):
     async def publish_end(self, run_id: str) -> None:
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
+            if stream.expired:
+                return
+            stream.ended = True
+            stream.condition.notify_all()
+
+    async def expire(self, run_id: str) -> None:
+        stream = self._get_or_create_stream(run_id)
+        async with stream.condition:
+            stream.events.clear()
+            stream.start_offset = 0
+            stream.expired = True
             stream.ended = True
             stream.condition.notify_all()
 
@@ -91,6 +105,9 @@ class MemoryStreamBridge(StreamBridge):
     ) -> AsyncIterator[StreamEvent]:
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
+            if stream.expired:
+                yield END_SENTINEL
+                return
             next_offset = self._resolve_start_offset(stream, last_event_id)
 
         while True:

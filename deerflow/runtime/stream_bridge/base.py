@@ -46,6 +46,14 @@ class StreamBridge(abc.ABC):
         """Signal that no more events will be produced for *run_id*."""
 
     @abc.abstractmethod
+    async def expire(self, run_id: str) -> None:
+        """Discard buffered events and stop buffering new events for *run_id*.
+
+        The expired marker remains until :meth:`cleanup` is called so callers
+        can distinguish an expired replay window from a never-created stream.
+        """
+
+    @abc.abstractmethod
     def subscribe(
         self,
         run_id: str,

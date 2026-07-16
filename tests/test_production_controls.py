@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 import tempfile
 import importlib
@@ -14,7 +15,7 @@ from app.dependencies import ClientManager
 from app.middleware import ApiKeyAuthMiddleware
 from deerflow.config.app_config import AppConfig, get_app_config, reset_app_config
 from deerflow.config.tracing_config import get_tracing_config, reset_tracing_config
-from deerflow.runtime import ConflictError, RunStatus
+from deerflow.runtime import ConflictError, DisconnectMode, END_SENTINEL, RunStatus
 
 
 class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
@@ -188,6 +189,49 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(cancelled)
         self.assertEqual(record.status, RunStatus.interrupted)
+
+    async def test_disconnected_continue_run_expires_replay_after_grace_period(self) -> None:
+        manager = ClientManager()
+        manager._reconnect_grace_seconds = 0.01
+        record = await manager.run_manager.create_or_reject(
+            "thread-1",
+            run_id="run-1",
+            on_disconnect=DisconnectMode.continue_,
+        )
+        await manager.run_manager.set_status(record.run_id, RunStatus.running)
+        await manager.stream_bridge.publish(record.run_id, "messages-tuple", {"content": "before"})
+
+        await manager.attach_run_stream(record.run_id)
+        await manager.detach_run_stream(record.run_id)
+        await asyncio.sleep(0.05)
+
+        self.assertTrue(record.metadata["replay_expired"])
+        self.assertEqual(record.metadata["replay_expired_reason"], "disconnect_timeout")
+        await manager.stream_bridge.publish(record.run_id, "messages-tuple", {"content": "after"})
+        stream = manager.stream_bridge.subscribe(record.run_id, heartbeat_interval=0.001)
+        self.assertIs(await anext(stream), END_SENTINEL)
+
+    async def test_completed_replay_and_run_metadata_use_separate_retention_windows(self) -> None:
+        manager = ClientManager()
+        manager._completed_replay_seconds = 0.01
+        manager._run_metadata_retention_seconds = 10
+        record = await manager.run_manager.create_or_reject("thread-1", run_id="run-1")
+        await manager.run_manager.set_status(record.run_id, RunStatus.success)
+        await manager.stream_bridge.publish(record.run_id, "messages-tuple", {"content": "done"})
+        await manager.stream_bridge.publish_end(record.run_id)
+
+        manager._schedule_completed_run_retention(record.run_id)
+        await asyncio.sleep(0.03)
+
+        self.assertIsNotNone(manager.run_manager.get(record.run_id))
+        self.assertTrue(record.metadata["replay_expired"])
+        self.assertEqual(record.metadata["replay_expired_reason"], "completed_retention")
+
+        metadata_handle = manager._metadata_cleanup_handles.pop(record.run_id)
+        metadata_handle.cancel()
+        manager._on_run_metadata_elapsed(record.run_id)
+        await asyncio.sleep(0.01)
+        self.assertIsNone(manager.run_manager.get(record.run_id))
 
     async def test_sqlite_checkpointer_failure_does_not_fallback_by_default(self) -> None:
         original_type = settings.checkpointer_type

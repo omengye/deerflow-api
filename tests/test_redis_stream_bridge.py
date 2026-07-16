@@ -131,3 +131,15 @@ class RedisStreamBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fake.deleted, ["test:run-1"])
         self.assertNotIn("test:run-1", fake.streams)
+
+    async def test_expire_discards_buffer_and_drops_future_events(self) -> None:
+        fake = _FakeRedis()
+        bridge = RedisStreamBridge(client=fake, key_prefix="test", retention_seconds=60)
+        await bridge.publish("run-1", "metadata", {"run_id": "run-1"})
+
+        await bridge.expire("run-1")
+        await bridge.publish("run-1", "messages-tuple", {"content": "late"})
+
+        self.assertNotIn("test:run-1", fake.streams)
+        sub = bridge.subscribe("run-1", heartbeat_interval=0.001)
+        self.assertIs(await _next(sub), END_SENTINEL)
