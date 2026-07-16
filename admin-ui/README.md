@@ -36,6 +36,8 @@ When served by the API process, the API base URL is inferred from the current or
 - `GET|PUT /api/admin/subagents`: read or update built-in/custom subagent configuration.
 - `GET|PUT /api/admin/memory`: read or update global memory configuration.
 - `GET|PUT /api/admin/summarization`: read or update conversation summarization configuration.
+- `GET /api/admin/scheduled-tasks`: list persisted scheduled tasks without internal metadata.
+- `DELETE /api/admin/scheduled-tasks/{task_id}`: delete a scheduled task and its stored execution records.
 - `POST /api/admin/config/reload`: reload file-backed configuration.
 - `GET /api/admin/skills/custom`: list custom skills.
 - `GET /api/admin/skills/custom/{name}`: read a custom skill.

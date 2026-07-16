@@ -45,6 +45,8 @@
     memoryConfig: null,
     summarizationConfig: null,
     configHealth: null,
+    scheduledTasks: [],
+    schedulerStatus: null,
     feishu: null,
     customSkills: [],
     currentView: "overview",
@@ -59,6 +61,7 @@
     skills: "Skills",
     mcp: "MCP",
     feishu: "Feishu",
+    scheduler: "定时任务",
     runtime: "运行配置",
   };
 
@@ -209,6 +212,10 @@
     configHealthDetails: document.getElementById("configHealthDetails"),
     configHealthWarnings: document.getElementById("configHealthWarnings"),
     configHealthMessage: document.getElementById("configHealthMessage"),
+    refreshScheduledTasksButton: document.getElementById("refreshScheduledTasksButton"),
+    scheduledTasksSummary: document.getElementById("scheduledTasksSummary"),
+    scheduledTasksTableBody: document.getElementById("scheduledTasksTableBody"),
+    scheduledTasksMessage: document.getElementById("scheduledTasksMessage"),
   };
 
   function defaultBaseUrl() {
@@ -389,6 +396,7 @@
       loadMemoryConfig(),
       loadSummarizationConfig(),
       loadConfigHealth(),
+      loadScheduledTasks(),
       loadHealth(),
       loadModels(),
       loadSkills(),
@@ -458,6 +466,17 @@
     const data = await request("/api/admin/config/health");
     state.configHealth = data;
     renderConfigHealth();
+    return data;
+  }
+
+  async function loadScheduledTasks() {
+    const data = await request("/api/admin/scheduled-tasks?include_disabled=true&limit=200");
+    state.scheduledTasks = Array.isArray(data?.tasks) ? data.tasks : [];
+    state.schedulerStatus = {
+      enabled: Boolean(data?.scheduler_enabled),
+      storageExists: Boolean(data?.storage_exists),
+    };
+    renderScheduledTasks();
     return data;
   }
 
@@ -858,6 +877,63 @@
       .join("");
   }
 
+  function formatScheduledTime(value) {
+    if (!value) return "--";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return new Intl.DateTimeFormat("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).format(date);
+  }
+
+  function scheduledTaskExpression(task) {
+    const expression = task.schedule_expr && typeof task.schedule_expr === "object" ? task.schedule_expr : {};
+    if (task.schedule_type === "once") return `一次：${formatScheduledTime(expression.run_at)}`;
+    if (task.schedule_type === "interval") {
+      const start = expression.start_at ? `，开始于 ${formatScheduledTime(expression.start_at)}` : "";
+      return `每 ${expression.every_seconds || "--"} 秒${start}`;
+    }
+    if (task.schedule_type === "daily") return `每天 ${expression.time_of_day || "--"}（${task.timezone || "默认时区"}）`;
+    return `${task.schedule_type || "未知"}：${JSON.stringify(expression)}`;
+  }
+
+  function renderScheduledTasks() {
+    if (!el.scheduledTasksTableBody || !el.scheduledTasksSummary) return;
+    const tasks = state.scheduledTasks;
+    const status = state.schedulerStatus;
+    const serviceText = status?.enabled ? "Scheduler 已启用" : "Scheduler 已停用";
+    const storageText = status?.storageExists ? "存储已存在" : "尚未创建任务存储";
+    el.scheduledTasksSummary.textContent = `${serviceText}；${storageText}；共 ${tasks.length} 个任务。`;
+    if (!tasks.length) {
+      el.scheduledTasksTableBody.innerHTML = `<tr><td colspan="6">当前没有定时任务。</td></tr>`;
+      return;
+    }
+    el.scheduledTasksTableBody.innerHTML = tasks
+      .map((task) => {
+        const id = escapeHtml(task.id);
+        return `
+          <tr>
+            <td>
+              <div class="mono task-id">${id}</div>
+              <div class="description-cell task-prompt">${escapeHtml(task.prompt || "")}</div>
+            </td>
+            <td class="schedule-cell">${escapeHtml(scheduledTaskExpression(task))}</td>
+            <td>${badge(task.enabled ? "已启用" : "已停用", task.enabled ? "ok" : "neutral")}</td>
+            <td class="mono">${escapeHtml(formatScheduledTime(task.next_run_at))}</td>
+            <td class="mono">${escapeHtml(task.thread_id || "--")}</td>
+            <td><button class="danger-button" data-scheduled-task-action="delete" data-task-id="${id}" type="button">删除</button></td>
+          </tr>
+        `;
+      })
+      .join("");
+  }
+
   function renderCustomSkillSelect() {
     if (!el.customSkillSelect) return;
     const current = el.customSkillSelect.value;
@@ -1246,6 +1322,37 @@
       el.configHealthMessage.textContent = `检查失败：${error.message}`;
     } finally {
       setBusy(el.refreshConfigHealthButton, false);
+    }
+  }
+
+  async function refreshScheduledTasks() {
+    el.scheduledTasksMessage.textContent = "";
+    setBusy(el.refreshScheduledTasksButton, true, "刷新中");
+    try {
+      await loadScheduledTasks();
+      el.scheduledTasksMessage.textContent = "定时任务已刷新。";
+    } catch (error) {
+      el.scheduledTasksMessage.textContent = `刷新失败：${error.message}`;
+    } finally {
+      setBusy(el.refreshScheduledTasksButton, false);
+    }
+  }
+
+  async function deleteScheduledTask(taskId, button) {
+    const task = state.scheduledTasks.find((item) => item.id === taskId);
+    const prompt = task?.prompt ? `\n\n${task.prompt.slice(0, 120)}` : "";
+    if (!window.confirm(`确定删除定时任务 ${taskId}？删除后不会再触发后续执行，已经开始的执行不会被取消。${prompt}`)) return;
+    el.scheduledTasksMessage.textContent = "";
+    setBusy(button, true, "删除中");
+    try {
+      await request(`/api/admin/scheduled-tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" });
+      await loadScheduledTasks();
+      el.scheduledTasksMessage.textContent = `${taskId} 已删除。`;
+      showToast("定时任务已删除。");
+    } catch (error) {
+      el.scheduledTasksMessage.textContent = `删除失败：${error.message}`;
+    } finally {
+      setBusy(button, false);
     }
   }
 
@@ -1801,6 +1908,7 @@
     el.saveMemoryButton.addEventListener("click", saveMemoryConfig);
     el.saveSummarizationButton.addEventListener("click", saveSummarizationConfig);
     el.refreshConfigHealthButton.addEventListener("click", refreshConfigHealth);
+    el.refreshScheduledTasksButton.addEventListener("click", refreshScheduledTasks);
     el.saveFeishuButton.addEventListener("click", saveFeishuConfig);
     el.restartFeishuButton.addEventListener("click", restartFeishuChannel);
 
@@ -1826,6 +1934,12 @@
       } else if (button.dataset.modelAction === "delete") {
         deleteModel(button.dataset.modelName);
       }
+    });
+
+    el.scheduledTasksTableBody.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-scheduled-task-action]");
+      if (!button || button.dataset.scheduledTaskAction !== "delete") return;
+      deleteScheduledTask(button.dataset.taskId, button);
     });
 
     el.openModelDraftButton.addEventListener("click", () => {

@@ -7,10 +7,11 @@ import json
 import logging
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta, timezone as fixed_timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -173,10 +174,18 @@ class SchedulerStore:
                 """
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     async def create_task(
         self,
@@ -304,6 +313,7 @@ class SchedulerStore:
     async def delete_task(self, task_id: str) -> bool:
         def _write() -> bool:
             with self._connect() as conn:
+                conn.execute("DELETE FROM scheduled_task_runs WHERE task_id = ?", (task_id,))
                 cur = conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
                 return cur.rowcount > 0
 

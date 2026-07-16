@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 
 import httpx
 import yaml
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config import FeishuSettings, settings
@@ -29,6 +29,7 @@ from deerflow.config.model_config import ModelConfig
 from deerflow.config.subagents_config import SubagentsAppConfig
 from deerflow.config.summarization_config import ContextSize, SummarizationConfig
 from deerflow.config.title_config import TitleConfig
+from deerflow.runtime.scheduler import ScheduledTask, SchedulerStore
 from deerflow.skills.manager import (
     ALLOWED_SUPPORT_SUBDIRS,
     append_history,
@@ -223,6 +224,36 @@ def _config_path() -> Path:
     if not path.is_absolute():
         path = Path.cwd() / path
     return path.resolve()
+
+
+def _admin_scheduler_store() -> tuple[SchedulerStore | None, Path, bool]:
+    config_path = _config_path()
+    config_data = _load_config_data(config_path)
+    api_config = config_data.get("api") if isinstance(config_data.get("api"), dict) else {}
+    raw_db_path = api_config.get("scheduler_db_path") or settings.scheduler_db_path
+    db_path = Path(str(raw_db_path))
+    if not db_path.is_absolute():
+        db_path = config_path.parent / db_path
+    enabled = bool(api_config.get("scheduler_enabled", settings.scheduler_enabled))
+    resolved = db_path.resolve()
+    return (SchedulerStore(resolved) if resolved.exists() else None, resolved, enabled)
+
+
+def _admin_scheduled_task_response(task: ScheduledTask) -> dict[str, Any]:
+    return {
+        "id": task.id,
+        "thread_id": task.thread_id,
+        "prompt": task.prompt,
+        "schedule_type": task.schedule_type,
+        "schedule_expr": task.schedule_expr,
+        "timezone": task.timezone,
+        "enabled": task.enabled,
+        "next_run_at": task.next_run_at,
+        "created_by": task.created_by,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+        "multitask_strategy": task.multitask_strategy,
+    }
 
 
 @contextmanager
@@ -1098,6 +1129,8 @@ async def admin_me():
             "memory_write": True,
             "summarization_write": True,
             "config_health": True,
+            "scheduled_tasks_read": True,
+            "scheduled_tasks_delete": True,
             "custom_skills_write": True,
             "runtime_write": True,
             "mcp_admin": True,
@@ -1119,6 +1152,54 @@ async def get_admin_config_health():
     """Validate config.yaml and return safe compatibility/security diagnostics."""
     path = _config_path()
     return _config_health_response(_load_config_data(path), path)
+
+
+@router.get("/scheduled-tasks")
+async def get_admin_scheduled_tasks(
+    include_disabled: bool = True,
+    thread_id: str | None = Query(default=None, max_length=256),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """List persisted scheduled tasks without exposing internal metadata or kwargs."""
+    store, db_path, scheduler_enabled = _admin_scheduler_store()
+    if store is None:
+        return {
+            "tasks": [],
+            "count": 0,
+            "scheduler_enabled": scheduler_enabled,
+            "storage_exists": False,
+        }
+    try:
+        tasks = await store.list_tasks(thread_id=thread_id, include_disabled=include_disabled, limit=limit)
+    except Exception as exc:
+        logger.exception("Admin scheduled task listing failed for %s", db_path)
+        raise HTTPException(status_code=500, detail=f"Failed to read scheduled tasks: {exc}") from exc
+    return {
+        "tasks": [_admin_scheduled_task_response(task) for task in tasks],
+        "count": len(tasks),
+        "scheduler_enabled": scheduler_enabled,
+        "storage_exists": True,
+    }
+
+
+@router.delete("/scheduled-tasks/{task_id}")
+async def delete_admin_scheduled_task(task_id: str):
+    """Delete a persisted scheduled task and its stored execution records."""
+    store, db_path, _scheduler_enabled = _admin_scheduler_store()
+    if store is None:
+        raise HTTPException(status_code=404, detail="Scheduled task not found")
+    try:
+        task = await store.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Scheduled task not found")
+        if not await store.delete_task(task_id):
+            raise HTTPException(status_code=404, detail="Scheduled task not found")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Admin scheduled task deletion failed for %s in %s", task_id, db_path)
+        raise HTTPException(status_code=500, detail=f"Failed to delete scheduled task: {exc}") from exc
+    return {"success": True, "deleted": task_id}
 
 
 @router.get("/title")

@@ -41,6 +41,7 @@
           <button class="nav-item" data-view-target="skills" type="button">Skills</button>
           <button class="nav-item" data-view-target="mcp" type="button">MCP</button>
           <button class="nav-item" data-view-target="feishu" type="button">Feishu</button>
+          <button class="nav-item" data-view-target="scheduler" type="button">定时任务</button>
           <button class="nav-item" data-view-target="runtime" type="button">运行配置</button>
         </nav>
 
@@ -603,6 +604,37 @@
             </section>
           </div>
 
+        </section>
+
+        <section id="schedulerView" class="view-section">
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>定时任务</h3>
+                <p>查看持久化任务并删除不再需要的任务；删除不会取消已经开始执行的任务。</p>
+              </div>
+              <button id="refreshScheduledTasksButton" class="secondary-button" type="button">刷新任务</button>
+            </div>
+            <div class="toolbar-row">
+              <span id="scheduledTasksSummary" class="inline-message">尚未读取任务。</span>
+            </div>
+            <div class="table-wrap">
+              <table class="scheduler-table">
+                <thead>
+                  <tr>
+                    <th>任务</th>
+                    <th>调度</th>
+                    <th>状态</th>
+                    <th>下次执行</th>
+                    <th>Thread</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="scheduledTasksTableBody"></tbody>
+              </table>
+            </div>
+            <p id="scheduledTasksMessage" class="form-message" role="status"></p>
+          </section>
         </section>
 
         <section id="runtimeView" class="view-section">

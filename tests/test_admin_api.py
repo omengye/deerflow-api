@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from app.middleware import ApiKeyAuthMiddleware
 from app.routers import admin as admin_router
 from deerflow.config.app_config import reset_app_config
 from deerflow.config.extensions_config import reset_extensions_config
+from deerflow.runtime.scheduler import SchedulerStore
 
 
 class AdminApiTests(unittest.TestCase):
@@ -417,6 +419,47 @@ tool_groups: []
             },
         )
         self.assertEqual(summarization.status_code, 400)
+
+    def test_scheduled_tasks_can_be_listed_and_deleted(self) -> None:
+        db_path = Path(self._tmp.name) / "scheduled_tasks.db"
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        raw["api"]["scheduler_enabled"] = False
+        raw["api"]["scheduler_db_path"] = str(db_path).replace("\\", "/")
+        self.config_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        store = SchedulerStore(db_path)
+        store.setup()
+        task = asyncio.run(
+            store.create_task(
+                thread_id="thread-admin",
+                prompt="Generate the daily report",
+                schedule_type="daily",
+                schedule_expr={"time_of_day": "09:00"},
+                timezone="Asia/Shanghai",
+                metadata={"delivery": {"channel": "feishu", "chat_id": "secret-chat"}},
+                kwargs={"internal": "value"},
+            )
+        )
+        client = self._client()
+
+        listed = client.get("/api/admin/scheduled-tasks", headers=self._auth_headers())
+
+        self.assertEqual(listed.status_code, 200)
+        payload = listed.json()
+        self.assertFalse(payload["scheduler_enabled"])
+        self.assertTrue(payload["storage_exists"])
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["tasks"][0]["id"], task.id)
+        self.assertEqual(payload["tasks"][0]["prompt"], "Generate the daily report")
+        self.assertNotIn("metadata", payload["tasks"][0])
+        self.assertNotIn("kwargs", payload["tasks"][0])
+
+        deleted = client.delete(f"/api/admin/scheduled-tasks/{task.id}", headers=self._auth_headers())
+        missing = client.delete(f"/api/admin/scheduled-tasks/{task.id}", headers=self._auth_headers())
+
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(deleted.json()["deleted"], task.id)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(asyncio.run(store.list_tasks(include_disabled=True)), [])
 
     def test_update_models_rejects_duplicate_names(self) -> None:
         client = self._client()

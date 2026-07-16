@@ -597,6 +597,39 @@ tr:last-child td {
   line-height: 1.45;
 }
 
+.task-id {
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.task-prompt {
+  min-width: 240px;
+  max-width: 420px;
+  white-space: normal;
+}
+
+.schedule-cell {
+  min-width: 190px;
+  max-width: 320px;
+  white-space: normal;
+}
+
+.scheduler-table {
+  min-width: 980px;
+}
+
+.scheduler-table th:nth-child(3),
+.scheduler-table th:nth-child(6),
+.scheduler-table td:nth-child(3),
+.scheduler-table td:nth-child(6),
+.scheduler-table td:nth-child(3) .status-badge {
+  white-space: nowrap;
+}
+
+.scheduler-table td:nth-child(4) {
+  min-width: 150px;
+}
+
 .split-form {
   display: grid;
   grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);

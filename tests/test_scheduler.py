@@ -54,6 +54,33 @@ async def test_scheduler_store_persists_tasks(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_scheduler_store_delete_removes_task_runs(tmp_path):
+    store = SchedulerStore(tmp_path / "scheduled_tasks.db")
+    store.setup()
+    task = await store.create_task(
+        thread_id="thread-1",
+        prompt="run report",
+        schedule_type="daily",
+        schedule_expr={"time_of_day": "09:00"},
+        timezone="Asia/Shanghai",
+    )
+    now = datetime.now(UTC).isoformat()
+    with store._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO scheduled_task_runs (
+                id, task_id, scheduled_at, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("run-row-1", task.id, now, "success", now, now),
+        )
+
+    assert await store.delete_task(task.id) is True
+    assert await store.get_task(task.id) is None
+    assert await store.list_task_runs(task.id) == []
+
+
+@pytest.mark.asyncio
 async def test_scheduler_service_dispatches_due_task(tmp_path):
     db_path = tmp_path / "scheduled_tasks.db"
     store = SchedulerStore(db_path)
@@ -92,7 +119,13 @@ async def test_scheduler_service_dispatches_due_task(tmp_path):
     assert calls
     assert calls[0]["thread_id"] == "thread-1"
     assert calls[0]["message"] == "run due task"
-    runs = await store.list_task_runs((await store.list_tasks(include_disabled=True))[0].id)
+    task_id = (await store.list_tasks(include_disabled=True))[0].id
+    runs = []
+    for _ in range(20):
+        runs = await store.list_task_runs(task_id)
+        if runs and runs[0]["run_id"] == "run-1":
+            break
+        await asyncio.sleep(0.01)
     assert runs[0]["run_id"] == "run-1"
 
 
