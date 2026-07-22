@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import json
 import os
-import shutil
 import string
 import tempfile
 from copy import deepcopy
@@ -33,7 +32,6 @@ from deerflow.runtime.scheduler import ScheduledTask, SchedulerStore
 from deerflow.skills.manager import (
     ALLOWED_SUPPORT_SUBDIRS,
     append_history,
-    atomic_write,
     custom_skill_exists,
     ensure_custom_skill_is_editable,
     ensure_safe_support_path,
@@ -43,9 +41,10 @@ from deerflow.skills.manager import (
     public_skill_exists,
     read_custom_skill_content,
     read_history,
-    validate_skill_markdown_content,
     validate_skill_name,
 )
+from deerflow.skills.evolution import SkillEvolutionService, SkillPublishConflict, get_evolution_store
+from deerflow.skills.evolution.worker import get_evolution_worker
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +121,19 @@ class AdminSkillUpsertRequest(BaseModel):
 class AdminSupportFileWriteRequest(BaseModel):
     content: str = Field(max_length=200_000)
     reload: bool = False
+
+
+class AdminProposalReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_base_sha256: str | None = None
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class AdminSkillRollbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str | None = Field(default=None, max_length=2000)
 
 
 class AdminRuntimePatchRequest(BaseModel):
@@ -468,23 +480,12 @@ def _sanitize_history(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sanitized
 
 
-def _admin_skill_scan(content: str, *, executable: bool, location: str) -> dict[str, str]:
-    lowered = content.lower()
-    blocked_fragments = [
-        "ignore previous instructions",
-        "ignore all previous instructions",
-        "reveal system prompt",
-        "exfiltrate",
-        "steal api key",
-        "steal token",
-    ]
-    if any(fragment in lowered for fragment in blocked_fragments):
-        raise HTTPException(status_code=400, detail=f"Security scan blocked {location}")
-    if executable:
-        executable_blocks = ["rm -rf /", "curl ", "wget ", "invoke-webrequest", "iex ", "downloadstring"]
-        if any(fragment in lowered for fragment in executable_blocks):
-            raise HTTPException(status_code=400, detail=f"Security scan blocked executable file {location}")
-    return {"decision": "allow", "reason": "Deterministic admin checks passed."}
+def _publication_scan_summary(result: dict[str, Any]) -> dict[str, str]:
+    scans = result.get("scans") or []
+    if not scans:
+        return {"decision": "allow", "reason": "No candidate content required scanning."}
+    decision = "warn" if any(scan.get("decision") == "warn" for scan in scans) else "allow"
+    return {"decision": decision, "reason": " ".join(str(scan.get("reason") or "") for scan in scans).strip()}
 
 
 def _list_custom_support_files(name: str) -> list[str]:
@@ -500,6 +501,12 @@ def _list_custom_support_files(name: str) -> list[str]:
     return files
 
 
+def _list_revision_files(snapshot: Path | None) -> list[str]:
+    if snapshot is None or not snapshot.exists():
+        return []
+    return sorted(path.relative_to(snapshot).as_posix() for path in snapshot.rglob("*") if path.is_file())
+
+
 def _custom_skill_response(name: str, *, include_content: bool = False) -> dict[str, Any]:
     skill = next((s for s in list_custom_skills() if s.name == name), None)
     if skill is None:
@@ -511,6 +518,7 @@ def _custom_skill_response(name: str, *, include_content: bool = False) -> dict[
         "enabled": _skill_enabled_state(skill.name, bool(skill.enabled)),
         "path": str(skill.skill_file),
         "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat() if stat else None,
+        "active_revision": get_evolution_store().get_active_revision(skill.name),
     }
     if include_content:
         payload["content"] = read_custom_skill_content(name)
@@ -523,6 +531,14 @@ def _set_skill_enabled(name: str, enabled: bool) -> None:
     skills = data.setdefault("skills", {})
     skills[name] = {"enabled": enabled}
     _write_extensions_data(path, data)
+    try:
+        get_evolution_store().bump_catalog(
+            actor="admin",
+            action="skill.enabled" if enabled else "skill.disabled",
+            details={"skill_name": name},
+        )
+    except Exception:
+        logger.exception("Failed to update Skill catalog version after Admin enabled-state change")
 
 
 def _skill_enabled_state(name: str, default: bool) -> bool:
@@ -1539,6 +1555,84 @@ async def list_admin_custom_skills():
         return {"skills": [_custom_skill_response(skill.name) for skill in list_custom_skills()]}
 
 
+@router.get("/evolution/status")
+async def get_admin_evolution_status():
+    """Return Skill evolution, worker, signal and probation status."""
+    with _admin_app_config_context():
+        status = SkillEvolutionService().status()
+        status["worker"] = get_evolution_worker().status()
+        return status
+
+
+@router.get("/evolution/signals")
+async def list_admin_evolution_signals(
+    status: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    """List sanitized automatic-discovery signals, newest first."""
+    with _admin_app_config_context():
+        store = get_evolution_store()
+        signals = store.list_signals(status=status)[:limit]
+        return {"signals": [signal.model_dump(mode="json") for signal in signals]}
+
+
+@router.get("/evolution/proposals")
+async def list_admin_evolution_proposals(status: str | None = Query(default=None)):
+    """List Skill proposals, newest first."""
+    with _admin_app_config_context():
+        store = get_evolution_store()
+        proposals = store.list_proposals(status=status)
+        return {
+            "proposals": [proposal.model_dump(mode="json") for proposal in proposals],
+            "catalog_version": store.get_catalog_version(),
+        }
+
+
+@router.get("/evolution/proposals/{proposal_id}")
+async def get_admin_evolution_proposal(proposal_id: str):
+    """Return one Proposal with its unified diff."""
+    try:
+        with _admin_app_config_context():
+            store = get_evolution_store()
+            proposal = store.load_proposal(proposal_id)
+            return {**proposal.model_dump(mode="json"), "diff": store.read_proposal_diff(proposal_id)}
+    except Exception as exc:
+        raise _safe_skill_error(exc) from exc
+
+
+@router.post("/evolution/proposals/{proposal_id}/approve")
+async def approve_admin_evolution_proposal(proposal_id: str, req: AdminProposalReviewRequest = Body(default=AdminProposalReviewRequest())):
+    """Validate and atomically publish a pending Skill Proposal."""
+    try:
+        with _admin_app_config_context():
+            proposal = await SkillEvolutionService().approve_proposal(
+                proposal_id,
+                expected_base_sha256=req.expected_base_sha256,
+                note=req.note,
+            )
+            await _refresh_after_skill_change(reload=False)
+            return {
+                "success": True,
+                "proposal": proposal.model_dump(mode="json"),
+                "catalog_version": get_evolution_store().get_catalog_version(),
+            }
+    except SkillPublishConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise _safe_skill_error(exc) from exc
+
+
+@router.post("/evolution/proposals/{proposal_id}/reject")
+async def reject_admin_evolution_proposal(proposal_id: str, req: AdminProposalReviewRequest = Body(default=AdminProposalReviewRequest())):
+    """Reject a pending Skill Proposal without changing active files."""
+    try:
+        with _admin_app_config_context():
+            proposal = SkillEvolutionService().reject_proposal(proposal_id, note=req.note)
+            return {"success": True, "proposal": proposal.model_dump(mode="json")}
+    except Exception as exc:
+        raise _safe_skill_error(exc) from exc
+
+
 @router.get("/skills/custom/{name}")
 async def get_admin_custom_skill(name: str):
     """Read a custom skill and its supporting file index."""
@@ -1559,11 +1653,15 @@ async def upsert_admin_custom_skill(name: str, req: AdminSkillUpsertRequest = Bo
             exists = custom_skill_exists(name)
             if not exists and public_skill_exists(name):
                 raise ValueError(f"'{name}' is a built-in skill. Create a custom skill with a distinct name.")
-            validate_skill_markdown_content(name, req.content)
-            scanner = _admin_skill_scan(req.content, executable=False, location=f"{name}/SKILL.md")
             skill_file = get_custom_skill_file(name)
             prev_content = skill_file.read_text(encoding="utf-8") if skill_file.exists() else None
-            atomic_write(skill_file, req.content)
+            publication = await SkillEvolutionService().publish_admin_change(
+                action="edit" if exists else "create",
+                name=name,
+                content=req.content,
+                note="Direct Admin edit",
+            )
+            scanner = _publication_scan_summary(publication)
             append_history(
                 name,
                 _history_record(
@@ -1580,6 +1678,8 @@ async def upsert_admin_custom_skill(name: str, req: AdminSkillUpsertRequest = Bo
             payload = _custom_skill_response(name, include_content=True)
             payload["success"] = True
             payload["reload"] = reload_result
+            payload["revision"] = publication["manifest"]["version"]
+            payload["catalog_version"] = get_evolution_store().get_catalog_version()
             return payload
     except HTTPException:
         raise
@@ -1594,8 +1694,12 @@ async def delete_admin_custom_skill(name: str):
         with _admin_app_config_context():
             name = validate_skill_name(name)
             ensure_custom_skill_is_editable(name)
-            skill_dir = get_custom_skill_dir(name)
             prev_content = read_custom_skill_content(name)
+            publication = await SkillEvolutionService().publish_admin_change(
+                action="delete",
+                name=name,
+                note="Direct Admin deletion",
+            )
             append_history(
                 name,
                 _history_record(
@@ -1606,9 +1710,14 @@ async def delete_admin_custom_skill(name: str):
                     scanner={"decision": "allow", "reason": "Deletion requested by admin."},
                 ),
             )
-            shutil.rmtree(skill_dir)
             reload_result = await _refresh_after_skill_change(reload=True)
-            return {"success": True, "name": name, "reload": reload_result}
+            return {
+                "success": True,
+                "name": name,
+                "reload": reload_result,
+                "revision": publication["manifest"]["version"],
+                "catalog_version": publication["catalog_version"],
+            }
     except HTTPException:
         raise
     except Exception as exc:
@@ -1628,6 +1737,68 @@ async def get_admin_custom_skill_history(name: str):
         raise _safe_skill_error(exc) from exc
 
 
+@router.get("/skills/custom/{name}/revisions")
+async def list_admin_custom_skill_revisions(name: str):
+    """List immutable published revisions for a custom Skill."""
+    try:
+        with _admin_app_config_context():
+            name = validate_skill_name(name)
+            store = get_evolution_store()
+            active_dir = get_custom_skill_dir(name)
+            if active_dir.exists():
+                store.bootstrap_active_skill(name, active_dir, actor="system")
+            revisions = store.list_revisions(name)
+            if not revisions:
+                raise FileNotFoundError(f"No revisions found for custom skill '{name}'.")
+            return {
+                "name": name,
+                "active_revision": store.get_active_revision(name),
+                "catalog_version": store.get_catalog_version(),
+                "revisions": [manifest.model_dump(mode="json") for manifest in revisions],
+            }
+    except Exception as exc:
+        raise _safe_skill_error(exc) from exc
+
+
+@router.get("/skills/custom/{name}/revisions/{version}")
+async def get_admin_custom_skill_revision(name: str, version: int):
+    """Read one immutable Skill revision."""
+    try:
+        with _admin_app_config_context():
+            name = validate_skill_name(name)
+            manifest, snapshot = get_evolution_store().load_revision(name, version)
+            files = _list_revision_files(snapshot)
+            content = (snapshot / "SKILL.md").read_text(encoding="utf-8") if snapshot is not None and (snapshot / "SKILL.md").is_file() else None
+            return {"manifest": manifest.model_dump(mode="json"), "content": content, "files": files}
+    except Exception as exc:
+        raise _safe_skill_error(exc) from exc
+
+
+@router.post("/skills/custom/{name}/rollback/{version}")
+async def rollback_admin_custom_skill(name: str, version: int, req: AdminSkillRollbackRequest = Body(default=AdminSkillRollbackRequest())):
+    """Publish a historical snapshot as a new immutable revision."""
+    try:
+        with _admin_app_config_context():
+            name = validate_skill_name(name)
+            previous_content = read_custom_skill_content(name) if custom_skill_exists(name) else None
+            result = SkillEvolutionService().publisher.rollback(name, version, actor="admin", note=req.note)
+            new_content = read_custom_skill_content(name) if custom_skill_exists(name) else None
+            append_history(
+                name,
+                _history_record(
+                    action="rollback",
+                    file_path="SKILL.md",
+                    prev_content=previous_content,
+                    new_content=new_content,
+                    scanner={"decision": "allow", "reason": f"Admin rollback to revision {version}."},
+                ),
+            )
+            await _refresh_after_skill_change(reload=False)
+            return {"success": True, **result}
+    except Exception as exc:
+        raise _safe_skill_error(exc) from exc
+
+
 @router.put("/skills/custom/{name}/files/{file_path:path}")
 async def write_admin_custom_skill_file(
     name: str,
@@ -1642,10 +1813,15 @@ async def write_admin_custom_skill_file(
             target = _validate_support_path_or_raise(name, file_path)
             skill_dir = get_custom_skill_dir(name).resolve()
             relative = target.relative_to(skill_dir).as_posix()
-            executable = relative.startswith("scripts/")
-            scanner = _admin_skill_scan(req.content, executable=executable, location=f"{name}/{file_path}")
             prev_content = target.read_text(encoding="utf-8") if target.exists() else None
-            atomic_write(target, req.content)
+            publication = await SkillEvolutionService().publish_admin_change(
+                action="write_file",
+                name=name,
+                path=relative,
+                content=req.content,
+                note="Direct Admin support-file edit",
+            )
+            scanner = _publication_scan_summary(publication)
             append_history(
                 name,
                 _history_record(
@@ -1662,6 +1838,8 @@ async def write_admin_custom_skill_file(
                 "name": name,
                 "file_path": relative,
                 "reload": reload_result,
+                "revision": publication["manifest"]["version"],
+                "catalog_version": publication["catalog_version"],
             }
     except HTTPException:
         raise
@@ -1680,8 +1858,13 @@ async def delete_admin_custom_skill_file(name: str, file_path: str):
             if not target.exists() or not target.is_file():
                 raise FileNotFoundError(f"Supporting file '{file_path}' not found for skill '{name}'.")
             prev_content = target.read_text(encoding="utf-8")
-            target.unlink()
             relative = target.relative_to(get_custom_skill_dir(name).resolve()).as_posix()
+            publication = await SkillEvolutionService().publish_admin_change(
+                action="remove_file",
+                name=name,
+                path=relative,
+                note="Direct Admin support-file deletion",
+            )
             append_history(
                 name,
                 _history_record(
@@ -1692,7 +1875,13 @@ async def delete_admin_custom_skill_file(name: str, file_path: str):
                     scanner={"decision": "allow", "reason": "Deletion requested by admin."},
                 ),
             )
-            return {"success": True, "name": name, "file_path": relative}
+            return {
+                "success": True,
+                "name": name,
+                "file_path": relative,
+                "revision": publication["manifest"]["version"],
+                "catalog_version": publication["catalog_version"],
+            }
     except HTTPException:
         raise
     except Exception as exc:

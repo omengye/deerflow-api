@@ -49,6 +49,10 @@
     schedulerStatus: null,
     feishu: null,
     customSkills: [],
+    evolutionStatus: null,
+    evolutionProposals: [],
+    evolutionSignals: [],
+    selectedEvolutionProposal: null,
     currentView: "overview",
     editingModelName: null,
     modelReloadSequence: 0,
@@ -191,6 +195,28 @@
     supportFileContent: document.getElementById("supportFileContent"),
     writeSupportFileButton: document.getElementById("writeSupportFileButton"),
     deleteSupportFileButton: document.getElementById("deleteSupportFileButton"),
+    evolutionStatusSummary: document.getElementById("evolutionStatusSummary"),
+    evolutionProposalsTableBody: document.getElementById("evolutionProposalsTableBody"),
+    proposalStatusFilter: document.getElementById("proposalStatusFilter"),
+    refreshEvolutionButton: document.getElementById("refreshEvolutionButton"),
+    evolutionActionMessage: document.getElementById("evolutionActionMessage"),
+    evolutionProposalPanel: document.getElementById("evolutionProposalPanel"),
+    evolutionProposalTitle: document.getElementById("evolutionProposalTitle"),
+    evolutionProposalSubtitle: document.getElementById("evolutionProposalSubtitle"),
+    evolutionProposalDetails: document.getElementById("evolutionProposalDetails"),
+    evolutionProposalDiff: document.getElementById("evolutionProposalDiff"),
+    evolutionProposalScans: document.getElementById("evolutionProposalScans"),
+    evolutionProposalEvaluation: document.getElementById("evolutionProposalEvaluation"),
+    evolutionSignalsTableBody: document.getElementById("evolutionSignalsTableBody"),
+    evolutionProbationsPreview: document.getElementById("evolutionProbationsPreview"),
+    evolutionReviewNote: document.getElementById("evolutionReviewNote"),
+    evolutionReviewMessage: document.getElementById("evolutionReviewMessage"),
+    approveEvolutionProposalButton: document.getElementById("approveEvolutionProposalButton"),
+    rejectEvolutionProposalButton: document.getElementById("rejectEvolutionProposalButton"),
+    closeEvolutionProposalButton: document.getElementById("closeEvolutionProposalButton"),
+    loadSkillRevisionsButton: document.getElementById("loadSkillRevisionsButton"),
+    skillRevisionsPanel: document.getElementById("skillRevisionsPanel"),
+    skillRevisionsList: document.getElementById("skillRevisionsList"),
     runtimeConfigDetails: document.getElementById("runtimeConfigDetails"),
     reloadConfigButton: document.getElementById("reloadConfigButton"),
     runtimeMessage: document.getElementById("runtimeMessage"),
@@ -401,6 +427,9 @@
       loadModels(),
       loadSkills(),
       loadCustomSkills(),
+      loadEvolutionStatus(),
+      loadEvolutionProposals(),
+      loadEvolutionSignals(),
       loadMcp(),
       loadFeishu(),
     ]);
@@ -504,6 +533,29 @@
     const data = await request("/api/admin/skills/custom");
     state.customSkills = Array.isArray(data?.skills) ? data.skills : [];
     renderCustomSkillSelect();
+    return data;
+  }
+
+  async function loadEvolutionStatus() {
+    const data = await request("/api/admin/evolution/status");
+    state.evolutionStatus = data;
+    renderEvolutionStatus();
+    return data;
+  }
+
+  async function loadEvolutionProposals() {
+    const status = el.proposalStatusFilter?.value;
+    const query = status && status !== "all" ? `?status=${encodeURIComponent(status)}` : "";
+    const data = await request(`/api/admin/evolution/proposals${query}`);
+    state.evolutionProposals = Array.isArray(data?.proposals) ? data.proposals : [];
+    renderEvolutionProposals();
+    return data;
+  }
+
+  async function loadEvolutionSignals() {
+    const data = await request("/api/admin/evolution/signals?limit=50");
+    state.evolutionSignals = Array.isArray(data?.signals) ? data.signals : [];
+    renderEvolutionSignals();
     return data;
   }
 
@@ -877,6 +929,195 @@
       .join("");
   }
 
+  function evolutionStatusLabel(status) {
+    const labels = {
+      generating: "生成中",
+      validating: "验证中",
+      pending_review: "待审批",
+      publishing: "发布中",
+      published: "已发布",
+      rejected: "已拒绝",
+      failed: "失败",
+      stale: "已过期",
+    };
+    return labels[status] || status || "未知";
+  }
+
+  function evolutionStatusClass(status) {
+    if (status === "published") return "ok";
+    if (["failed", "stale", "rejected"].includes(status)) return "danger";
+    if (["pending_review", "generating", "validating", "publishing"].includes(status)) return "warn";
+    return "neutral";
+  }
+
+  function evolutionRiskLabel(risk) {
+    if (risk === "low") return "低";
+    if (risk === "high") return "高";
+    return "中";
+  }
+
+  function evolutionRiskClass(risk) {
+    if (risk === "low") return "ok";
+    if (risk === "high") return "danger";
+    return "warn";
+  }
+
+  function evolutionOriginLabel(origin) {
+    return origin === "automatic" ? "自动发现" : "Agent 提交";
+  }
+
+  function evolutionSignalStatusLabel(status) {
+    const labels = {
+      pending: "等待处理",
+      processing: "处理中",
+      proposal_created: "已生成 Proposal",
+      ignored: "已忽略",
+      failed: "失败",
+    };
+    return labels[status] || status || "未知";
+  }
+
+  function renderEvolutionStatus() {
+    if (!el.evolutionStatusSummary) return;
+    const status = state.evolutionStatus || {};
+    const pending = status.proposal_counts?.pending_review || 0;
+    const signalPending = (status.signal_counts?.pending || 0) + (status.signal_counts?.processing || 0);
+    const probationEntries = Object.values(status.probations || {});
+    const probationActive = probationEntries.filter((item) => item?.status === "probation").length;
+    const probationAlerts = probationEntries.filter((item) => item?.status === "alert").length;
+    const items = [
+      ["运行模式", status.enabled ? status.mode || "review" : "已禁用"],
+      ["待审批", String(pending)],
+      ["Catalog Version", String(status.catalog_version ?? 0)],
+      ["自动发现", status.discovery_enabled ? "已启用" : "未启用"],
+      ["后台 Worker", status.worker?.running ? `运行中 · 队列 ${status.worker.queue_depth || 0}` : "未运行"],
+      ["待处理 Signal", String(signalPending)],
+      ["Probation", String(probationActive)],
+      ["回归告警", String(probationAlerts)],
+    ];
+    el.evolutionStatusSummary.innerHTML = items
+      .map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`)
+      .join("");
+    if (el.evolutionProbationsPreview) {
+      el.evolutionProbationsPreview.textContent = probationEntries.length
+        ? JSON.stringify(status.probations, null, 2)
+        : "当前没有 probation 记录。";
+    }
+  }
+
+  function renderEvolutionSignals() {
+    if (!el.evolutionSignalsTableBody) return;
+    const signals = state.evolutionSignals;
+    if (!signals.length) {
+      el.evolutionSignalsTableBody.innerHTML = `<tr><td colspan="7">当前没有自动发现 Signal。</td></tr>`;
+      return;
+    }
+    el.evolutionSignalsTableBody.innerHTML = signals
+      .map(
+        (signal) => `
+          <tr>
+            <td class="mono">${escapeHtml(String(signal.id || "").slice(0, 14))}…</td>
+            <td>${escapeHtml((signal.trigger_types || []).join(", ") || "--")}</td>
+            <td>${escapeHtml((signal.tool_names || []).join(", ") || "--")}<br><small>错误 ${signal.tool_error_count || 0}</small></td>
+            <td>${escapeHtml(String(signal.recurrence_count || 1))}</td>
+            <td>${badge(evolutionSignalStatusLabel(signal.status), signal.status === "failed" ? "danger" : signal.status === "proposal_created" ? "ok" : "warn")}</td>
+            <td class="mono">${escapeHtml(signal.proposal_id || "--")}</td>
+            <td class="mono">${escapeHtml(formatScheduledTime(signal.created_at))}</td>
+          </tr>
+        `,
+      )
+      .join("");
+  }
+
+  function renderEvolutionProposals() {
+    if (!el.evolutionProposalsTableBody) return;
+    const proposals = state.evolutionProposals;
+    if (!proposals.length) {
+      el.evolutionProposalsTableBody.innerHTML = `<tr><td colspan="8">当前没有符合条件的 Proposal。</td></tr>`;
+      return;
+    }
+    el.evolutionProposalsTableBody.innerHTML = proposals
+      .map((proposal) => {
+        const id = escapeHtml(proposal.id);
+        return `
+          <tr>
+            <td class="mono">${id.slice(0, 14)}…</td>
+            <td class="mono">${escapeHtml(proposal.skill_name)}</td>
+            <td>${escapeHtml(proposal.action)}${proposal.file_path ? `<br><small>${escapeHtml(proposal.file_path)}</small>` : ""}</td>
+            <td>${escapeHtml(evolutionOriginLabel(proposal.origin))}</td>
+            <td>${badge(evolutionRiskLabel(proposal.risk), evolutionRiskClass(proposal.risk))}</td>
+            <td>${badge(evolutionStatusLabel(proposal.status), evolutionStatusClass(proposal.status))}</td>
+            <td class="mono">${escapeHtml(formatScheduledTime(proposal.created_at))}</td>
+            <td><button class="secondary-button" data-proposal-action="view" data-proposal-id="${id}" type="button">查看</button></td>
+          </tr>
+        `;
+      })
+      .join("");
+  }
+
+  async function openEvolutionProposal(proposalId) {
+    el.evolutionActionMessage.textContent = "读取 Proposal 中...";
+    try {
+      const proposal = await request(`/api/admin/evolution/proposals/${encodeURIComponent(proposalId)}`);
+      state.selectedEvolutionProposal = proposal;
+      el.evolutionProposalTitle.textContent = `${proposal.skill_name} · ${proposal.action}`;
+      el.evolutionProposalSubtitle.textContent = proposal.reason || proposal.trigger?.summary || "未提供改进原因";
+      const details = [
+        ["Proposal", proposal.id],
+        ["状态", evolutionStatusLabel(proposal.status)],
+        ["来源", evolutionOriginLabel(proposal.origin)],
+        ["风险", evolutionRiskLabel(proposal.risk)],
+        ["基础 Revision", proposal.base_revision ?? "新建"],
+        ["触发 Thread", proposal.trigger?.thread_id || "--"],
+        ["变更文件", (proposal.changed_files || []).join(", ") || "--"],
+      ];
+      el.evolutionProposalDetails.innerHTML = details
+        .map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`)
+        .join("");
+      el.evolutionProposalDiff.textContent = proposal.diff || "没有可显示的文本 Diff。";
+      el.evolutionProposalScans.textContent = JSON.stringify(proposal.scans || [], null, 2);
+      el.evolutionProposalEvaluation.textContent = Object.keys(proposal.evaluation || {}).length
+        ? JSON.stringify(proposal.evaluation, null, 2)
+        : "该 Proposal 未进入 Auto Patch 评估。";
+      el.evolutionReviewNote.value = proposal.review_note || "";
+      el.evolutionReviewMessage.textContent = proposal.error || "";
+      const pending = proposal.status === "pending_review";
+      el.approveEvolutionProposalButton.classList.toggle("hidden", !pending);
+      el.rejectEvolutionProposalButton.classList.toggle("hidden", !pending);
+      el.evolutionProposalPanel.classList.remove("hidden");
+      el.evolutionActionMessage.textContent = "";
+      el.evolutionProposalPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (error) {
+      el.evolutionActionMessage.textContent = `读取失败：${error.message}`;
+    }
+  }
+
+  async function reviewEvolutionProposal(approve) {
+    const proposal = state.selectedEvolutionProposal;
+    if (!proposal) return;
+    const button = approve ? el.approveEvolutionProposalButton : el.rejectEvolutionProposalButton;
+    setBusy(button, true, approve ? "发布中" : "拒绝中");
+    el.evolutionReviewMessage.textContent = "";
+    try {
+      const suffix = approve ? "approve" : "reject";
+      await request(`/api/admin/evolution/proposals/${encodeURIComponent(proposal.id)}/${suffix}`, {
+        method: "POST",
+        timeoutMs: 120000,
+        body: {
+          expected_base_sha256: proposal.base_sha256,
+          note: el.evolutionReviewNote.value.trim() || null,
+        },
+      });
+      showToast(approve ? "Proposal 已批准并发布。" : "Proposal 已拒绝。");
+      await Promise.all([loadEvolutionStatus(), loadEvolutionProposals(), loadEvolutionSignals(), loadSkills(), loadCustomSkills()]);
+      await openEvolutionProposal(proposal.id);
+    } catch (error) {
+      el.evolutionReviewMessage.textContent = `${approve ? "发布" : "拒绝"}失败：${error.message}`;
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
   function formatScheduledTime(value) {
     if (!value) return "--";
     const date = new Date(value);
@@ -982,7 +1223,7 @@
     try {
       await request(`/api/skills/${encodeURIComponent(name)}/${action}`, { method: "POST" });
       el.skillActionMessage.textContent = `${name} 已${enabled ? "启用" : "禁用"}。`;
-      await loadSkills();
+      await Promise.all([loadSkills(), loadEvolutionStatus()]);
       renderOverview();
     } catch (error) {
       el.skillActionMessage.textContent = `操作失败：${error.message}`;
@@ -1728,6 +1969,7 @@
     const name = el.customSkillSelect.value;
     el.skillDraftMessage.textContent = "";
     el.skillHistoryPreview.textContent = "";
+    el.skillRevisionsPanel.classList.add("hidden");
     if (!name) {
       el.draftSkillName.value = "";
       el.draftSkillDescription.value = "";
@@ -1765,7 +2007,7 @@
         },
       });
       el.skillDraftMessage.textContent = `${name} 已保存。`;
-      await Promise.all([loadSkills(), loadCustomSkills()]);
+      await Promise.all([loadSkills(), loadCustomSkills(), loadEvolutionStatus()]);
       el.customSkillSelect.value = name;
       renderOverview();
       showToast("自定义 skill 已保存。");
@@ -1788,7 +2030,7 @@
       el.skillDraftMessage.textContent = `${name} 已删除。`;
       el.customSkillSelect.value = "";
       updateSkillDraft();
-      await Promise.all([loadSkills(), loadCustomSkills()]);
+      await Promise.all([loadSkills(), loadCustomSkills(), loadEvolutionStatus()]);
       renderOverview();
     } catch (error) {
       el.skillDraftMessage.textContent = `删除失败：${error.message}`;
@@ -1811,6 +2053,65 @@
     }
   }
 
+  async function loadSkillRevisions() {
+    const name = slugify(el.draftSkillName.value.trim());
+    if (!name) {
+      el.skillDraftMessage.textContent = "请先选择一个自定义 Skill。";
+      return;
+    }
+    try {
+      const data = await request(`/api/admin/skills/custom/${encodeURIComponent(name)}/revisions`);
+      const active = Number(data.active_revision);
+      const revisions = Array.isArray(data.revisions) ? data.revisions : [];
+      el.skillRevisionsList.innerHTML = revisions.length
+        ? revisions
+            .map((revision) => {
+              const isActive = Number(revision.version) === active;
+              const note = revision.note || revision.action || "published";
+              return `
+                <div class="revision-item">
+                  <strong>v${escapeHtml(revision.version)} ${isActive ? badge("当前", "ok") : ""}</strong>
+                  <span><small>${escapeHtml(formatScheduledTime(revision.created_at))} · ${escapeHtml(note)}</small></span>
+                  ${isActive ? "" : `<button class="ghost-button" data-revision-action="rollback" data-revision-version="${escapeHtml(revision.version)}" type="button">回滚到此版本</button>`}
+                </div>
+              `;
+            })
+            .join("")
+        : `<div class="revision-item"><span>尚无 Revision。</span></div>`;
+      el.skillRevisionsPanel.classList.remove("hidden");
+      el.skillHistoryPreview.textContent = "";
+    } catch (error) {
+      el.skillDraftMessage.textContent = `版本读取失败：${error.message}`;
+    }
+  }
+
+  async function rollbackSkillRevision(version, button) {
+    const name = slugify(el.draftSkillName.value.trim());
+    if (!name || !window.confirm(`确认将 ${name} 回滚到 v${version}？系统会创建一个新的 Revision。`)) return;
+    setBusy(button, true, "回滚中");
+    try {
+      await request(`/api/admin/skills/custom/${encodeURIComponent(name)}/rollback/${encodeURIComponent(version)}`, {
+        method: "POST",
+        body: { note: `Admin UI rollback to v${version}` },
+      });
+      showToast(`${name} 已回滚到 v${version} 的内容。`);
+      await Promise.all([loadSkills(), loadCustomSkills(), loadEvolutionStatus()]);
+      if (state.customSkills.some((skill) => skill.name === name)) {
+        el.customSkillSelect.value = name;
+        await loadSelectedCustomSkill();
+        await loadSkillRevisions();
+      } else {
+        el.customSkillSelect.value = "";
+        updateSkillDraft();
+        el.skillRevisionsPanel.classList.add("hidden");
+      }
+    } catch (error) {
+      el.skillDraftMessage.textContent = `回滚失败：${error.message}`;
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
   async function writeSupportFile() {
     const name = slugify(el.draftSkillName.value.trim());
     const path = el.supportFilePath.value.trim();
@@ -1825,7 +2126,7 @@
         body: { content: el.supportFileContent.value, reload: false },
       });
       el.skillDraftMessage.textContent = `${path} 已写入。`;
-      await loadSelectedCustomSkill();
+      await Promise.all([loadSelectedCustomSkill(), loadEvolutionStatus()]);
     } catch (error) {
       el.skillDraftMessage.textContent = `写入失败：${error.message}`;
     } finally {
@@ -1844,7 +2145,7 @@
     try {
       await request(`/api/admin/skills/custom/${encodeURIComponent(name)}/files/${encodePath(path)}`, { method: "DELETE" });
       el.skillDraftMessage.textContent = `${path} 已删除。`;
-      await loadSelectedCustomSkill();
+      await Promise.all([loadSelectedCustomSkill(), loadEvolutionStatus()]);
     } catch (error) {
       el.skillDraftMessage.textContent = `删除失败：${error.message}`;
     } finally {
@@ -1896,6 +2197,23 @@
     el.skillCategoryFilter.addEventListener("change", () => {
       renderSkills();
       renderOverview();
+    });
+    el.proposalStatusFilter.addEventListener("change", loadEvolutionProposals);
+    el.refreshEvolutionButton.addEventListener("click", async () => {
+      setBusy(el.refreshEvolutionButton, true, "刷新中");
+      try {
+        await Promise.all([loadEvolutionStatus(), loadEvolutionProposals(), loadEvolutionSignals()]);
+      } finally {
+        setBusy(el.refreshEvolutionButton, false);
+      }
+    });
+    el.closeEvolutionProposalButton.addEventListener("click", () => el.evolutionProposalPanel.classList.add("hidden"));
+    el.approveEvolutionProposalButton.addEventListener("click", () => reviewEvolutionProposal(true));
+    el.rejectEvolutionProposalButton.addEventListener("click", () => reviewEvolutionProposal(false));
+    el.evolutionProposalsTableBody.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-proposal-action]");
+      if (!button) return;
+      openEvolutionProposal(button.dataset.proposalId);
     });
     el.saveMcpButton.addEventListener("click", saveMcp);
     el.enableMcpButton.addEventListener("click", () => setMcpEnabled(true));
@@ -1978,6 +2296,12 @@
     el.deleteSkillButton.addEventListener("click", deleteSkillDraft);
     el.refreshCustomSkillsButton.addEventListener("click", loadCustomSkills);
     el.loadSkillHistoryButton.addEventListener("click", loadSkillHistory);
+    el.loadSkillRevisionsButton.addEventListener("click", loadSkillRevisions);
+    el.skillRevisionsList.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-revision-action='rollback']");
+      if (!button) return;
+      rollbackSkillRevision(button.dataset.revisionVersion, button);
+    });
     el.writeSupportFileButton.addEventListener("click", writeSupportFile);
     el.deleteSupportFileButton.addEventListener("click", deleteSupportFile);
     el.copySkillMarkdownButton.addEventListener("click", () => copyText(el.skillMarkdownEditor.value, "Skill 草稿已复制。"));

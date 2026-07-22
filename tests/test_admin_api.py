@@ -2,7 +2,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import yaml
 from fastapi import FastAPI
@@ -15,6 +15,9 @@ from app.routers import admin as admin_router
 from deerflow.config.app_config import reset_app_config
 from deerflow.config.extensions_config import reset_extensions_config
 from deerflow.runtime.scheduler import SchedulerStore
+from deerflow.skills.evolution import EvolutionSignal, SkillEvolutionService, get_evolution_store
+from deerflow.skills.evolution.store import utc_now_iso
+from deerflow.skills.security_scanner import ScanResult
 
 
 class AdminApiTests(unittest.TestCase):
@@ -37,6 +40,7 @@ class AdminApiTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.config_path = Path(self._tmp.name) / "config.yaml"
         self.skills_root = Path(self._tmp.name) / "skills"
+        self.evolution_root = Path(self._tmp.name) / "skill-evolution"
         self.skills_root.joinpath("public", "builtin").mkdir(parents=True)
         self.skills_root.joinpath("custom").mkdir(parents=True)
         self.skills_root.joinpath("public", "builtin", "SKILL.md").write_text(
@@ -65,6 +69,7 @@ class AdminApiTests(unittest.TestCase):
         )
         skills_path = str(self.skills_root).replace("\\", "/")
         extensions_path = str(self.extensions_path).replace("\\", "/")
+        evolution_path = str(self.evolution_root).replace("\\", "/")
         self.config_path.write_text(
             f"""
 config_version: 12
@@ -100,6 +105,10 @@ skills:
   enabled: true
   path: {skills_path}
   extensions_file: {extensions_path}
+skill_evolution:
+  enabled: false
+  mode: review
+  storage_path: {evolution_path}
 tools: []
 tool_groups: []
 """.strip(),
@@ -564,6 +573,125 @@ tool_groups: []
             json={"content": "bad", "reload": False},
         )
         self.assertEqual(bad_file.status_code, 400)
+
+    def test_custom_skill_revisions_and_rollback(self) -> None:
+        client = self._client()
+        first = "---\nname: versioned-skill\ndescription: Version one\n---\n\n- First workflow.\n"
+        second = "---\nname: versioned-skill\ndescription: Version two\n---\n\n- Second workflow.\n"
+
+        created = client.put(
+            "/api/admin/skills/custom/versioned-skill",
+            headers=self._auth_headers(),
+            json={"content": first, "reload": False},
+        )
+        updated = client.put(
+            "/api/admin/skills/custom/versioned-skill",
+            headers=self._auth_headers(),
+            json={"content": second, "reload": False},
+        )
+        revisions = client.get(
+            "/api/admin/skills/custom/versioned-skill/revisions",
+            headers=self._auth_headers(),
+        )
+
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(created.json()["revision"], 1)
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["revision"], 2)
+        self.assertEqual(revisions.status_code, 200)
+        self.assertEqual([item["version"] for item in revisions.json()["revisions"]], [2, 1])
+
+        rolled_back = client.post(
+            "/api/admin/skills/custom/versioned-skill/rollback/1",
+            headers=self._auth_headers(),
+            json={"note": "Regression found"},
+        )
+        current = client.get(
+            "/api/admin/skills/custom/versioned-skill",
+            headers=self._auth_headers(),
+        )
+        status = client.get("/api/admin/evolution/status", headers=self._auth_headers())
+
+        self.assertEqual(rolled_back.status_code, 200)
+        self.assertEqual(rolled_back.json()["manifest"]["version"], 3)
+        self.assertEqual(rolled_back.json()["manifest"]["rollback_of"], 1)
+        self.assertEqual(current.json()["content"], first)
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["mode"], "review")
+        self.assertGreaterEqual(status.json()["catalog_version"], 3)
+
+    def test_evolution_proposal_review_api_publishes_only_after_approval(self) -> None:
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        raw["skill_evolution"]["enabled"] = True
+        self.config_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        reset_app_config()
+        client = self._client()
+        content = "---\nname: reviewed-skill\ndescription: Reviewed workflow\n---\n\n- Verify first.\n"
+        scanner = AsyncMock(return_value=ScanResult("allow", "Test scanner allowed candidate."))
+
+        with patch("deerflow.skills.evolution.service.scan_skill_content", scanner):
+            with admin_router._admin_app_config_context():
+                proposal = asyncio.run(
+                    SkillEvolutionService().create_proposal(
+                        action="create",
+                        name="reviewed-skill",
+                        content=content,
+                        reason="Reusable review workflow",
+                        thread_id="thread-review",
+                    )
+                )
+
+            active_file = self.skills_root / "custom" / "reviewed-skill" / "SKILL.md"
+            self.assertFalse(active_file.exists())
+
+            listed = client.get("/api/admin/evolution/proposals?status=pending_review", headers=self._auth_headers())
+            detail = client.get(f"/api/admin/evolution/proposals/{proposal.id}", headers=self._auth_headers())
+            approved = client.post(
+                f"/api/admin/evolution/proposals/{proposal.id}/approve",
+                headers=self._auth_headers(),
+                json={"expected_base_sha256": None, "note": "Approved in test"},
+            )
+
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual([item["id"] for item in listed.json()["proposals"]], [proposal.id])
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn("SKILL.md", detail.json()["diff"])
+        self.assertEqual(approved.status_code, 200)
+        self.assertEqual(approved.json()["proposal"]["status"], "published")
+        self.assertEqual(active_file.read_text(encoding="utf-8"), content)
+
+    def test_evolution_signal_and_worker_observability_api(self) -> None:
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        raw["skill_evolution"]["enabled"] = True
+        raw["skill_evolution"]["discovery"] = {"enabled": True}
+        self.config_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        reset_app_config()
+        now = utc_now_iso()
+        with admin_router._admin_app_config_context():
+            store = get_evolution_store()
+            store.save_signal(
+                EvolutionSignal(
+                    id="s_admin_test",
+                    fingerprint="abc123",
+                    trigger_types=["repeated_task"],
+                    user_summary="Sanitized recurring task",
+                    assistant_summary="Done",
+                    recurrence_count=2,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+        client = self._client()
+        signals = client.get("/api/admin/evolution/signals", headers=self._auth_headers())
+        status = client.get("/api/admin/evolution/status", headers=self._auth_headers())
+
+        self.assertEqual(signals.status_code, 200)
+        self.assertEqual(signals.json()["signals"][0]["id"], "s_admin_test")
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["signal_counts"]["pending"], 1)
+        self.assertIn("worker", status.json())
+        self.assertIn("probations", status.json())
 
     def test_runtime_patch_writes_config_and_hot_applies_settings(self) -> None:
         client = self._client()

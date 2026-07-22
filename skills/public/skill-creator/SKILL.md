@@ -29,6 +29,19 @@ Then after the skill is done (but again, the order is flexible), you can also ru
 
 Cool? Cool.
 
+## Persisting skills in DeerFlow
+
+When the `skill_manage` tool is available, installed skill directories may be
+read-only. Draft and evaluate the skill in a writable workspace, then submit
+the finished content through `skill_manage` using `create`, `edit`, `patch`, or
+`write_file`. The tool creates a review proposal and returns a proposal ID; it
+does not publish directly. Tell the user that the proposal is awaiting Admin
+review, and never claim the active skill changed until it has been approved.
+
+Do not use self-evolution to modify built-in skills, backend source code,
+configuration, or audit data. Script additions and deletions are high-risk and
+always require explicit Admin review.
+
 ## Communicating with the user
 
 The skill creator is liable to be used by people across a wide range of familiarity with coding jargon. If you haven't heard (and how could you, it's only very recently that it started), there's a trend now where the power of Claude is inspiring plumbers to open up their terminals, parents and grandparents to google "how to install npm". On the other hand, the bulk of users are probably fairly computer-literate.

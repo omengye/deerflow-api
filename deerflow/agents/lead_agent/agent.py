@@ -9,6 +9,7 @@ from deerflow.agents.memory.summarization_hook import memory_flush_hook
 from deerflow.agents.middlewares.clarification_middleware import ClarificationMiddleware
 from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware, calibrate_loop_detection
 from deerflow.agents.middlewares.memory_middleware import MemoryMiddleware
+from deerflow.agents.middlewares.evolution_signal_middleware import EvolutionSignalMiddleware
 from deerflow.agents.middlewares.subagent_limit_middleware import SubagentLimitMiddleware, clamp_subagent_limit
 from deerflow.agents.middlewares.summarization_middleware import BeforeSummarizationHook, DeerFlowSummarizationMiddleware
 from deerflow.agents.middlewares.title_middleware import TitleMiddleware
@@ -244,6 +245,7 @@ Being proactive with task management demonstrates thoroughness and ensures all r
 # TodoListMiddleware should be before ClarificationMiddleware to allow todo management
 # TitleMiddleware generates title after first exchange
 # MemoryMiddleware queues conversation for memory update (after TitleMiddleware)
+# EvolutionSignalMiddleware observes only the latest completed turn (after MemoryMiddleware)
 # ViewImageMiddleware should be before ClarificationMiddleware to inject image details before LLM
 # ToolErrorHandlingMiddleware should be before ClarificationMiddleware to convert tool exceptions to ToolMessages
 # ClarificationMiddleware should be last to intercept clarification requests after model calls
@@ -283,6 +285,11 @@ def _build_middlewares(config: RunnableConfig, model_name: str | None, agent_nam
 
     # Add MemoryMiddleware (after TitleMiddleware)
     middlewares.append(MemoryMiddleware(agent_name=agent_name))
+
+    # Collect lightweight improvement signals and probation outcomes. Candidate
+    # generation runs later on the single background worker, never in-response.
+    if get_app_config().skill_evolution.enabled:
+        middlewares.append(EvolutionSignalMiddleware())
 
     # Add ViewImageMiddleware only if the current model supports vision.
     # Use the resolved runtime model_name from make_lead_agent to avoid stale config values.

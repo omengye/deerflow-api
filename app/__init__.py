@@ -61,10 +61,20 @@ async def lifespan(app: FastAPI):
     manager = get_client_manager()
     await manager.startup()
     await manager.start_feishu_channel()
+    evolution_worker = None
+    try:
+        from deerflow.config import get_app_config
 
-    yield
+        if get_app_config().skill_evolution.enabled:
+            from deerflow.skills.evolution.worker import get_evolution_worker
 
-    await manager.shutdown()
+            evolution_worker = get_evolution_worker()
+            evolution_worker.start(recover=True)
+        yield
+    finally:
+        if evolution_worker is not None:
+            evolution_worker.stop()
+        await manager.shutdown()
 
 
 app = FastAPI(

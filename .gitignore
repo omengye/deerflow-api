@@ -53,6 +53,7 @@ data/checkpoints.db-shm
 data/checkpoints.db-wal
 data/deerflow/
 data/uploads/
+.deer-flow/
 
 .codex
 .opencode

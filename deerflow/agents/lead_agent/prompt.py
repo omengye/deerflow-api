@@ -153,13 +153,15 @@ def _build_skill_evolution_section(skill_evolution_enabled: bool) -> str:
         return ""
     return """
 ## Skill Self-Evolution
-After completing a task, consider creating or updating a skill when:
+After completing the user's task, consider submitting a skill proposal when:
 - The task required 5+ tool calls to resolve
 - You overcame non-obvious errors or pitfalls
 - The user corrected your approach and the corrected version worked
 - You discovered a non-trivial, recurring workflow
-If you used a skill and encountered issues not covered by it, patch it immediately.
-Prefer patch over edit. Before creating a new skill, confirm with the user first.
+If an existing custom skill was incomplete, prefer a small patch proposal over a full edit.
+The `skill_manage` tool only creates a review proposal; it never changes the active skill directly.
+Do not modify built-in skills, backend code, configuration, scripts, or audit history through self-evolution.
+Do not delay the user's result to discuss routine proposal creation. Report the proposal ID if you create one.
 Skip simple one-off tasks.
 """
 

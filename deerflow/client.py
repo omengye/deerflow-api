@@ -276,6 +276,17 @@ class DeerFlowClient:
             logger.debug("Failed to build memory signature for agent cache key", exc_info=True)
             return None
 
+    @staticmethod
+    def _get_skill_catalog_version() -> int:
+        """Return the global published Skill catalog version."""
+        try:
+            from deerflow.skills.evolution import get_evolution_store
+
+            return get_evolution_store().get_catalog_version()
+        except Exception:
+            logger.debug("Failed to read Skill catalog version for agent cache key", exc_info=True)
+            return 0
+
     def _ensure_agent(self, config: RunnableConfig):
         """Create (or recreate) the agent when config-dependent params change."""
         cfg = config.get("configurable", {})
@@ -284,6 +295,10 @@ class DeerFlowClient:
         model_name = requested_model_name or (app_config.models[0].name if app_config.models else None)
         model_config = app_config.get_model_config(model_name) if model_name else None
         memory_signature = self._get_memory_signature(self._agent_name)
+        skill_catalog_version = self._get_skill_catalog_version()
+        skill_evolution_config = getattr(app_config, "skill_evolution", None)
+        skill_evolution_enabled = bool(getattr(skill_evolution_config, "enabled", False))
+        skill_evolution_mode = getattr(skill_evolution_config, "mode", "review")
         key = (
             model_name,
             getattr(model_config, "supports_vision", False),
@@ -293,6 +308,9 @@ class DeerFlowClient:
             getattr(app_config.subagents, "enabled", True),
             cfg.get("max_concurrent_subagents"),
             memory_signature,
+            skill_catalog_version,
+            skill_evolution_enabled,
+            skill_evolution_mode,
             self._agent_name,
             frozenset(self._available_skills) if self._available_skills is not None else None,
         )
@@ -1179,17 +1197,33 @@ class DeerFlowClient:
         self._agent = None
         self._agent_config_key = None
         reload_extensions_config()
+        try:
+            from deerflow.agents.lead_agent.prompt import clear_skills_system_prompt_cache
+            from deerflow.skills.evolution import get_evolution_store
+
+            catalog_version = get_evolution_store().bump_catalog(
+                actor="admin",
+                action="skill.enabled" if enabled else "skill.disabled",
+                details={"skill_name": name},
+            )
+            clear_skills_system_prompt_cache()
+        except Exception:
+            logger.warning("Failed to update Skill catalog version after changing enabled state", exc_info=True)
+            catalog_version = None
 
         updated = next((s for s in load_skills(enabled_only=False) if s.name == name), None)
         if updated is None:
             raise RuntimeError(f"Skill '{name}' disappeared after update")
-        return {
+        result = {
             "name": updated.name,
             "description": updated.description,
             "license": updated.license,
             "category": updated.category,
             "enabled": updated.enabled,
         }
+        if catalog_version is not None:
+            result["catalog_version"] = catalog_version
+        return result
 
     def install_skill(self, skill_path: str | Path) -> dict:
         """Install a skill from a .skill archive (ZIP).
@@ -1204,7 +1238,25 @@ class DeerFlowClient:
             FileNotFoundError: If the file does not exist.
             ValueError: If the file is invalid.
         """
-        return install_skill_from_archive(skill_path)
+        result = install_skill_from_archive(skill_path)
+        try:
+            from deerflow.agents.lead_agent.prompt import clear_skills_system_prompt_cache
+            from deerflow.skills.evolution import get_evolution_store
+            from deerflow.skills.manager import get_custom_skill_dir
+
+            skill_name = str(result.get("skill_name") or "")
+            store = get_evolution_store()
+            if skill_name:
+                store.bootstrap_active_skill(skill_name, get_custom_skill_dir(skill_name), actor="admin")
+            result["catalog_version"] = store.bump_catalog(
+                actor="admin",
+                action="skill.installed",
+                details={"skill_name": skill_name},
+            )
+            clear_skills_system_prompt_cache()
+        except Exception:
+            logger.warning("Failed to version installed Skill", exc_info=True)
+        return result
 
     # ------------------------------------------------------------------
     # Public API — memory management

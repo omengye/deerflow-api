@@ -151,6 +151,41 @@ skills:
   path: ./skills
   container_path: /mnt/skills
 
+# Agent-managed Skill improvement. Review mode discovers reusable improvements
+# automatically but always requires an admin to publish them. auto_patch mode
+# may publish only small, low-risk SKILL.md patches that pass both gates.
+skill_evolution:
+  enabled: false
+  mode: review
+  # Relative to DEER_FLOW_HOME (repo-local .deer-flow by default).
+  storage_path: skill-evolution
+  generation_model_name: null
+  moderation_model_name: null
+  evaluation_model_name: null
+  security_fail_closed: true
+  discovery:
+    enabled: false
+    min_tool_calls: 5
+    repeat_threshold: 2
+    repeat_window_days: 30
+    cooldown_hours: 24
+    max_daily_proposals: 5
+    max_pending_proposals: 20
+  candidate_limits:
+    max_files: 20
+    max_total_bytes: 524288
+    max_file_bytes: 131072
+  auto_patch:
+    max_changed_lines: 40
+    # Safety locks in this implementation; automatic publication is patch-only.
+    allow_create: false
+    allow_support_files: false
+    allow_scripts: false
+    allow_delete: false
+  monitoring:
+    probation_uses: 3
+    auto_rollback_consecutive_failures: 2
+
 memory:
   enabled: true
   storage_path: memory.json
