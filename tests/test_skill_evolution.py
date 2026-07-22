@@ -195,6 +195,69 @@ async def test_generator_accepts_exact_custom_skill_patch_and_rejects_malformed_
 
 
 @pytest.mark.asyncio
+async def test_generator_normalizes_safe_skill_name_variants(evolution_env):
+    skills_root, _, _ = evolution_env
+    content = "---\nname: research-flow\ndescription: Repeatable research workflow\n---\n\n- Search.\n"
+    skill_file = skills_root / "custom" / "research-flow" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text(content, encoding="utf-8")
+    signal = _signal(skills_used=[{"name": "research-flow", "scope": "custom", "source": "current_turn"}])
+    generator = SkillCandidateGenerator()
+    model = AsyncMock()
+    model.ainvoke.return_value = AIMessage(
+        content=json.dumps(
+            {
+                "action": "patch",
+                "skill_name": " Research_Flow ",
+                "reason": "Make the recurring search robust",
+                "content": None,
+                "find": "- Search.",
+                "replace": "- Search with pagination.",
+                "expected_count": 1,
+            }
+        )
+    )
+
+    with patch("deerflow.skills.evolution.generator.create_chat_model", return_value=model), patch(
+        "deerflow.skills.evolution.generator.aclose_chat_model", new=AsyncMock()
+    ):
+        candidate = await generator.generate(signal)
+
+    assert candidate.action == "patch"
+    assert candidate.skill_name == "research-flow"
+
+
+@pytest.mark.asyncio
+async def test_generator_aligns_create_frontmatter_with_normalized_name(evolution_env):
+    _, _, _ = evolution_env
+    generator = SkillCandidateGenerator()
+    model = AsyncMock()
+    model.ainvoke.return_value = AIMessage(
+        content=json.dumps(
+            {
+                "action": "create",
+                "skill_name": "Weekly Report Flow",
+                "reason": "Create a reusable report workflow",
+                "content": "---\nname: Weekly Report Flow\ndescription: Repeatable weekly report workflow\n---\n\n- Build report.\n",
+                "find": None,
+                "replace": None,
+                "expected_count": None,
+            }
+        )
+    )
+
+    with patch("deerflow.skills.evolution.generator.create_chat_model", return_value=model), patch(
+        "deerflow.skills.evolution.generator.aclose_chat_model", new=AsyncMock()
+    ):
+        candidate = await generator.generate(_signal())
+
+    assert candidate.action == "create"
+    assert candidate.skill_name == "weekly-report-flow"
+    assert candidate.content is not None
+    assert "\nname: weekly-report-flow\n" in candidate.content
+
+
+@pytest.mark.asyncio
 async def test_worker_recovers_pending_and_interrupted_signals(evolution_env):
     _, store, _ = evolution_env
     first = _signal(id="s_pending", status="pending")

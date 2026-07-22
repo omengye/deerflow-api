@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from deerflow.config import get_app_config
 from deerflow.models import aclose_chat_model, create_chat_model
-from deerflow.skills.manager import get_custom_skill_dir, validate_skill_name
+from deerflow.skills.manager import get_custom_skill_dir, validate_skill_markdown_content, validate_skill_name
 
 from .models import EvolutionSignal
 
@@ -73,6 +73,25 @@ def extract_json_object(raw: str) -> dict[str, Any] | None:
     return None
 
 
+def _normalize_generated_skill_name(name: str) -> str:
+    """Convert common model naming variants to the required safe slug."""
+    normalized = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    if not normalized:
+        raise ValueError("Generated skill_name cannot be normalized to hyphen-case.")
+    return validate_skill_name(normalized)
+
+
+def _set_generated_frontmatter_name(content: str, name: str) -> str:
+    """Keep a generated create candidate's frontmatter aligned with its slug."""
+    match = re.match(r"^(---\n)(.*?)(\n---(?:\n|$))", content, re.DOTALL)
+    if match is None:
+        return content
+    frontmatter, replacements = re.subn(r"(?m)^name\s*:.*$", f"name: {name}", match.group(2), count=1)
+    if replacements == 0:
+        return content
+    return f"{match.group(1)}{frontmatter}{match.group(3)}{content[match.end():]}"
+
+
 class SkillCandidateGenerator:
     """Generate only skip/create/exact patch decisions from sanitized signals."""
 
@@ -102,10 +121,12 @@ class SkillCandidateGenerator:
             return candidate
         if not candidate.skill_name:
             raise ValueError("Generated candidate is missing skill_name.")
-        candidate.skill_name = validate_skill_name(candidate.skill_name)
+        candidate.skill_name = _normalize_generated_skill_name(candidate.skill_name)
         if candidate.action == "create":
             if not candidate.content:
                 raise ValueError("Generated create candidate is missing content.")
+            candidate.content = _set_generated_frontmatter_name(candidate.content, candidate.skill_name)
+            validate_skill_markdown_content(candidate.skill_name, candidate.content)
             if get_custom_skill_dir(candidate.skill_name).exists():
                 raise ValueError("Generated create candidate targets an existing custom Skill.")
         elif candidate.action == "patch":
@@ -127,6 +148,8 @@ class SkillCandidateGenerator:
             "You improve reusable AI-agent Skills from a sanitized task signal. "
             "Return ONLY one JSON object. Allowed actions are skip, create, patch. "
             "Prefer an exact patch to a custom Skill that was actually used. "
+            "skill_name must use lowercase ASCII letters, digits, and single hyphens only, with at most 64 characters. "
+            "For patch, copy an existing custom Skill name exactly. For create, use the same skill_name in the SKILL.md frontmatter. "
             "For patch, provide verbatim find and replace strings and expected_count. "
             "Never propose scripts, support files, shell commands, credentials, permissions, URLs, deletion, or direct file writes. "
             "Use create only for a clearly reusable workflow when no existing custom Skill fits. "
@@ -163,8 +186,8 @@ class SkillCandidateGenerator:
             if parsed is None:
                 raise ValueError("Candidate generator returned malformed JSON.")
             return self._validate(GeneratedCandidate.model_validate(parsed))
-        except (ValidationError, ValueError):
-            logger.warning("Automatic Skill candidate was rejected", exc_info=True)
+        except (ValidationError, ValueError) as exc:
+            logger.warning("Automatic Skill candidate was rejected: %s", exc)
             return GeneratedCandidate(action="skip", reason="Generator output was invalid or unsafe.")
         except Exception:
             logger.warning("Automatic Skill candidate generation failed", exc_info=True)
