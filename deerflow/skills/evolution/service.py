@@ -155,7 +155,14 @@ class SkillEvolutionService:
             raise ValueError(f"Unsupported action '{action}'.")
         return active_dir, candidate_dir
 
-    async def _validate_candidate(self, name: str, candidate_dir: Path | None, *, use_llm: bool) -> list[dict[str, Any]]:
+    async def _validate_candidate(
+        self,
+        name: str,
+        candidate_dir: Path | None,
+        *,
+        use_llm: bool,
+        baseline_dir: Path | None = None,
+    ) -> list[dict[str, Any]]:
         if candidate_dir is None:
             return []
         config = get_app_config().skill_evolution
@@ -182,12 +189,26 @@ class SkillEvolutionService:
             relative = item.relative_to(candidate_dir)
             if relative != Path("SKILL.md") and relative.name == "SKILL.md":
                 raise CandidateValidationError(f"Nested SKILL.md is not allowed: {relative.as_posix()}.")
-            if relative != Path("SKILL.md") and (not relative.parts or relative.parts[0] not in ALLOWED_SUPPORT_SUBDIRS):
-                raise CandidateValidationError(f"Unsupported candidate path: {relative.as_posix()}.")
             size = item.stat().st_size
             total_bytes += size
             if size > limits.max_file_bytes:
                 raise CandidateValidationError(f"Candidate file '{relative.as_posix()}' exceeds {limits.max_file_bytes} bytes.")
+            unsupported = relative != Path("SKILL.md") and (not relative.parts or relative.parts[0] not in ALLOWED_SUPPORT_SUBDIRS)
+            if unsupported:
+                baseline_file = baseline_dir / relative if baseline_dir is not None else None
+                inherited = (
+                    baseline_file is not None
+                    and baseline_file.is_file()
+                    and not baseline_file.is_symlink()
+                    and item.read_bytes() == baseline_file.read_bytes()
+                )
+                if not inherited:
+                    raise CandidateValidationError(f"Unsupported candidate path: {relative.as_posix()}.")
+                # Files outside the managed support directories may have been
+                # installed or created before evolution was enabled. Preserve
+                # them when unchanged, but do not expose their contents (for
+                # example local configuration or credentials) to the scanner.
+                continue
             try:
                 text = item.read_text(encoding="utf-8")
             except UnicodeDecodeError as exc:
@@ -272,7 +293,7 @@ class SkillEvolutionService:
             proposal.status = "validating"
             proposal.updated_at = utc_now_iso()
             self.store.save_proposal(proposal)
-            proposal.scans = await self._validate_candidate(name, candidate, use_llm=True)
+            proposal.scans = await self._validate_candidate(name, candidate, use_llm=True, baseline_dir=before)
             proposal.candidate_sha256 = hash_skill_tree(candidate)
             proposal.changed_files = changed_tree_files(before, candidate)
             proposal.status = "pending_review"
@@ -320,7 +341,14 @@ class SkillEvolutionService:
         self.store.save_proposal(proposal)
         candidate = None if proposal.action == "delete" else self.store.proposal_candidate_dir(proposal.id, proposal.skill_name)
         try:
-            proposal.scans = await self._validate_candidate(proposal.skill_name, candidate, use_llm=True)
+            active = get_custom_skill_dir(proposal.skill_name)
+            baseline = active if active.exists() else None
+            proposal.scans = await self._validate_candidate(
+                proposal.skill_name,
+                candidate,
+                use_llm=True,
+                baseline_dir=baseline,
+            )
             if auto_published and any(scan.get("decision") != "allow" for scan in proposal.scans):
                 raise CandidateValidationError("Automatic publication requires every fresh security scan to allow the candidate.", scans=proposal.scans)
             result = self.publisher.publish(
@@ -534,7 +562,8 @@ class SkillEvolutionService:
                     raise ValueError(f"Unsupported Admin action '{action}'.")
                 candidate_or_none = candidate
 
-            scans = await self._validate_candidate(name, candidate_or_none, use_llm=False)
+            baseline = active if active.exists() else None
+            scans = await self._validate_candidate(name, candidate_or_none, use_llm=False, baseline_dir=baseline)
             result = self.publisher.publish(name=name, candidate_dir=candidate_or_none, action=action, actor="admin", note=note)
             result["scans"] = scans
             return result

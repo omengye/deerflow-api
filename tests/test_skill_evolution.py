@@ -369,6 +369,57 @@ async def test_review_proposal_does_not_change_active_skill_until_approved(evolu
 
 
 @pytest.mark.asyncio
+async def test_patch_preserves_unmanaged_root_file_without_scanning_it(evolution_env):
+    skills_root, store, service = evolution_env
+    skill_dir = skills_root / "custom" / "mail-flow"
+    skill_dir.mkdir(parents=True)
+    original = "---\nname: mail-flow\ndescription: Send a status email\n---\n\n- Send mail.\n"
+    (skill_dir / "SKILL.md").write_text(original, encoding="utf-8")
+    mail_config = '{"smtp_password": "local-secret"}\n'
+    (skill_dir / "mail_config.json").write_text(mail_config, encoding="utf-8")
+    scanner = AsyncMock(return_value=ScanResult("allow", "Allowed."))
+
+    with patch("deerflow.skills.evolution.service.scan_skill_content", scanner), patch.object(SkillPublisher, "_refresh_prompt_cache"):
+        proposal = await service.create_proposal(
+            action="patch",
+            name="mail-flow",
+            find="- Send mail.",
+            replace="- Send mail with retries.",
+            expected_count=1,
+        )
+        published = await service.approve_proposal(proposal.id)
+
+    candidate = store.proposal_candidate_dir(proposal.id, "mail-flow")
+    assert published.status == "published"
+    assert proposal.changed_files == ["SKILL.md"]
+    assert (candidate / "mail_config.json").read_text(encoding="utf-8") == mail_config
+    assert (skill_dir / "mail_config.json").read_text(encoding="utf-8") == mail_config
+    assert scanner.await_count == 2
+    assert scanner.await_args.kwargs["location"] == "mail-flow/SKILL.md"
+
+
+@pytest.mark.asyncio
+async def test_candidate_rejects_new_or_modified_unmanaged_root_file(evolution_env, tmp_path):
+    _, _, service = evolution_env
+    content = "---\nname: mail-flow\ndescription: Send a status email\n---\n\n- Send mail.\n"
+    baseline = tmp_path / "baseline" / "mail-flow"
+    candidate = tmp_path / "candidate" / "mail-flow"
+    baseline.mkdir(parents=True)
+    candidate.mkdir(parents=True)
+    (baseline / "SKILL.md").write_text(content, encoding="utf-8")
+    (candidate / "SKILL.md").write_text(content, encoding="utf-8")
+    (baseline / "mail_config.json").write_text("{}\n", encoding="utf-8")
+    (candidate / "mail_config.json").write_text('{"changed": true}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unsupported candidate path: mail_config.json"):
+        await service._validate_candidate("mail-flow", candidate, use_llm=False, baseline_dir=baseline)
+
+    (baseline / "mail_config.json").unlink()
+    with pytest.raises(ValueError, match="Unsupported candidate path: mail_config.json"):
+        await service._validate_candidate("mail-flow", candidate, use_llm=False, baseline_dir=baseline)
+
+
+@pytest.mark.asyncio
 async def test_patch_conflict_and_rollback_are_versioned(evolution_env):
     skills_root, store, service = evolution_env
     original = "---\nname: research-flow\ndescription: Repeatable research workflow\n---\n\n- Search.\n"
