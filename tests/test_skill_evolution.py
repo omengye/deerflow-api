@@ -117,7 +117,7 @@ def test_latest_turn_analysis_does_not_recount_history_and_attributes_correction
         AIMessage(content="First answer"),
         HumanMessage(content="不对，请重新处理"),
         AIMessage(content="", tool_calls=[{"name": "web_search", "args": {"query": "x"}, "id": "new-1"}]),
-        ToolMessage(content="Error: temporary failure", tool_call_id="new-1", status="error"),
+        ToolMessage(content="Error: temporary failure api_key=supersecretvalue", tool_call_id="new-1", status="error"),
         AIMessage(content="", tool_calls=[{"name": "web_search", "args": {"query": "y"}, "id": "new-2"}]),
         ToolMessage(content="success", tool_call_id="new-2"),
         AIMessage(content="Corrected answer"),
@@ -130,6 +130,10 @@ def test_latest_turn_analysis_does_not_recount_history_and_attributes_correction
     assert analysis.tool_names == ["web_search", "web_search"]
     assert analysis.recovered_error_count == 1
     assert analysis.unresolved_error_count == 0
+    assert len(analysis.tool_errors) == 1
+    assert analysis.tool_errors[0].tool_name == "web_search"
+    assert analysis.tool_errors[0].message == "Error: temporary failure api_key=[REDACTED]"
+    assert analysis.tool_errors[0].recovered is True
     assert analysis.correction is True
     assert analysis.skills_used == [{"name": "research-flow", "scope": "custom", "source": "previous_turn"}]
 
@@ -156,6 +160,33 @@ async def test_repeated_task_creates_one_signal_then_respects_cooldown(evolution
     assert signal.recurrence_count == 2
     assert store.load_signal(signal.id).status == "pending"
     assert collector.collect(analysis, thread_id="t1") is None
+
+
+def test_tool_error_details_are_bounded_and_mark_unresolved():
+    messages = [
+        HumanMessage(content="Run the tools"),
+        *[
+            item
+            for index in range(12)
+            for item in (
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "web_search", "args": {"query": str(index)}, "id": f"call-{index}"}],
+                ),
+                ToolMessage(content=f"Error: failure {index}", tool_call_id=f"call-{index}", status="error"),
+            )
+        ],
+        AIMessage(content="Completed with errors"),
+    ]
+
+    analysis = analyze_latest_turn(messages)
+
+    assert analysis is not None
+    assert analysis.tool_error_count == 12
+    assert analysis.unresolved_error_count == 12
+    assert len(analysis.tool_errors) == 10
+    assert analysis.tool_errors[-1].sequence == 10
+    assert all(detail.recovered is False for detail in analysis.tool_errors)
 
 
 @pytest.mark.asyncio
@@ -276,6 +307,24 @@ async def test_worker_recovers_pending_and_interrupted_signals(evolution_env):
     processed = {call.args[0] for call in service.process_signal.await_args_list}
     assert processed == {"s_pending", "s_processing"}
     assert store.load_signal("s_processing").status == "pending"
+
+
+def test_worker_cancels_queued_signal_before_processing(evolution_env):
+    _, store, _ = evolution_env
+    service = SimpleNamespace(process_signal=AsyncMock())
+    worker = EvolutionWorker(store, service)
+
+    assert worker.enqueue("s_cancelled", lazy_start=False) is True
+    assert worker.status()["queue_depth"] == 1
+    assert worker.cancel("s_cancelled") is True
+    worker.start(recover=False)
+    try:
+        assert worker.wait_until_idle(timeout=5)
+    finally:
+        worker.stop()
+
+    service.process_signal.assert_not_awaited()
+    assert worker.status()["queue_depth"] == 0
 
 
 @pytest.mark.asyncio

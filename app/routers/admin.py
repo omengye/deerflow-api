@@ -1573,7 +1573,51 @@ async def list_admin_evolution_signals(
     with _admin_app_config_context():
         store = get_evolution_store()
         signals = store.list_signals(status=status)[:limit]
-        return {"signals": [signal.model_dump(mode="json") for signal in signals]}
+        return {"signals": [signal.model_dump(mode="json", exclude={"tool_errors"}) for signal in signals]}
+
+
+@router.get("/evolution/signals/{signal_id}")
+async def get_admin_evolution_signal(signal_id: str):
+    """Return one sanitized automatic-discovery signal with tool errors."""
+    try:
+        with _admin_app_config_context():
+            signal = get_evolution_store().load_signal(signal_id)
+            return signal.model_dump(mode="json")
+    except Exception as exc:
+        raise _safe_skill_error(exc) from exc
+
+
+@router.delete("/evolution/signals/{signal_id}")
+async def delete_admin_evolution_signal(signal_id: str):
+    """Cancel a queued signal when needed, then remove its durable record."""
+    try:
+        with _admin_app_config_context():
+            store = get_evolution_store()
+            signal = store.load_signal(signal_id)
+            if signal.status == "processing":
+                raise HTTPException(status_code=409, detail="A processing evolution signal cannot be deleted.")
+            if not get_evolution_worker().cancel(signal_id):
+                raise HTTPException(status_code=409, detail="Evolution signal processing has already started.")
+            deleted = store.delete_signal(signal_id)
+            store.append_audit(
+                actor="admin",
+                action="signal.deleted",
+                details={
+                    "signal_id": deleted.id,
+                    "status": deleted.status,
+                    "proposal_id": deleted.proposal_id,
+                },
+            )
+            return {
+                "success": True,
+                "signal_id": deleted.id,
+                "status": deleted.status,
+                "proposal_preserved": bool(deleted.proposal_id),
+            }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _safe_skill_error(exc) from exc
 
 
 @router.get("/evolution/proposals")

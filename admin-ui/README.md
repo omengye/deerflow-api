@@ -46,6 +46,9 @@ When served by the API process, the API base URL is inferred from the current or
 - `GET /api/admin/skills/custom/{name}/history`: read sanitized skill history.
 - `PUT /api/admin/skills/custom/{name}/files/{path}`: write supporting files.
 - `DELETE /api/admin/skills/custom/{name}/files/{path}`: remove supporting files.
+- `GET /api/admin/evolution/signals`: list sanitized automatic-discovery Signal summaries.
+- `GET /api/admin/evolution/signals/{signal_id}`: inspect one Signal and its bounded, sanitized tool errors.
+- `DELETE /api/admin/evolution/signals/{signal_id}`: cancel a queued Signal when necessary and delete its record.
 - `PATCH /api/admin/runtime`: write allowlisted runtime fields.
 - `POST /api/admin/mcp/{name}/enable`: enable an MCP server.
 - `POST /api/admin/mcp/{name}/disable`: disable an MCP server.

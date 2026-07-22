@@ -6,6 +6,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -18,6 +19,9 @@ from deerflow.config import get_app_config
 from deerflow.config.paths import get_paths
 
 from .models import EvolutionSignal, RevisionManifest, SkillProposal
+
+
+_SIGNAL_ID_RE = re.compile(r"^s_[A-Za-z0-9_-]{1,128}$")
 
 
 def utc_now_iso() -> str:
@@ -170,6 +174,11 @@ class FileEvolutionStore:
     def proposal_candidate_dir(self, proposal_id: str, skill_name: str) -> Path:
         return self.proposal_dir(proposal_id) / "candidate" / skill_name
 
+    def signal_path(self, signal_id: str) -> Path:
+        if not _SIGNAL_ID_RE.fullmatch(signal_id):
+            raise ValueError("Invalid evolution signal id.")
+        return self.signals_dir / f"{signal_id}.json"
+
     def save_proposal(self, proposal: SkillProposal) -> None:
         with self.lock:
             self.ensure_layout()
@@ -209,16 +218,23 @@ class FileEvolutionStore:
     def save_signal(self, signal: EvolutionSignal) -> None:
         with self.lock:
             self.ensure_layout()
-            self._atomic_write_json(self.signals_dir / f"{signal.id}.json", signal.model_dump(mode="json"))
+            self._atomic_write_json(self.signal_path(signal.id), signal.model_dump(mode="json"))
 
     def load_signal(self, signal_id: str) -> EvolutionSignal:
-        path = self.signals_dir / f"{signal_id}.json"
+        path = self.signal_path(signal_id)
         if not path.exists():
             raise FileNotFoundError(f"Evolution signal '{signal_id}' not found.")
         try:
             return EvolutionSignal.model_validate_json(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"Invalid evolution signal '{signal_id}': {exc}") from exc
+
+    def delete_signal(self, signal_id: str) -> EvolutionSignal:
+        """Delete one durable signal and return its final stored value."""
+        with self.lock:
+            signal = self.load_signal(signal_id)
+            self.signal_path(signal_id).unlink()
+            return signal
 
     def list_signals(self, *, status: str | None = None) -> list[EvolutionSignal]:
         if not self.signals_dir.exists():

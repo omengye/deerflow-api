@@ -53,6 +53,8 @@
     evolutionProposals: [],
     evolutionSignals: [],
     selectedEvolutionProposal: null,
+    selectedEvolutionSignal: null,
+    evolutionSignalTrigger: null,
     currentView: "overview",
     editingModelName: null,
     modelReloadSequence: 0,
@@ -208,6 +210,15 @@
     evolutionProposalScans: document.getElementById("evolutionProposalScans"),
     evolutionProposalEvaluation: document.getElementById("evolutionProposalEvaluation"),
     evolutionSignalsTableBody: document.getElementById("evolutionSignalsTableBody"),
+    evolutionSignalPanel: document.getElementById("evolutionSignalPanel"),
+    evolutionSignalTitle: document.getElementById("evolutionSignalTitle"),
+    evolutionSignalSubtitle: document.getElementById("evolutionSignalSubtitle"),
+    evolutionSignalDetails: document.getElementById("evolutionSignalDetails"),
+    evolutionSignalToolErrors: document.getElementById("evolutionSignalToolErrors"),
+    evolutionSignalSummary: document.getElementById("evolutionSignalSummary"),
+    evolutionSignalProcessError: document.getElementById("evolutionSignalProcessError"),
+    evolutionSignalMessage: document.getElementById("evolutionSignalMessage"),
+    closeEvolutionSignalButton: document.getElementById("closeEvolutionSignalButton"),
     evolutionProbationsPreview: document.getElementById("evolutionProbationsPreview"),
     evolutionReviewNote: document.getElementById("evolutionReviewNote"),
     evolutionReviewMessage: document.getElementById("evolutionReviewMessage"),
@@ -1009,24 +1020,136 @@
     if (!el.evolutionSignalsTableBody) return;
     const signals = state.evolutionSignals;
     if (!signals.length) {
-      el.evolutionSignalsTableBody.innerHTML = `<tr><td colspan="7">当前没有自动发现 Signal。</td></tr>`;
+      el.evolutionSignalsTableBody.innerHTML = `<tr><td colspan="8">当前没有自动发现 Signal。</td></tr>`;
       return;
     }
     el.evolutionSignalsTableBody.innerHTML = signals
-      .map(
-        (signal) => `
+      .map((signal) => {
+        const id = escapeHtml(signal.id || "");
+        const errorCount = Number(signal.tool_error_count || 0);
+        const processing = signal.status === "processing";
+        return `
           <tr>
-            <td class="mono">${escapeHtml(String(signal.id || "").slice(0, 14))}…</td>
+            <td class="mono" title="${id}">${escapeHtml(String(signal.id || "").slice(0, 14))}…</td>
             <td>${escapeHtml((signal.trigger_types || []).join(", ") || "--")}</td>
-            <td>${escapeHtml((signal.tool_names || []).join(", ") || "--")}<br><small>错误 ${signal.tool_error_count || 0}</small></td>
+            <td>${escapeHtml((signal.tool_names || []).join(", ") || "--")}<br><small class="${errorCount ? "signal-error-count" : ""}">错误 ${errorCount}</small></td>
             <td>${escapeHtml(String(signal.recurrence_count || 1))}</td>
             <td>${badge(evolutionSignalStatusLabel(signal.status), signal.status === "failed" ? "danger" : signal.status === "proposal_created" ? "ok" : "warn")}</td>
             <td class="mono">${escapeHtml(signal.proposal_id || "--")}</td>
             <td class="mono">${escapeHtml(formatScheduledTime(signal.created_at))}</td>
+            <td>
+              <div class="row-actions compact-actions">
+                <button class="secondary-button" data-signal-action="view" data-signal-id="${id}" type="button">${errorCount ? `查看错误 (${errorCount})` : "详情"}</button>
+                <button
+                  class="danger-button"
+                  data-signal-action="delete"
+                  data-signal-id="${id}"
+                  type="button"
+                  ${processing ? 'disabled aria-disabled="true" title="正在处理的 Signal 不能删除"' : ""}
+                >删除</button>
+              </div>
+            </td>
           </tr>
+        `;
+      })
+      .join("");
+  }
+
+  function closeEvolutionSignalDetail({ restoreFocus = true } = {}) {
+    el.evolutionSignalPanel.classList.add("hidden");
+    state.selectedEvolutionSignal = null;
+    if (restoreFocus && state.evolutionSignalTrigger?.isConnected) {
+      state.evolutionSignalTrigger.focus();
+    }
+    state.evolutionSignalTrigger = null;
+  }
+
+  function renderEvolutionSignalErrors(signal) {
+    const errors = Array.isArray(signal.tool_errors) ? signal.tool_errors : [];
+    if (!errors.length) {
+      const text = Number(signal.tool_error_count || 0)
+        ? "该 Signal 创建时未保存错误详情，仅保留了错误数量。"
+        : "本次 Signal 没有记录到工具错误。";
+      el.evolutionSignalToolErrors.innerHTML = `<div class="signal-error-empty">${escapeHtml(text)}</div>`;
+      return;
+    }
+    el.evolutionSignalToolErrors.innerHTML = errors
+      .map(
+        (error) => `
+          <article class="signal-error-item" role="listitem">
+            <div class="signal-error-meta">
+              <strong>#${escapeHtml(error.sequence)} · ${escapeHtml(error.tool_name || "unknown")}</strong>
+              ${badge(error.recovered ? "已恢复" : "未恢复", error.recovered ? "ok" : "danger")}
+            </div>
+            <p>${escapeHtml(error.message || "未提供错误信息")}</p>
+          </article>
         `,
       )
       .join("");
+  }
+
+  async function openEvolutionSignal(signalId, trigger) {
+    state.evolutionSignalTrigger = trigger || null;
+    setBusy(trigger, true, "读取中");
+    try {
+      const signal = await request(`/api/admin/evolution/signals/${encodeURIComponent(signalId)}`);
+      state.selectedEvolutionSignal = signal;
+      el.evolutionSignalTitle.textContent = `${signal.id} · ${evolutionSignalStatusLabel(signal.status)}`;
+      el.evolutionSignalSubtitle.textContent = (signal.trigger_types || []).join(", ") || "未记录触发原因";
+      const details = [
+        ["工具调用", signal.tool_count || 0],
+        ["工具错误", signal.tool_error_count || 0],
+        ["已恢复 / 未恢复", `${signal.recovered_error_count || 0} / ${signal.unresolved_error_count || 0}`],
+        ["重复次数", signal.recurrence_count || 1],
+        ["Proposal", signal.proposal_id || "--"],
+        ["Thread / Run", [signal.thread_id, signal.run_id].filter(Boolean).join(" / ") || "--"],
+        ["创建时间", formatScheduledTime(signal.created_at)],
+        ["更新时间", formatScheduledTime(signal.updated_at)],
+      ];
+      el.evolutionSignalDetails.innerHTML = details
+        .map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`)
+        .join("");
+      renderEvolutionSignalErrors(signal);
+      el.evolutionSignalSummary.textContent = `用户摘要：${signal.user_summary || "--"}\n\n助手摘要：${signal.assistant_summary || "--"}`;
+      el.evolutionSignalProcessError.textContent = signal.error || "没有 Signal 处理错误。";
+      const storedErrors = Array.isArray(signal.tool_errors) ? signal.tool_errors.length : 0;
+      el.evolutionSignalMessage.textContent = Number(signal.tool_error_count || 0) > storedErrors && storedErrors > 0
+        ? `为控制存储大小，仅展示前 ${storedErrors} 条脱敏错误。`
+        : "错误信息已经过脱敏和长度限制。";
+      el.evolutionSignalPanel.classList.remove("hidden");
+      el.evolutionSignalPanel.focus({ preventScroll: true });
+      el.evolutionSignalPanel.scrollIntoView({
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+        block: "start",
+      });
+    } catch (error) {
+      showToast(`读取 Signal 失败：${error.message}`);
+    } finally {
+      setBusy(trigger, false);
+    }
+  }
+
+  async function deleteEvolutionSignal(signalId, button) {
+    const signal = state.evolutionSignals.find((item) => item.id === signalId);
+    if (signal?.status === "processing") {
+      showToast("正在处理的 Signal 不能删除，请稍后重试。");
+      return;
+    }
+    const proposalNote = signal?.proposal_id ? `\n关联 Proposal ${signal.proposal_id} 将被保留。` : "";
+    if (!window.confirm(`确认删除 Signal ${signalId}？${proposalNote}\n该操作不会重置重复次数或自动发现冷却时间。`)) return;
+    setBusy(button, true, "删除中");
+    try {
+      await request(`/api/admin/evolution/signals/${encodeURIComponent(signalId)}`, { method: "DELETE" });
+      if (state.selectedEvolutionSignal?.id === signalId) {
+        closeEvolutionSignalDetail({ restoreFocus: false });
+      }
+      await Promise.all([loadEvolutionSignals(), loadEvolutionStatus()]);
+      showToast(`Signal ${signalId} 已删除。`);
+    } catch (error) {
+      showToast(`删除 Signal 失败：${error.message}`);
+    } finally {
+      setBusy(button, false);
+    }
   }
 
   function renderEvolutionProposals() {
@@ -2214,6 +2337,19 @@
       const button = event.target.closest("[data-proposal-action]");
       if (!button) return;
       openEvolutionProposal(button.dataset.proposalId);
+    });
+    el.evolutionSignalsTableBody.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-signal-action]");
+      if (!button) return;
+      if (button.dataset.signalAction === "view") {
+        openEvolutionSignal(button.dataset.signalId, button);
+      } else if (button.dataset.signalAction === "delete") {
+        deleteEvolutionSignal(button.dataset.signalId, button);
+      }
+    });
+    el.closeEvolutionSignalButton.addEventListener("click", () => closeEvolutionSignalDetail());
+    el.evolutionSignalPanel.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeEvolutionSignalDetail();
     });
     el.saveMcpButton.addEventListener("click", saveMcp);
     el.enableMcpButton.addEventListener("click", () => setMcpEnabled(true));

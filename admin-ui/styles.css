@@ -200,6 +200,15 @@ textarea:focus {
   border: 1px solid transparent;
   font-weight: 700;
   white-space: nowrap;
+  transition:
+    border-color 180ms ease,
+    background-color 180ms ease,
+    color 180ms ease;
+}
+
+button:focus-visible {
+  outline: 3px solid rgba(13, 127, 111, 0.24);
+  outline-offset: 2px;
 }
 
 .primary-button {
@@ -728,7 +737,84 @@ pre {
 }
 
 .evolution-table {
-  min-width: 920px;
+  min-width: 1080px;
+}
+
+.compact-actions {
+  flex-wrap: nowrap;
+}
+
+.compact-actions button {
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.signal-error-count {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.evolution-signal-panel {
+  margin-top: 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: #f8faf9;
+  padding: 16px;
+  outline: none;
+}
+
+.evolution-signal-panel:focus-visible {
+  box-shadow: 0 0 0 3px rgba(13, 127, 111, 0.14);
+}
+
+.signal-error-list {
+  display: grid;
+  max-height: 520px;
+  gap: 10px;
+  overflow: auto;
+  padding: 12px;
+}
+
+.signal-error-item {
+  display: grid;
+  gap: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.04);
+  padding: 11px 12px;
+  color: #d9ebe6;
+}
+
+.signal-error-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.signal-error-item p {
+  margin: 0;
+  color: #c4d8d2;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.signal-error-empty {
+  min-height: 120px;
+  padding: 18px 14px;
+  color: #9db7b0;
+  line-height: 1.55;
+}
+
+.signal-detail-preview {
+  min-height: 130px;
+  max-height: 240px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .evolution-detail-grid {

@@ -57,6 +57,17 @@ class SkillProposal(BaseModel):
     error: str | None = None
 
 
+class ToolErrorDetail(BaseModel):
+    """Bounded, sanitized metadata for one failed tool result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sequence: int = Field(ge=1)
+    tool_name: str
+    message: str
+    recovered: bool = False
+
+
 class EvolutionSignal(BaseModel):
     """A sanitized, durable task-level improvement signal."""
 
@@ -75,6 +86,7 @@ class EvolutionSignal(BaseModel):
     tool_error_count: int = 0
     recovered_error_count: int = 0
     unresolved_error_count: int = 0
+    tool_errors: list[ToolErrorDetail] = Field(default_factory=list)
     recurrence_count: int = 1
     skills_used: list[dict[str, Any]] = Field(default_factory=list)
     proposal_id: str | None = None

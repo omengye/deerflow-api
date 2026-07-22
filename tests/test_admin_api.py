@@ -676,6 +676,18 @@ tool_groups: []
                     trigger_types=["repeated_task"],
                     user_summary="Sanitized recurring task",
                     assistant_summary="Done",
+                    tool_names=["web_search"],
+                    tool_count=1,
+                    tool_error_count=1,
+                    unresolved_error_count=1,
+                    tool_errors=[
+                        {
+                            "sequence": 1,
+                            "tool_name": "web_search",
+                            "message": "Error: upstream timeout",
+                            "recovered": False,
+                        }
+                    ],
                     recurrence_count=2,
                     created_at=now,
                     updated_at=now,
@@ -684,14 +696,52 @@ tool_groups: []
 
         client = self._client()
         signals = client.get("/api/admin/evolution/signals", headers=self._auth_headers())
+        detail = client.get("/api/admin/evolution/signals/s_admin_test", headers=self._auth_headers())
         status = client.get("/api/admin/evolution/status", headers=self._auth_headers())
 
         self.assertEqual(signals.status_code, 200)
         self.assertEqual(signals.json()["signals"][0]["id"], "s_admin_test")
+        self.assertNotIn("tool_errors", signals.json()["signals"][0])
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["tool_errors"][0]["message"], "Error: upstream timeout")
         self.assertEqual(status.status_code, 200)
         self.assertEqual(status.json()["signal_counts"]["pending"], 1)
         self.assertIn("worker", status.json())
         self.assertIn("probations", status.json())
+
+        deleted = client.delete("/api/admin/evolution/signals/s_admin_test", headers=self._auth_headers())
+        missing = client.get("/api/admin/evolution/signals/s_admin_test", headers=self._auth_headers())
+        status_after_delete = client.get("/api/admin/evolution/status", headers=self._auth_headers())
+
+        self.assertEqual(deleted.status_code, 200)
+        self.assertTrue(deleted.json()["success"])
+        self.assertFalse(deleted.json()["proposal_preserved"])
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(status_after_delete.json()["signal_counts"].get("pending", 0), 0)
+        self.assertIn('"action": "signal.deleted"', self.evolution_root.joinpath("audit.jsonl").read_text(encoding="utf-8"))
+
+    def test_processing_evolution_signal_cannot_be_deleted(self) -> None:
+        now = utc_now_iso()
+        with admin_router._admin_app_config_context():
+            store = get_evolution_store()
+            store.save_signal(
+                EvolutionSignal(
+                    id="s_processing_test",
+                    status="processing",
+                    fingerprint="processing",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+        response = self._client().delete(
+            "/api/admin/evolution/signals/s_processing_test",
+            headers=self._auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, 409)
+        with admin_router._admin_app_config_context():
+            self.assertEqual(get_evolution_store().load_signal("s_processing_test").status, "processing")
 
     def test_runtime_patch_writes_config_and_hot_applies_settings(self) -> None:
         client = self._client()

@@ -524,10 +524,43 @@
                     <th>状态</th>
                     <th>Proposal</th>
                     <th>创建时间</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="evolutionSignalsTableBody"></tbody>
               </table>
+            </div>
+            <div
+              id="evolutionSignalPanel"
+              class="evolution-signal-panel hidden"
+              tabindex="-1"
+              aria-labelledby="evolutionSignalTitle"
+            >
+              <div class="panel-header">
+                <div>
+                  <h3 id="evolutionSignalTitle">Signal 详情</h3>
+                  <p id="evolutionSignalSubtitle">查看脱敏后的任务摘要、工具错误和处理结果。</p>
+                </div>
+                <button id="closeEvolutionSignalButton" class="ghost-button" type="button">关闭</button>
+              </div>
+              <div id="evolutionSignalDetails" class="readonly-grid evolution-detail-grid"></div>
+              <div class="evolution-review-grid">
+                <div class="code-panel">
+                  <div class="code-header"><span>工具错误详情</span></div>
+                  <div id="evolutionSignalToolErrors" class="signal-error-list" role="list"></div>
+                </div>
+                <div class="evolution-review-side">
+                  <div class="code-panel">
+                    <div class="code-header"><span>任务摘要</span></div>
+                    <pre id="evolutionSignalSummary" class="signal-detail-preview"></pre>
+                  </div>
+                  <div class="code-panel">
+                    <div class="code-header"><span>Signal 处理信息</span></div>
+                    <pre id="evolutionSignalProcessError" class="signal-detail-preview"></pre>
+                  </div>
+                </div>
+              </div>
+              <p id="evolutionSignalMessage" class="form-message" role="status" aria-live="polite"></p>
             </div>
             <div class="code-panel evolution-probation-panel">
               <div class="code-header"><span>Probation 状态</span></div>

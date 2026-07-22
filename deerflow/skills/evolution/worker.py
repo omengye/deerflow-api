@@ -32,6 +32,7 @@ class EvolutionWorker:
         self._processing_signal_id: str | None = None
         self._last_error: str | None = None
         self._queued_ids: set[str] = set()
+        self._cancelled_ids: set[str] = set()
 
     def start(self, *, recover: bool = True) -> None:
         with self._state_lock:
@@ -63,9 +64,20 @@ class EvolutionWorker:
         with self._state_lock:
             if signal_id in self._queued_ids or signal_id == self._processing_signal_id:
                 return False
+            self._cancelled_ids.discard(signal_id)
             self._queued_ids.add(signal_id)
         self._queue.put(signal_id)
         return True
+
+    def cancel(self, signal_id: str) -> bool:
+        """Cancel a queued signal; return False once processing has started."""
+        with self._state_lock:
+            if signal_id == self._processing_signal_id:
+                return False
+            if signal_id in self._queued_ids:
+                self._queued_ids.discard(signal_id)
+                self._cancelled_ids.add(signal_id)
+            return True
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
@@ -77,8 +89,14 @@ class EvolutionWorker:
                 self._queue.task_done()
                 break
             with self._state_lock:
+                cancelled = signal_id in self._cancelled_ids
+                self._cancelled_ids.discard(signal_id)
                 self._queued_ids.discard(signal_id)
-                self._processing_signal_id = signal_id
+                if not cancelled:
+                    self._processing_signal_id = signal_id
+            if cancelled:
+                self._queue.task_done()
+                continue
             try:
                 asyncio.run(self.service.process_signal(signal_id))
                 with self._state_lock:

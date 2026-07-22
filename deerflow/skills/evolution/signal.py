@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from deerflow.config import get_app_config
 
-from .models import EvolutionSignal
+from .models import EvolutionSignal, ToolErrorDetail
 from .store import FileEvolutionStore, utc_now_iso
 
 
@@ -31,6 +31,8 @@ _FINGERPRINT_NOISE_RE = re.compile(r"[^\w\u3400-\u9fff]+", re.UNICODE)
 _CORRECTION_FALLBACK_RE = re.compile(
     r"(?i)(?:\b(?:that(?:'s| is) (?:wrong|incorrect)|you misunderstood|try again|redo)\b|不对|你理解错了|你理解有误|重试|重新来|换一种|改用)"
 )
+_MAX_TOOL_ERROR_DETAILS = 10
+_MAX_TOOL_ERROR_MESSAGE_CHARS = 800
 
 
 def _extract_message_text(message: Any) -> str:
@@ -88,6 +90,7 @@ class TurnAnalysis:
     tool_error_count: int = 0
     recovered_error_count: int = 0
     unresolved_error_count: int = 0
+    tool_errors: list[ToolErrorDetail] = field(default_factory=list)
     correction: bool = False
     skills_used: list[dict[str, Any]] = field(default_factory=list)
     has_final_assistant: bool = False
@@ -168,27 +171,41 @@ def analyze_latest_turn(messages: list[Any]) -> TurnAnalysis | None:
             if call_id:
                 calls_by_id[call_id] = (str(call.get("name") or "unknown"), index)
 
-    tool_results: list[tuple[int, str, bool]] = []
+    tool_results: list[tuple[int, str, bool, str]] = []
     for index, message in enumerate(current_turn):
         if not isinstance(message, ToolMessage):
             continue
         call_id = str(getattr(message, "tool_call_id", "") or "")
         tool_name = calls_by_id.get(call_id, (str(getattr(message, "name", "") or "unknown"), index))[0]
-        tool_results.append((index, tool_name, _is_tool_error(message)))
+        is_error = _is_tool_error(message)
+        error_message = sanitize_summary(_extract_message_text(message), limit=_MAX_TOOL_ERROR_MESSAGE_CHARS) if is_error else ""
+        tool_results.append((index, tool_name, is_error, error_message))
 
     recovered = 0
     unresolved = 0
-    for result_index, tool_name, is_error in tool_results:
+    tool_errors: list[ToolErrorDetail] = []
+    error_sequence = 0
+    for result_index, tool_name, is_error, error_message in tool_results:
         if not is_error:
             continue
+        error_sequence += 1
         later_success = any(
             later_index > result_index and later_name == tool_name and not later_error
-            for later_index, later_name, later_error in tool_results
+            for later_index, later_name, later_error, _ in tool_results
         )
         if later_success:
             recovered += 1
         else:
             unresolved += 1
+        if len(tool_errors) < _MAX_TOOL_ERROR_DETAILS:
+            tool_errors.append(
+                ToolErrorDetail(
+                    sequence=error_sequence,
+                    tool_name=tool_name,
+                    message=error_message or "Tool reported an error without details.",
+                    recovered=later_success,
+                )
+            )
 
     user_text = _extract_message_text(current_user)
     correction = _detect_current_correction(current_user)
@@ -203,9 +220,10 @@ def analyze_latest_turn(messages: list[Any]) -> TurnAnalysis | None:
         fingerprint=task_fingerprint(user_text),
         tool_names=tool_names,
         tool_count=len(tool_calls),
-        tool_error_count=sum(1 for _, _, is_error in tool_results if is_error),
+        tool_error_count=sum(1 for _, _, is_error, _ in tool_results if is_error),
         recovered_error_count=recovered,
         unresolved_error_count=unresolved,
+        tool_errors=tool_errors,
         correction=correction,
         skills_used=skills,
         has_final_assistant=True,
@@ -287,6 +305,7 @@ class EvolutionSignalCollector:
             tool_error_count=analysis.tool_error_count,
             recovered_error_count=analysis.recovered_error_count,
             unresolved_error_count=analysis.unresolved_error_count,
+            tool_errors=analysis.tool_errors,
             recurrence_count=recurrence_count,
             skills_used=analysis.skills_used,
             created_at=now,
