@@ -449,7 +449,15 @@
                   <option value="stale">已过期</option>
                 </select>
               </label>
-              <span id="evolutionActionMessage" class="inline-message"></span>
+              <label class="filter-field">
+                <span>归档范围</span>
+                <select id="proposalArchiveFilter">
+                  <option value="current">当前记录</option>
+                  <option value="archived">已归档</option>
+                  <option value="all">全部记录</option>
+                </select>
+              </label>
+              <span id="evolutionActionMessage" class="inline-message" role="status" aria-live="polite"></span>
             </div>
             <div class="table-wrap">
               <table class="evolution-table">

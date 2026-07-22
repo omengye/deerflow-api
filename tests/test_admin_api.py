@@ -646,6 +646,10 @@ tool_groups: []
 
             listed = client.get("/api/admin/evolution/proposals?status=pending_review", headers=self._auth_headers())
             detail = client.get(f"/api/admin/evolution/proposals/{proposal.id}", headers=self._auth_headers())
+            archive_while_pending = client.post(
+                f"/api/admin/evolution/proposals/{proposal.id}/archive",
+                headers=self._auth_headers(),
+            )
             approved = client.post(
                 f"/api/admin/evolution/proposals/{proposal.id}/approve",
                 headers=self._auth_headers(),
@@ -656,9 +660,44 @@ tool_groups: []
         self.assertEqual([item["id"] for item in listed.json()["proposals"]], [proposal.id])
         self.assertEqual(detail.status_code, 200)
         self.assertIn("SKILL.md", detail.json()["diff"])
+        self.assertEqual(archive_while_pending.status_code, 409)
         self.assertEqual(approved.status_code, 200)
         self.assertEqual(approved.json()["proposal"]["status"], "published")
         self.assertEqual(active_file.read_text(encoding="utf-8"), content)
+
+        archived = client.post(
+            f"/api/admin/evolution/proposals/{proposal.id}/archive",
+            headers=self._auth_headers(),
+        )
+        current = client.get("/api/admin/evolution/proposals", headers=self._auth_headers())
+        archived_list = client.get(
+            "/api/admin/evolution/proposals?archived_only=true",
+            headers=self._auth_headers(),
+        )
+        archived_detail = client.get(
+            f"/api/admin/evolution/proposals/{proposal.id}",
+            headers=self._auth_headers(),
+        )
+
+        self.assertEqual(archived.status_code, 200)
+        self.assertEqual(archived.json()["proposal"]["archived_by"], "admin")
+        self.assertEqual(current.json()["proposals"], [])
+        self.assertEqual([item["id"] for item in archived_list.json()["proposals"]], [proposal.id])
+        self.assertEqual(archived_detail.json()["published_revision"], 1)
+        self.assertIn("SKILL.md", archived_detail.json()["diff"])
+
+        restored = client.post(
+            f"/api/admin/evolution/proposals/{proposal.id}/restore",
+            headers=self._auth_headers(),
+        )
+        current_after_restore = client.get("/api/admin/evolution/proposals", headers=self._auth_headers())
+
+        self.assertEqual(restored.status_code, 200)
+        self.assertIsNone(restored.json()["proposal"]["archived_at"])
+        self.assertEqual([item["id"] for item in current_after_restore.json()["proposals"]], [proposal.id])
+        audit = self.evolution_root.joinpath("audit.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"action": "proposal.archived"', audit)
+        self.assertIn('"action": "proposal.restored"', audit)
 
     def test_evolution_signal_and_worker_observability_api(self) -> None:
         raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))

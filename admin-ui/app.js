@@ -200,6 +200,7 @@
     evolutionStatusSummary: document.getElementById("evolutionStatusSummary"),
     evolutionProposalsTableBody: document.getElementById("evolutionProposalsTableBody"),
     proposalStatusFilter: document.getElementById("proposalStatusFilter"),
+    proposalArchiveFilter: document.getElementById("proposalArchiveFilter"),
     refreshEvolutionButton: document.getElementById("refreshEvolutionButton"),
     evolutionActionMessage: document.getElementById("evolutionActionMessage"),
     evolutionProposalPanel: document.getElementById("evolutionProposalPanel"),
@@ -556,8 +557,13 @@
 
   async function loadEvolutionProposals() {
     const status = el.proposalStatusFilter?.value;
-    const query = status && status !== "all" ? `?status=${encodeURIComponent(status)}` : "";
-    const data = await request(`/api/admin/evolution/proposals${query}`);
+    const archiveScope = el.proposalArchiveFilter?.value || "current";
+    const params = new URLSearchParams();
+    if (status && status !== "all") params.set("status", status);
+    if (archiveScope === "archived") params.set("archived_only", "true");
+    if (archiveScope === "all") params.set("include_archived", "true");
+    const query = params.toString();
+    const data = await request(`/api/admin/evolution/proposals${query ? `?${query}` : ""}`);
     state.evolutionProposals = Array.isArray(data?.proposals) ? data.proposals : [];
     renderEvolutionProposals();
     return data;
@@ -1162,16 +1168,49 @@
     el.evolutionProposalsTableBody.innerHTML = proposals
       .map((proposal) => {
         const id = escapeHtml(proposal.id);
+        const archived = Boolean(proposal.archived_at);
+        const terminal = ["published", "rejected", "failed", "stale"].includes(proposal.status);
+        const mainLabel = proposal.status === "pending_review"
+          ? "审核"
+          : ["failed", "stale"].includes(proposal.status)
+            ? "查看错误"
+            : "查看";
+        const menuActions = [
+          proposal.status === "published" && proposal.published_revision != null
+            ? `<button class="ghost-button" data-proposal-action="revision" data-proposal-id="${id}" type="button">查看 Revision</button>`
+            : "",
+          archived
+            ? `<button class="secondary-button" data-proposal-action="restore" data-proposal-id="${id}" type="button">恢复</button>`
+            : terminal
+              ? `<button class="ghost-button" data-proposal-action="archive" data-proposal-id="${id}" type="button">归档</button>`
+              : "",
+          `<button class="ghost-button" data-proposal-action="copy" data-proposal-id="${id}" type="button">复制 ID</button>`,
+        ].filter(Boolean);
         return `
-          <tr>
-            <td class="mono">${id.slice(0, 14)}…</td>
+          <tr class="${archived ? "archived-proposal-row" : ""}">
+            <td class="mono" title="${id}">${id.slice(0, 14)}…</td>
             <td class="mono">${escapeHtml(proposal.skill_name)}</td>
             <td>${escapeHtml(proposal.action)}${proposal.file_path ? `<br><small>${escapeHtml(proposal.file_path)}</small>` : ""}</td>
             <td>${escapeHtml(evolutionOriginLabel(proposal.origin))}</td>
             <td>${badge(evolutionRiskLabel(proposal.risk), evolutionRiskClass(proposal.risk))}</td>
-            <td>${badge(evolutionStatusLabel(proposal.status), evolutionStatusClass(proposal.status))}</td>
+            <td>
+              <div class="proposal-status-stack">
+                ${badge(evolutionStatusLabel(proposal.status), evolutionStatusClass(proposal.status))}
+                ${archived ? badge("已归档", "neutral") : ""}
+              </div>
+            </td>
             <td class="mono">${escapeHtml(formatScheduledTime(proposal.created_at))}</td>
-            <td><button class="secondary-button" data-proposal-action="view" data-proposal-id="${id}" type="button">查看</button></td>
+            <td>
+              <div class="row-actions compact-actions">
+                <button class="secondary-button" data-proposal-action="view" data-proposal-id="${id}" type="button">${mainLabel}</button>
+                <details class="proposal-action-menu">
+                  <summary class="ghost-button">更多</summary>
+                  <div class="proposal-action-menu-panel">
+                    ${menuActions.join("")}
+                  </div>
+                </details>
+              </div>
+            </td>
           </tr>
         `;
       })
@@ -1191,8 +1230,10 @@
         ["来源", evolutionOriginLabel(proposal.origin)],
         ["风险", evolutionRiskLabel(proposal.risk)],
         ["基础 Revision", proposal.base_revision ?? "新建"],
+        ["发布 Revision", proposal.published_revision ?? "--"],
         ["触发 Thread", proposal.trigger?.thread_id || "--"],
         ["变更文件", (proposal.changed_files || []).join(", ") || "--"],
+        ["归档状态", proposal.archived_at ? `${formatScheduledTime(proposal.archived_at)} · ${proposal.archived_by || "--"}` : "未归档"],
       ];
       el.evolutionProposalDetails.innerHTML = details
         .map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`)
@@ -1209,7 +1250,10 @@
       el.rejectEvolutionProposalButton.classList.toggle("hidden", !pending);
       el.evolutionProposalPanel.classList.remove("hidden");
       el.evolutionActionMessage.textContent = "";
-      el.evolutionProposalPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+      el.evolutionProposalPanel.scrollIntoView({
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+        block: "start",
+      });
     } catch (error) {
       el.evolutionActionMessage.textContent = `读取失败：${error.message}`;
     }
@@ -1236,6 +1280,80 @@
       await openEvolutionProposal(proposal.id);
     } catch (error) {
       el.evolutionReviewMessage.textContent = `${approve ? "发布" : "拒绝"}失败：${error.message}`;
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
+  async function setEvolutionProposalArchived(proposalId, restore, button) {
+    const selected = state.selectedEvolutionProposal?.id === proposalId ? state.selectedEvolutionProposal : null;
+    const proposal = state.evolutionProposals.find((item) => item.id === proposalId) || selected;
+    if (!restore) {
+      const status = proposal ? evolutionStatusLabel(proposal.status) : "未知";
+      const skill = proposal?.skill_name || "未知 Skill";
+      const confirmed = window.confirm(
+        `确认归档 Proposal ${proposalId}？\nSkill：${skill}\n当前状态：${status}\n\n归档仅从默认列表隐藏记录，不会删除 Skill、Revision、Signal、Diff 或审计记录。`,
+      );
+      if (!confirmed) return;
+    }
+    button.closest("details")?.removeAttribute("open");
+    setBusy(button, true, restore ? "恢复中" : "归档中");
+    try {
+      const action = restore ? "restore" : "archive";
+      await request(`/api/admin/evolution/proposals/${encodeURIComponent(proposalId)}/${action}`, { method: "POST" });
+      await Promise.all([loadEvolutionProposals(), loadEvolutionStatus()]);
+      if (state.selectedEvolutionProposal?.id === proposalId) {
+        if (state.evolutionProposals.some((item) => item.id === proposalId)) {
+          await openEvolutionProposal(proposalId);
+        } else {
+          state.selectedEvolutionProposal = null;
+          el.evolutionProposalPanel.classList.add("hidden");
+        }
+      }
+      showToast(`Proposal ${proposalId} 已${restore ? "恢复" : "归档"}。`);
+    } catch (error) {
+      showToast(`${restore ? "恢复" : "归档"} Proposal 失败：${error.message}`);
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
+  async function openProposalRevision(proposalId, button) {
+    const selected = state.selectedEvolutionProposal?.id === proposalId ? state.selectedEvolutionProposal : null;
+    const proposal = state.evolutionProposals.find((item) => item.id === proposalId) || selected;
+    if (!proposal?.skill_name || proposal.published_revision == null) {
+      showToast("该 Proposal 没有关联的已发布 Revision。");
+      return;
+    }
+    button.closest("details")?.removeAttribute("open");
+    setBusy(button, true, "读取中");
+    try {
+      const name = proposal.skill_name;
+      const version = proposal.published_revision;
+      const revision = await request(
+        `/api/admin/skills/custom/${encodeURIComponent(name)}/revisions/${encodeURIComponent(version)}`,
+      );
+      setView("skills");
+      el.skillDraftPanel.classList.remove("hidden");
+      const activeSkillExists = state.customSkills.some((skill) => skill.name === name);
+      if (activeSkillExists) {
+        el.customSkillSelect.value = name;
+        await loadSelectedCustomSkill();
+      } else {
+        el.customSkillSelect.value = "";
+        el.draftSkillName.value = name;
+        el.draftSkillDescription.value = `历史 Revision v${version}`;
+        el.draftSkillEnabled.checked = false;
+        el.skillMarkdownEditor.value = revision.content || "该 Revision 表示 Skill 删除，没有 SKILL.md 快照。";
+      }
+      await loadSkillRevisions(version);
+      el.skillDraftMessage.textContent = `Proposal ${proposalId} 对应 Revision v${version}。`;
+      el.skillRevisionsPanel.scrollIntoView({
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+        block: "start",
+      });
+    } catch (error) {
+      showToast(`读取 Revision 失败：${error.message}`);
     } finally {
       setBusy(button, false);
     }
@@ -2176,7 +2294,7 @@
     }
   }
 
-  async function loadSkillRevisions() {
+  async function loadSkillRevisions(targetVersion = null) {
     const name = slugify(el.draftSkillName.value.trim());
     if (!name) {
       el.skillDraftMessage.textContent = "请先选择一个自定义 Skill。";
@@ -2190,10 +2308,15 @@
         ? revisions
             .map((revision) => {
               const isActive = Number(revision.version) === active;
+              const isTarget = targetVersion != null && Number(revision.version) === Number(targetVersion);
               const note = revision.note || revision.action || "published";
               return `
-                <div class="revision-item">
-                  <strong>v${escapeHtml(revision.version)} ${isActive ? badge("当前", "ok") : ""}</strong>
+                <div class="revision-item ${isTarget ? "proposal-target-revision" : ""}" ${isTarget ? 'aria-current="true"' : ""}>
+                  <strong>
+                    v${escapeHtml(revision.version)}
+                    ${isActive ? badge("当前", "ok") : ""}
+                    ${isTarget ? badge("当前 Proposal", "warn") : ""}
+                  </strong>
                   <span><small>${escapeHtml(formatScheduledTime(revision.created_at))} · ${escapeHtml(note)}</small></span>
                   ${isActive ? "" : `<button class="ghost-button" data-revision-action="rollback" data-revision-version="${escapeHtml(revision.version)}" type="button">回滚到此版本</button>`}
                 </div>
@@ -2322,6 +2445,7 @@
       renderOverview();
     });
     el.proposalStatusFilter.addEventListener("change", loadEvolutionProposals);
+    el.proposalArchiveFilter.addEventListener("change", loadEvolutionProposals);
     el.refreshEvolutionButton.addEventListener("click", async () => {
       setBusy(el.refreshEvolutionButton, true, "刷新中");
       try {
@@ -2336,7 +2460,17 @@
     el.evolutionProposalsTableBody.addEventListener("click", (event) => {
       const button = event.target.closest("[data-proposal-action]");
       if (!button) return;
-      openEvolutionProposal(button.dataset.proposalId);
+      const action = button.dataset.proposalAction;
+      if (action === "view") {
+        openEvolutionProposal(button.dataset.proposalId);
+      } else if (action === "archive" || action === "restore") {
+        setEvolutionProposalArchived(button.dataset.proposalId, action === "restore", button);
+      } else if (action === "revision") {
+        openProposalRevision(button.dataset.proposalId, button);
+      } else if (action === "copy") {
+        button.closest("details")?.removeAttribute("open");
+        copyText(button.dataset.proposalId, "Proposal ID 已复制。");
+      }
     });
     el.evolutionSignalsTableBody.addEventListener("click", (event) => {
       const button = event.target.closest("[data-signal-action]");
@@ -2432,7 +2566,7 @@
     el.deleteSkillButton.addEventListener("click", deleteSkillDraft);
     el.refreshCustomSkillsButton.addEventListener("click", loadCustomSkills);
     el.loadSkillHistoryButton.addEventListener("click", loadSkillHistory);
-    el.loadSkillRevisionsButton.addEventListener("click", loadSkillRevisions);
+    el.loadSkillRevisionsButton.addEventListener("click", () => loadSkillRevisions());
     el.skillRevisionsList.addEventListener("click", (event) => {
       const button = event.target.closest("[data-revision-action='rollback']");
       if (!button) return;

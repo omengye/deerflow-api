@@ -1621,11 +1621,19 @@ async def delete_admin_evolution_signal(signal_id: str):
 
 
 @router.get("/evolution/proposals")
-async def list_admin_evolution_proposals(status: str | None = Query(default=None)):
-    """List Skill proposals, newest first."""
+async def list_admin_evolution_proposals(
+    status: str | None = Query(default=None),
+    include_archived: bool = Query(default=False),
+    archived_only: bool = Query(default=False),
+):
+    """List Skill proposals, newest first, hiding archived records by default."""
     with _admin_app_config_context():
         store = get_evolution_store()
-        proposals = store.list_proposals(status=status)
+        proposals = store.list_proposals(
+            status=status,
+            include_archived=include_archived or archived_only,
+            archived_only=archived_only,
+        )
         return {
             "proposals": [proposal.model_dump(mode="json") for proposal in proposals],
             "catalog_version": store.get_catalog_version(),
@@ -1672,6 +1680,30 @@ async def reject_admin_evolution_proposal(proposal_id: str, req: AdminProposalRe
     try:
         with _admin_app_config_context():
             proposal = SkillEvolutionService().reject_proposal(proposal_id, note=req.note)
+            return {"success": True, "proposal": proposal.model_dump(mode="json")}
+    except Exception as exc:
+        raise _safe_skill_error(exc) from exc
+
+
+@router.post("/evolution/proposals/{proposal_id}/archive")
+async def archive_admin_evolution_proposal(proposal_id: str):
+    """Archive one terminal Proposal while preserving all linked records."""
+    try:
+        with _admin_app_config_context():
+            proposal = SkillEvolutionService().archive_proposal(proposal_id)
+            return {"success": True, "proposal": proposal.model_dump(mode="json")}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise _safe_skill_error(exc) from exc
+
+
+@router.post("/evolution/proposals/{proposal_id}/restore")
+async def restore_admin_evolution_proposal(proposal_id: str):
+    """Restore one archived Proposal to the default Admin listing."""
+    try:
+        with _admin_app_config_context():
+            proposal = SkillEvolutionService().restore_proposal(proposal_id)
             return {"success": True, "proposal": proposal.model_dump(mode="json")}
     except Exception as exc:
         raise _safe_skill_error(exc) from exc

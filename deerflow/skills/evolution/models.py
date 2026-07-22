@@ -55,6 +55,8 @@ class SkillProposal(BaseModel):
     review_note: str | None = None
     published_revision: int | None = None
     error: str | None = None
+    archived_at: str | None = None
+    archived_by: str | None = None
 
 
 class ToolErrorDetail(BaseModel):

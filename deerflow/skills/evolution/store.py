@@ -193,7 +193,13 @@ class FileEvolutionStore:
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"Invalid Skill proposal '{proposal_id}': {exc}") from exc
 
-    def list_proposals(self, *, status: str | None = None) -> list[SkillProposal]:
+    def list_proposals(
+        self,
+        *,
+        status: str | None = None,
+        include_archived: bool = True,
+        archived_only: bool = False,
+    ) -> list[SkillProposal]:
         if not self.proposals_dir.exists():
             return []
         proposals: list[SkillProposal] = []
@@ -201,6 +207,10 @@ class FileEvolutionStore:
             try:
                 proposal = SkillProposal.model_validate_json(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
+                continue
+            if archived_only and proposal.archived_at is None:
+                continue
+            if not include_archived and proposal.archived_at is not None:
                 continue
             if status is None or proposal.status == status:
                 proposals.append(proposal)

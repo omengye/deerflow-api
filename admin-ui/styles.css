@@ -750,6 +750,69 @@ pre {
   font-size: 12px;
 }
 
+.proposal-status-stack {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  flex-direction: column;
+}
+
+.archived-proposal-row {
+  background: #f8faf9;
+  color: var(--muted);
+}
+
+.proposal-action-menu {
+  position: relative;
+}
+
+.proposal-action-menu > summary {
+  min-height: 32px;
+  padding: 0 10px;
+  cursor: pointer;
+  font-size: 12px;
+  list-style: none;
+}
+
+.proposal-action-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.proposal-action-menu > summary:focus-visible {
+  outline: 3px solid rgba(13, 127, 111, 0.24);
+  outline-offset: 2px;
+}
+
+.proposal-action-menu[open] > summary {
+  background: var(--accent-soft);
+}
+
+.proposal-action-menu-panel {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 5px);
+  right: 0;
+  display: grid;
+  min-width: 150px;
+  gap: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: white;
+  padding: 6px;
+  box-shadow: 0 12px 28px rgba(23, 38, 35, 0.14);
+}
+
+.proposal-action-menu-panel button {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.revision-item.proposal-target-revision {
+  border-radius: 8px;
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
 .signal-error-count {
   color: var(--danger);
   font-weight: 700;

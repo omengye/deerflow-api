@@ -481,6 +481,39 @@ async def test_review_proposal_does_not_change_active_skill_until_approved(evolu
 
 
 @pytest.mark.asyncio
+async def test_terminal_proposal_can_be_archived_and_restored_without_losing_history(evolution_env):
+    _, store, service = evolution_env
+    content = "---\nname: archived-flow\ndescription: Archive lifecycle\n---\n\n- Review.\n"
+    scanner = AsyncMock(return_value=ScanResult("allow", "Allowed."))
+
+    with patch("deerflow.skills.evolution.service.scan_skill_content", scanner):
+        proposal = await service.create_proposal(action="create", name="archived-flow", content=content)
+
+    with pytest.raises(ValueError, match="cannot be archived"):
+        service.archive_proposal(proposal.id)
+
+    service.reject_proposal(proposal.id, note="Not needed")
+    archived = service.archive_proposal(proposal.id)
+
+    assert archived.status == "rejected"
+    assert archived.archived_at is not None
+    assert archived.archived_by == "admin"
+    assert store.list_proposals(include_archived=False) == []
+    assert [item.id for item in store.list_proposals(archived_only=True)] == [proposal.id]
+    assert store.read_proposal_diff(proposal.id)
+    assert service.status()["proposal_counts"].get("rejected", 0) == 0
+
+    restored = service.restore_proposal(proposal.id)
+
+    assert restored.archived_at is None
+    assert restored.archived_by is None
+    assert [item.id for item in store.list_proposals(include_archived=False)] == [proposal.id]
+    audit = store.audit_path.read_text(encoding="utf-8")
+    assert '"action": "proposal.archived"' in audit
+    assert '"action": "proposal.restored"' in audit
+
+
+@pytest.mark.asyncio
 async def test_patch_preserves_unmanaged_root_file_without_scanning_it(evolution_env):
     skills_root, store, service = evolution_env
     skill_dir = skills_root / "custom" / "mail-flow"

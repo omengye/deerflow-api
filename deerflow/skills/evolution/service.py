@@ -507,6 +507,41 @@ class SkillEvolutionService:
         self.store.append_audit(actor="admin", action="proposal.rejected", details={"proposal_id": proposal.id, "note": note})
         return proposal
 
+    def archive_proposal(self, proposal_id: str, *, actor: str = "admin") -> SkillProposal:
+        """Hide a terminal Proposal without removing its review or revision history."""
+        with self.store.lock:
+            proposal = self.store.load_proposal(proposal_id)
+            if proposal.archived_at is not None:
+                return proposal
+            if proposal.status not in {"published", "rejected", "failed", "stale"}:
+                raise ValueError(f"Proposal '{proposal_id}' cannot be archived while its status is '{proposal.status}'.")
+            proposal.archived_at = utc_now_iso()
+            proposal.archived_by = actor
+            self.store.save_proposal(proposal)
+            self.store.append_audit(
+                actor=actor,
+                action="proposal.archived",
+                details={"proposal_id": proposal.id, "status": proposal.status},
+            )
+            return proposal
+
+    def restore_proposal(self, proposal_id: str, *, actor: str = "admin") -> SkillProposal:
+        """Return an archived Proposal to the default Admin listing."""
+        with self.store.lock:
+            proposal = self.store.load_proposal(proposal_id)
+            if proposal.archived_at is None:
+                return proposal
+            archived_at = proposal.archived_at
+            proposal.archived_at = None
+            proposal.archived_by = None
+            self.store.save_proposal(proposal)
+            self.store.append_audit(
+                actor=actor,
+                action="proposal.restored",
+                details={"proposal_id": proposal.id, "status": proposal.status, "archived_at": archived_at},
+            )
+            return proposal
+
     async def publish_admin_change(
         self,
         *,
@@ -569,7 +604,7 @@ class SkillEvolutionService:
             return result
 
     def status(self) -> dict[str, Any]:
-        proposals = self.store.list_proposals()
+        proposals = self.store.list_proposals(include_archived=False)
         counts: dict[str, int] = {}
         for proposal in proposals:
             counts[proposal.status] = counts.get(proposal.status, 0) + 1
