@@ -1,13 +1,24 @@
 from collections.abc import AsyncIterator, Iterable
 import asyncio
 from concurrent.futures import Future
+import json
+from types import SimpleNamespace
 from typing import Any, override
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from app import dependencies
-from app.channels.feishu import FeishuChannel, _IncomingResource, _filename_for_incoming_resource, _incoming_resources
+from app.channels.feishu import (
+    FeishuChannel,
+    _IncomingResource,
+    _filename_for_incoming_resource,
+    _incoming_resources,
+    _make_proposal_card,
+    _parse_proposal_action,
+)
 from deerflow.client import StreamEvent
 from deerflow.runtime import MemoryStreamBridge
+from deerflow.skills.evolution.models import ProposalTrigger, SkillProposal
 
 
 class _FakeClient:
@@ -118,6 +129,10 @@ class _RecordingFeishuChannel(FeishuChannel):
         return self.incoming_uploads
 
     @override
+    async def _send_pending_proposal_cards(self, thread_id: str, chat_id: str, *, force: bool) -> int:
+        return 0
+
+    @override
     async def _stream_to_cards(self, text: str, thread_id: str, chat_id: str, initial_card_id: str) -> str:
         if self.stream_started is not None:
             _ = self.stream_started.set()
@@ -138,6 +153,53 @@ class _RecordingFeishuChannel(FeishuChannel):
             return await self.render_run_to_chat(run_id="run-1", thread_id="thread-1", chat_id="chat-1")
         finally:
             dependencies.get_client_manager = original_get_client_manager
+
+
+class _ProposalRecordingFeishuChannel(FeishuChannel):
+    def __init__(self) -> None:
+        super().__init__(app_id="app", app_secret="secret")
+        self.sent_raw_cards: list[tuple[str, str]] = []
+        self.patched_raw_cards: list[tuple[str, str]] = []
+        self.sent_cards: list[tuple[str, str]] = []
+        self.reactions: list[tuple[str, str]] = []
+        self.stream_calls = 0
+
+    @override
+    async def _send_raw_card(self, chat_id: str, card: str) -> str:
+        self.sent_raw_cards.append((chat_id, card))
+        return f"proposal-card-{len(self.sent_raw_cards)}"
+
+    @override
+    async def _patch_raw_card(self, card_id: str, card: str) -> None:
+        self.patched_raw_cards.append((card_id, card))
+
+    @override
+    async def _send_card(self, chat_id: str, content: str) -> str:
+        self.sent_cards.append((chat_id, content))
+        return f"text-card-{len(self.sent_cards)}"
+
+    @override
+    async def _add_reaction(self, message_id: str, emoji_type: str) -> None:
+        self.reactions.append((message_id, emoji_type))
+
+    @override
+    async def _stream_to_cards(self, text: str, thread_id: str, chat_id: str, initial_card_id: str) -> str:
+        self.stream_calls += 1
+        return "done"
+
+
+def _proposal(*, status: str = "pending_review", proposal_id: str = "p_test") -> SkillProposal:
+    return SkillProposal(
+        id=proposal_id,
+        status=status,
+        action="edit",
+        skill_name="sample-skill",
+        reason="Improve the workflow",
+        trigger=ProposalTrigger(thread_id="thread-1"),
+        risk="medium",
+        created_at="2026-07-23T00:00:00+00:00",
+        updated_at="2026-07-23T00:00:00+00:00",
+    )
 
 
 class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
@@ -469,6 +531,137 @@ class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(channel.reactions, [("user-message", "OK"), ("user-message", "DONE")])
         self.assertLess(channel.operation_log.index("patch:card-1:answer"), channel.operation_log.index("reaction:DONE"))
+
+    async def test_pending_proposal_card_has_review_buttons_but_terminal_card_does_not(self) -> None:
+        pending = json.loads(_make_proposal_card(_proposal(), "--- old\n+++ new"))
+        published = json.loads(
+            _make_proposal_card(
+                _proposal(status="published"),
+                "--- old\n+++ new",
+            )
+        )
+
+        pending_action = next(element for element in pending["elements"] if element["tag"] == "action")
+        values = [button["value"] for button in pending_action["actions"]]
+        self.assertEqual(
+            values,
+            [
+                {"channel": "deerflow_proposal", "action": "reject", "proposal_id": "p_test"},
+                {"channel": "deerflow_proposal", "action": "approve", "proposal_id": "p_test"},
+            ],
+        )
+        self.assertNotIn("action", [element["tag"] for element in published["elements"]])
+        self.assertEqual(published["header"]["title"]["content"], "Skill Proposal · 已发布")
+
+    async def test_proposals_command_sends_cards_without_streaming_agent(self) -> None:
+        channel = _ProposalRecordingFeishuChannel()
+        with patch(
+            "app.proposal_review.list_pending_proposals",
+            return_value=[(_proposal(), "diff")],
+        ):
+            await channel._handle_message(
+                message_id="user-message",
+                chat_id="chat-1",
+                text="/proposals",
+                thread_id="thread-1",
+            )
+
+        self.assertEqual(channel.stream_calls, 0)
+        self.assertEqual(len(channel.sent_raw_cards), 1)
+        self.assertEqual(channel.sent_cards, [])
+        self.assertEqual(channel.reactions, [("user-message", "OK"), ("user-message", "DONE")])
+
+    async def test_automatic_proposal_notifications_are_deduplicated_per_thread(self) -> None:
+        channel = _ProposalRecordingFeishuChannel()
+        with patch(
+            "app.proposal_review.list_pending_proposals",
+            return_value=[(_proposal(), "diff")],
+        ):
+            first = await channel._send_pending_proposal_cards("thread-1", "chat-1", force=False)
+            second = await channel._send_pending_proposal_cards("thread-1", "chat-1", force=False)
+            forced = await channel._send_pending_proposal_cards("thread-1", "chat-1", force=True)
+
+        self.assertEqual((first, second, forced), (1, 0, 1))
+        self.assertEqual(len(channel.sent_raw_cards), 2)
+
+    async def test_approve_card_action_uses_shared_coordinator_and_patches_final_card(self) -> None:
+        channel = _ProposalRecordingFeishuChannel()
+        pending = _proposal()
+        published = pending.model_copy(update={"status": "published", "published_revision": 2})
+        approve = AsyncMock(return_value=published)
+        with (
+            patch("app.proposal_review.get_skill_proposal", return_value=(pending, "diff")),
+            patch("app.proposal_review.approve_skill_proposal", approve),
+        ):
+            await channel._handle_proposal_action(
+                card_id="message-card",
+                proposal_id=pending.id,
+                action="approve",
+                actor="feishu:ou_user",
+            )
+
+        approve.assert_awaited_once_with(
+            pending.id,
+            expected_base_sha256=pending.base_sha256,
+            note="在飞书中批准并发布",
+            actor="feishu:ou_user",
+        )
+        self.assertEqual(len(channel.patched_raw_cards), 2)
+        processing = json.loads(channel.patched_raw_cards[0][1])
+        final = json.loads(channel.patched_raw_cards[1][1])
+        self.assertEqual(processing["header"]["title"]["content"], "Skill Proposal · 处理中")
+        self.assertEqual(final["header"]["title"]["content"], "Skill Proposal · 已发布")
+        self.assertNotIn("action", [element["tag"] for element in final["elements"]])
+
+    async def test_already_reviewed_card_action_only_refreshes_terminal_card(self) -> None:
+        channel = _ProposalRecordingFeishuChannel()
+        published = _proposal(status="published")
+        approve = AsyncMock()
+        with (
+            patch("app.proposal_review.get_skill_proposal", return_value=(published, "diff")),
+            patch("app.proposal_review.approve_skill_proposal", approve),
+        ):
+            await channel._handle_proposal_action(
+                card_id="message-card",
+                proposal_id=published.id,
+                action="approve",
+                actor="feishu:ou_user",
+            )
+
+        approve.assert_not_awaited()
+        self.assertEqual(len(channel.patched_raw_cards), 1)
+        final = json.loads(channel.patched_raw_cards[0][1])
+        self.assertEqual(final["header"]["title"]["content"], "Skill Proposal · 已发布")
+
+    async def test_invalid_proposal_action_payload_is_ignored(self) -> None:
+        invalid = SimpleNamespace(
+            event=SimpleNamespace(
+                action=SimpleNamespace(
+                    value={"channel": "other", "action": "approve", "proposal_id": "p_test"}
+                ),
+                context=SimpleNamespace(open_message_id="message-card"),
+                operator=SimpleNamespace(open_id="ou_user"),
+            )
+        )
+        valid = SimpleNamespace(
+            event=SimpleNamespace(
+                action=SimpleNamespace(
+                    value={
+                        "channel": "deerflow_proposal",
+                        "action": "reject",
+                        "proposal_id": "p_test",
+                    }
+                ),
+                context=SimpleNamespace(open_message_id="message-card"),
+                operator=SimpleNamespace(open_id="ou_user"),
+            )
+        )
+
+        self.assertIsNone(_parse_proposal_action(invalid))
+        self.assertEqual(
+            _parse_proposal_action(valid),
+            ("reject", "p_test", "message-card", "feishu:ou_user"),
+        )
 
     async def test_astop_cancels_inflight_message_handlers(self) -> None:
         channel = _RecordingFeishuChannel()

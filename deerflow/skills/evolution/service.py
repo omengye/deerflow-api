@@ -412,6 +412,7 @@ class SkillEvolutionService:
         *,
         expected_base_sha256: str | None = None,
         note: str | None = None,
+        actor: str = "admin",
     ) -> SkillProposal:
         proposal = self.store.load_proposal(proposal_id)
         if proposal.status != "pending_review":
@@ -421,7 +422,7 @@ class SkillEvolutionService:
 
         return await self._publish_pending_proposal(
             proposal,
-            actor="admin",
+            actor=actor,
             note=note,
             auto_published=False,
         )
@@ -495,7 +496,13 @@ class SkillEvolutionService:
             self.store.append_audit(actor="system", action="signal.failed", details={"signal_id": signal.id, "error": str(exc)})
             raise
 
-    def reject_proposal(self, proposal_id: str, *, note: str | None = None) -> SkillProposal:
+    def reject_proposal(
+        self,
+        proposal_id: str,
+        *,
+        note: str | None = None,
+        actor: str = "admin",
+    ) -> SkillProposal:
         proposal = self.store.load_proposal(proposal_id)
         if proposal.status != "pending_review":
             raise ValueError(f"Proposal '{proposal_id}' is not pending review.")
@@ -504,7 +511,7 @@ class SkillEvolutionService:
         proposal.review_note = note
         proposal.updated_at = proposal.reviewed_at
         self.store.save_proposal(proposal)
-        self.store.append_audit(actor="admin", action="proposal.rejected", details={"proposal_id": proposal.id, "note": note})
+        self.store.append_audit(actor=actor, action="proposal.rejected", details={"proposal_id": proposal.id, "note": note})
         return proposal
 
     def archive_proposal(self, proposal_id: str, *, actor: str = "admin") -> SkillProposal:

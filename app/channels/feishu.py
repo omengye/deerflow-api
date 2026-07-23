@@ -18,6 +18,7 @@ import json
 import logging
 import mimetypes
 from pathlib import Path
+import re
 import tempfile
 import threading
 import time
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 _PATCH_INTERVAL = 1.0  # seconds between card patch calls
 _INITIAL_PATCH_MIN_CHARS = 24
 _RESET_COMMANDS = frozenset({"/new", "/reset"})
+_PROPOSAL_COMMANDS = frozenset({"/proposal", "/proposals"})
+_PROPOSAL_ID_RE = re.compile(r"^p_[A-Za-z0-9_-]{1,128}$")
+_PROPOSAL_DIFF_MAX_CHARS = 1_800
+_PROPOSAL_ERROR_MAX_CHARS = 500
 _MAX_FEISHU_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_FEISHU_FILE_BYTES = 30 * 1024 * 1024
 _FEISHU_IMAGE_EXTENSIONS = frozenset(
@@ -199,6 +204,198 @@ def _make_card(content: str) -> str:
     )
 
 
+def _bounded_text(value: Any, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 1]}…"
+
+
+def _safe_inline_text(value: Any) -> str:
+    return _bounded_text(value, 500).replace("`", "'").replace("\n", " ")
+
+
+def _make_proposal_card(
+    proposal: Any,
+    diff: str,
+    *,
+    processing: bool = False,
+    error: str | None = None,
+) -> str:
+    """Build a bounded interactive card for one Skill Proposal."""
+    status = str(getattr(proposal, "status", "pending_review"))
+    status_labels = {
+        "pending_review": "待审批",
+        "publishing": "发布中",
+        "published": "已发布",
+        "rejected": "已拒绝",
+        "failed": "失败",
+        "stale": "已失效",
+    }
+    action_labels = {
+        "create": "创建",
+        "edit": "编辑",
+        "patch": "局部修改",
+        "delete": "删除",
+        "write_file": "写入文件",
+        "remove_file": "删除文件",
+    }
+    risk_labels = {"low": "低", "medium": "中", "high": "高"}
+    if processing:
+        title = "Skill Proposal · 处理中"
+        template = "blue"
+    else:
+        title = f"Skill Proposal · {status_labels.get(status, status)}"
+        template = {
+            "pending_review": "orange",
+            "published": "green",
+            "rejected": "grey",
+            "failed": "red",
+            "stale": "red",
+        }.get(status, "blue")
+
+    proposal_id = _safe_inline_text(getattr(proposal, "id", ""))
+    skill_name = _safe_inline_text(getattr(proposal, "skill_name", ""))
+    action = str(getattr(proposal, "action", ""))
+    risk = str(getattr(proposal, "risk", ""))
+    reason = _safe_inline_text(getattr(proposal, "reason", "")) or "未提供"
+    details = (
+        f"**Skill：** `{skill_name}`\n"
+        f"**动作：** {action_labels.get(action, _safe_inline_text(action))}\n"
+        f"**风险：** {risk_labels.get(risk, _safe_inline_text(risk))}\n"
+        f"**原因：** {reason}\n"
+        f"**Proposal ID：** `{proposal_id}`"
+    )
+    elements: list[dict[str, Any]] = [
+        {"tag": "div", "text": {"tag": "lark_md", "content": details}},
+        {"tag": "hr"},
+    ]
+    bounded_diff = _bounded_text(diff, _PROPOSAL_DIFF_MAX_CHARS).replace("```", "``\u200b`")
+    if bounded_diff:
+        elements.append(
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"**变更摘要**\n```diff\n{bounded_diff}\n```",
+                },
+            }
+        )
+    else:
+        elements.append(
+            {"tag": "div", "text": {"tag": "lark_md", "content": "**变更摘要**\n（无差异内容）"}}
+        )
+
+    if error:
+        elements.extend(
+            [
+                {"tag": "hr"},
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"⚠️ **操作失败：** {_safe_inline_text(_bounded_text(error, _PROPOSAL_ERROR_MAX_CHARS))}",
+                    },
+                },
+            ]
+        )
+
+    if status == "pending_review" and not processing:
+        elements.append(
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "type": "default",
+                        "text": {"tag": "plain_text", "content": "拒绝"},
+                        "value": {
+                            "channel": "deerflow_proposal",
+                            "action": "reject",
+                            "proposal_id": proposal_id,
+                        },
+                    },
+                    {
+                        "tag": "button",
+                        "type": "primary",
+                        "text": {"tag": "plain_text", "content": "批准并发布"},
+                        "value": {
+                            "channel": "deerflow_proposal",
+                            "action": "approve",
+                            "proposal_id": proposal_id,
+                        },
+                        "confirm": {
+                            "title": {"tag": "plain_text", "content": "确认批准并发布？"},
+                            "text": {"tag": "plain_text", "content": "批准后将立即修改当前 Skill。"},
+                        },
+                    },
+                ],
+            }
+        )
+
+    return json.dumps(
+        {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": template,
+                "title": {"tag": "plain_text", "content": title},
+            },
+            "elements": elements,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _make_proposal_error_card(proposal_id: str, error: str) -> str:
+    return json.dumps(
+        {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "red",
+                "title": {"tag": "plain_text", "content": "Skill Proposal · 操作失败"},
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": (
+                            f"**Proposal ID：** `{_safe_inline_text(proposal_id)}`\n"
+                            f"⚠️ {_safe_inline_text(_bounded_text(error, _PROPOSAL_ERROR_MAX_CHARS))}"
+                        ),
+                    },
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
+def _parse_proposal_action(data: Any) -> tuple[str, str, str, str] | None:
+    event = getattr(data, "event", None)
+    action_event = getattr(event, "action", None)
+    value = getattr(action_event, "value", None)
+    if not isinstance(value, dict) or value.get("channel") != "deerflow_proposal":
+        return None
+
+    action = value.get("action")
+    proposal_id = value.get("proposal_id")
+    if action not in {"approve", "reject"}:
+        return None
+    if not isinstance(proposal_id, str) or not _PROPOSAL_ID_RE.fullmatch(proposal_id):
+        return None
+
+    context = getattr(event, "context", None)
+    card_id = getattr(context, "open_message_id", None)
+    if not isinstance(card_id, str) or not card_id:
+        return None
+
+    operator = getattr(event, "operator", None)
+    open_id = getattr(operator, "open_id", None)
+    actor = f"feishu:{open_id}" if isinstance(open_id, str) and open_id else "feishu:user"
+    return action, proposal_id, card_id, actor
+
+
 class FeishuChannel:
     def __init__(self, app_id: str, app_secret: str, verification_token: str = "") -> None:
         self._app_id = app_id
@@ -217,6 +414,10 @@ class FeishuChannel:
         # Feishu receives full-state snapshots on every turn. Track artifacts
         # already sent per thread so historical generated files are not resent.
         self._sent_artifacts_by_thread: dict[str, set[str]] = {}
+        # Proposal notifications are deduplicated per DeerFlow thread. The
+        # explicit /proposals command bypasses this set.
+        self._sent_proposals_by_thread: dict[str, set[str]] = {}
+        self._proposal_action_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -317,6 +518,7 @@ class FeishuChannel:
                 self._app_secret,
             )
             .register_p2_im_message_receive_v1(self._on_message)
+            .register_p2_card_action_trigger(self._on_card_action)
             .build()
         )
         # ws.Client is constructed directly — no builder pattern.
@@ -343,6 +545,26 @@ class FeishuChannel:
     # ------------------------------------------------------------------
     # Internal: message routing (sync — called by lark-oapi WS thread)
     # ------------------------------------------------------------------
+
+    def _track_handler_future(self, future: Future[None], label: str) -> None:
+        with self._handler_futures_lock:
+            self._handler_futures.add(future)
+
+        def _on_done(done: Future[None]) -> None:
+            with self._handler_futures_lock:
+                self._handler_futures.discard(done)
+            try:
+                exc = done.exception()
+            except FutureCancelledError:
+                return
+            if exc is not None:
+                logger.error(
+                    "Feishu %s handler error",
+                    label,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        future.add_done_callback(_on_done)
 
     def _on_message(self, data: Any) -> None:
         """Sync handler called by lark-oapi for each IM message event.
@@ -409,25 +631,39 @@ class FeishuChannel:
                 ),
                 self._main_loop,
             )
-            with self._handler_futures_lock:
-                self._handler_futures.add(fut)
-
-            def _on_done(done: Future[None]) -> None:
-                with self._handler_futures_lock:
-                    self._handler_futures.discard(done)
-                try:
-                    exc = done.exception()
-                except FutureCancelledError:
-                    return
-                if exc is not None:
-                    logger.error(
-                        "Feishu message handler error",
-                        exc_info=(type(exc), exc, exc.__traceback__),
-                    )
-
-            fut.add_done_callback(_on_done)
+            self._track_handler_future(fut, "message")
         except Exception:
             logger.exception("Error in Feishu _on_message")
+
+    def _on_card_action(self, data: Any) -> Any:
+        """Acknowledge a Feishu card click and schedule Proposal review."""
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        response = P2CardActionTriggerResponse({})
+        try:
+            parsed = _parse_proposal_action(data)
+            if parsed is None:
+                return response
+            action, proposal_id, card_id, actor = parsed
+            if self._main_loop is None:
+                logger.error("Feishu channel received a card action before start() initialised the main loop")
+                return response
+
+            future = asyncio.run_coroutine_threadsafe(
+                self._handle_proposal_action(
+                    card_id=card_id,
+                    proposal_id=proposal_id,
+                    action=action,
+                    actor=actor,
+                ),
+                self._main_loop,
+            )
+            self._track_handler_future(future, "Proposal action")
+        except Exception:
+            logger.exception("Error in Feishu _on_card_action")
+        return response
 
     # ------------------------------------------------------------------
     # Internal: message handling pipeline (runs in _main_loop)
@@ -446,6 +682,13 @@ class FeishuChannel:
         resources = resources or []
         if not resources and text.lower() in _RESET_COMMANDS:
             await self._handle_reset(message_id=message_id, chat_id=chat_id, thread_id=thread_id)
+            return
+        if not resources and text.lower() in _PROPOSAL_COMMANDS:
+            await self._handle_proposals_command(
+                message_id=message_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
             return
 
         lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
@@ -475,6 +718,10 @@ class FeishuChannel:
                         return
                     prompt = _build_prompt_with_uploads(text, uploaded_files)
                 _ = await self._stream_to_cards(prompt, thread_id, chat_id, card_id)
+                try:
+                    await self._send_pending_proposal_cards(thread_id, chat_id, force=False)
+                except Exception:
+                    logger.exception("Failed to send pending Proposal cards (thread=%s)", thread_id)
             except asyncio.CancelledError:
                 cancelled = True
                 raise
@@ -504,6 +751,7 @@ class FeishuChannel:
             # Remove the lock entry so the next message starts with a clean state.
             self._chat_locks.pop(chat_id, None)
             self._sent_artifacts_by_thread.pop(thread_id, None)
+            self._sent_proposals_by_thread.pop(thread_id, None)
             await self._add_reaction(message_id, "DONE")
             if result.get("success"):
                 await self._send_card(chat_id, "✅ 会话已重置，开始新对话吧！")
@@ -511,6 +759,110 @@ class FeishuChannel:
                 await self._send_card(chat_id, "⏳ 正在处理中，请稍后再试。")
             else:
                 await self._send_card(chat_id, "❌ 重置失败，请稍后再试。")
+
+    async def _handle_proposals_command(
+        self,
+        *,
+        message_id: str,
+        chat_id: str,
+        thread_id: str,
+    ) -> None:
+        """List all pending Proposals for the current Feishu conversation."""
+        lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
+        if lock.locked():
+            logger.info("Feishu chat %s busy — skipping Proposal listing", chat_id)
+            return
+        async with lock:
+            await self._add_reaction(message_id, "OK")
+            try:
+                sent = await self._send_pending_proposal_cards(thread_id, chat_id, force=True)
+                if sent == 0:
+                    await self._send_card(chat_id, "当前没有待审批 Proposal。")
+            except Exception as exc:
+                logger.exception("Failed to list pending Proposals (thread=%s)", thread_id)
+                await self._send_card(
+                    chat_id,
+                    f"❌ 获取待审批 Proposal 失败：{_bounded_text(exc, _PROPOSAL_ERROR_MAX_CHARS)}",
+                )
+            finally:
+                await self._add_reaction(message_id, "DONE")
+
+    async def _send_pending_proposal_cards(
+        self,
+        thread_id: str,
+        chat_id: str,
+        *,
+        force: bool,
+    ) -> int:
+        from app.proposal_review import list_pending_proposals
+
+        reviews = list_pending_proposals(thread_id)
+        sent_ids = self._sent_proposals_by_thread.setdefault(thread_id, set())
+        sent = 0
+        for proposal, diff in reviews:
+            if not force and proposal.id in sent_ids:
+                continue
+            message_id = await self._send_raw_card(chat_id, _make_proposal_card(proposal, diff))
+            if message_id:
+                sent_ids.add(proposal.id)
+                sent += 1
+        return sent
+
+    async def _handle_proposal_action(
+        self,
+        *,
+        card_id: str,
+        proposal_id: str,
+        action: str,
+        actor: str,
+    ) -> None:
+        """Review one Proposal and replace the clicked card with current state."""
+        from app import proposal_review
+
+        lock = self._proposal_action_locks.setdefault(proposal_id, asyncio.Lock())
+        async with lock:
+            try:
+                proposal, diff = proposal_review.get_skill_proposal(proposal_id)
+            except Exception as exc:
+                logger.exception("Failed to load Feishu Proposal %s", proposal_id)
+                await self._patch_raw_card(card_id, _make_proposal_error_card(proposal_id, str(exc)))
+                return
+
+            if proposal.status != "pending_review":
+                await self._patch_raw_card(card_id, _make_proposal_card(proposal, diff))
+                return
+
+            await self._patch_raw_card(card_id, _make_proposal_card(proposal, diff, processing=True))
+            try:
+                if action == "approve":
+                    proposal = await proposal_review.approve_skill_proposal(
+                        proposal_id,
+                        expected_base_sha256=proposal.base_sha256,
+                        note="在飞书中批准并发布",
+                        actor=actor,
+                    )
+                else:
+                    proposal = proposal_review.reject_skill_proposal(
+                        proposal_id,
+                        note="在飞书中拒绝",
+                        actor=actor,
+                    )
+                await self._patch_raw_card(card_id, _make_proposal_card(proposal, diff))
+            except Exception as exc:
+                logger.exception("Feishu Proposal %s action failed", proposal_id)
+                try:
+                    current, current_diff = proposal_review.get_skill_proposal(proposal_id)
+                except Exception:
+                    await self._patch_raw_card(card_id, _make_proposal_error_card(proposal_id, str(exc)))
+                    return
+                await self._patch_raw_card(
+                    card_id,
+                    _make_proposal_card(
+                        current,
+                        current_diff,
+                        error=str(exc) if current.status == "pending_review" else None,
+                    ),
+                )
 
     async def _stream_to_cards(
         self,
@@ -918,6 +1270,10 @@ class FeishuChannel:
 
     async def _send_card(self, chat_id: str, content: str) -> str:
         """Send an interactive card to chat_id; return the Feishu message_id."""
+        return await self._send_raw_card(chat_id, _make_card(content))
+
+    async def _send_raw_card(self, chat_id: str, card: str) -> str:
+        """Send a fully-built interactive card to chat_id."""
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
         req = (
@@ -927,7 +1283,7 @@ class FeishuChannel:
                 CreateMessageRequestBody.builder()
                 .receive_id(chat_id)
                 .msg_type("interactive")
-                .content(_make_card(content))
+                .content(card)
                 .build()
             )
             .build()
@@ -940,6 +1296,10 @@ class FeishuChannel:
 
     async def _patch_card(self, card_id: str, content: str) -> None:
         """Update an existing interactive card with new content."""
+        await self._patch_raw_card(card_id, _make_card(content))
+
+    async def _patch_raw_card(self, card_id: str, card: str) -> None:
+        """Replace an existing message with a fully-built interactive card."""
         if not card_id:
             return
         from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
@@ -949,7 +1309,7 @@ class FeishuChannel:
             .message_id(card_id)
             .request_body(
                 PatchMessageRequestBody.builder()
-                .content(_make_card(content))
+                .content(card)
                 .build()
             )
             .build()

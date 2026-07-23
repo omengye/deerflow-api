@@ -21,7 +21,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config import FeishuSettings, settings
 from app.dependencies import get_client_manager
-from deerflow.config.app_config import AppConfig, pop_current_app_config, push_current_app_config
+from app.proposal_review import (
+    approve_skill_proposal,
+    get_skill_catalog_version,
+    proposal_app_config_context,
+    refresh_skill_prompt_cache,
+    reject_skill_proposal,
+)
+from deerflow.config.app_config import AppConfig
 from deerflow.config.extensions_config import ExtensionsConfig
 from deerflow.config.memory_config import MemoryConfig
 from deerflow.config.model_config import ModelConfig
@@ -284,12 +291,8 @@ def _admin_scheduled_task_response(task: ScheduledTask) -> dict[str, Any]:
 
 @contextmanager
 def _admin_app_config_context():
-    config = AppConfig.from_file(str(_config_path()))
-    push_current_app_config(config)
-    try:
+    with proposal_app_config_context():
         yield
-    finally:
-        pop_current_app_config()
 
 
 def _load_config_data(path: Path | None = None) -> dict[str, Any]:
@@ -564,12 +567,7 @@ def _skill_enabled_state(name: str, default: bool) -> bool:
 
 
 async def _refresh_after_skill_change(*, reload: bool) -> dict[str, Any] | None:
-    try:
-        from deerflow.agents.lead_agent.prompt import refresh_skills_system_prompt_cache_async
-
-        await refresh_skills_system_prompt_cache_async()
-    except Exception:
-        logger.debug("Failed to refresh skills prompt cache after admin skill change", exc_info=True)
+    await refresh_skill_prompt_cache()
     if not reload:
         return None
     manager = get_client_manager()
@@ -1670,18 +1668,16 @@ async def get_admin_evolution_proposal(proposal_id: str):
 async def approve_admin_evolution_proposal(proposal_id: str, req: AdminProposalReviewRequest = Body(default=AdminProposalReviewRequest())):
     """Validate and atomically publish a pending Skill Proposal."""
     try:
-        with _admin_app_config_context():
-            proposal = await SkillEvolutionService().approve_proposal(
-                proposal_id,
-                expected_base_sha256=req.expected_base_sha256,
-                note=req.note,
-            )
-            await _refresh_after_skill_change(reload=False)
-            return {
-                "success": True,
-                "proposal": proposal.model_dump(mode="json"),
-                "catalog_version": get_evolution_store().get_catalog_version(),
-            }
+        proposal = await approve_skill_proposal(
+            proposal_id,
+            expected_base_sha256=req.expected_base_sha256,
+            note=req.note,
+        )
+        return {
+            "success": True,
+            "proposal": proposal.model_dump(mode="json"),
+            "catalog_version": get_skill_catalog_version(),
+        }
     except SkillPublishConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
@@ -1692,9 +1688,8 @@ async def approve_admin_evolution_proposal(proposal_id: str, req: AdminProposalR
 async def reject_admin_evolution_proposal(proposal_id: str, req: AdminProposalReviewRequest = Body(default=AdminProposalReviewRequest())):
     """Reject a pending Skill Proposal without changing active files."""
     try:
-        with _admin_app_config_context():
-            proposal = SkillEvolutionService().reject_proposal(proposal_id, note=req.note)
-            return {"success": True, "proposal": proposal.model_dump(mode="json")}
+        proposal = reject_skill_proposal(proposal_id, note=req.note)
+        return {"success": True, "proposal": proposal.model_dump(mode="json")}
     except Exception as exc:
         raise _safe_skill_error(exc) from exc
 
