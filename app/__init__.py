@@ -60,7 +60,6 @@ async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
     manager = get_client_manager()
     await manager.startup()
-    await manager.start_feishu_channel()
     evolution_worker = None
     try:
         from deerflow.config import get_app_config

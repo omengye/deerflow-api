@@ -151,6 +151,13 @@ class AdminRuntimePatchRequest(BaseModel):
     scheduler_enabled: bool | None = None
     scheduler_poll_interval_seconds: float | None = Field(default=None, ge=0.5, le=3600)
     scheduler_timezone: str | None = Field(default=None, min_length=1, max_length=128)
+    scheduler_max_concurrent_runs: int | None = Field(default=None, ge=1, le=100)
+    scheduler_max_attempts: int | None = Field(default=None, ge=1, le=20)
+    scheduler_retry_base_seconds: float | None = Field(default=None, ge=0, le=3600)
+    scheduler_claim_lease_seconds: float | None = Field(default=None, ge=5, le=86400)
+    scheduler_shutdown_grace_seconds: float | None = Field(default=None, ge=0, le=600)
+    scheduler_run_retention_days: int | None = Field(default=None, ge=1, le=3650)
+    scheduler_max_runs_per_task: int | None = Field(default=None, ge=1, le=100000)
     reload: bool = True
 
 
@@ -201,6 +208,13 @@ _RESTART_RUNTIME_FIELDS = {
     "scheduler_enabled",
     "scheduler_poll_interval_seconds",
     "scheduler_timezone",
+    "scheduler_max_concurrent_runs",
+    "scheduler_max_attempts",
+    "scheduler_retry_base_seconds",
+    "scheduler_claim_lease_seconds",
+    "scheduler_shutdown_grace_seconds",
+    "scheduler_run_retention_days",
+    "scheduler_max_runs_per_task",
 }
 
 _KNOWN_TOP_LEVEL_CONFIG_KEYS = {

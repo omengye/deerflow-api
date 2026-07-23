@@ -46,8 +46,10 @@ def _get_tzinfo(timezone: str):
         normalized = timezone.strip().upper()
         if normalized in {"UTC", "ETC/UTC", "Z"}:
             return UTC
-        if timezone in {"Asia/Shanghai", "Asia/Chongqing", "Asia/Harbin", "Asia/Urumqi"}:
+        if timezone in {"Asia/Shanghai", "Asia/Chongqing", "Asia/Harbin"}:
             return fixed_timezone(timedelta(hours=8), "Asia/Shanghai")
+        if timezone == "Asia/Urumqi":
+            return fixed_timezone(timedelta(hours=6), "Asia/Urumqi")
         raise
 
 
@@ -87,8 +89,13 @@ def compute_next_run_at(
             candidate = _parse_dt(start_at_raw, timezone)
         else:
             candidate = base + timedelta(seconds=seconds)
-        while candidate <= base:
-            candidate += timedelta(seconds=seconds)
+        if candidate <= base:
+            # Jump directly to the first future slot.  Iterating one interval
+            # at a time can hold the SQLite write transaction for minutes when
+            # a legacy anchor is years behind (especially for 1-second tasks).
+            elapsed_seconds = (base - candidate).total_seconds()
+            elapsed_intervals = int(elapsed_seconds // seconds) + 1
+            candidate += timedelta(seconds=elapsed_intervals * seconds)
         return candidate
 
     if schedule_type == "daily":
@@ -164,6 +171,13 @@ class SchedulerStore:
                     run_id TEXT,
                     status TEXT NOT NULL,
                     error TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    available_at TEXT,
+                    lease_expires_at TEXT,
+                    execution_status TEXT,
+                    execution_error TEXT,
+                    delivery_status TEXT,
+                    delivery_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(task_id) REFERENCES scheduled_tasks(id)
@@ -171,6 +185,29 @@ class SchedulerStore:
 
                 CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_task
                     ON scheduled_task_runs(task_id, created_at DESC);
+
+                """
+            )
+            # CREATE TABLE IF NOT EXISTS does not evolve databases created by
+            # older releases.  Add scheduler-run columns in place so existing
+            # task definitions and history remain usable after upgrade.
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(scheduled_task_runs)")}
+            migrations = {
+                "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "available_at": "TEXT",
+                "lease_expires_at": "TEXT",
+                "execution_status": "TEXT",
+                "execution_error": "TEXT",
+                "delivery_status": "TEXT",
+                "delivery_error": "TEXT",
+            }
+            for column, declaration in migrations.items():
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE scheduled_task_runs ADD COLUMN {column} {declaration}")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_claimable
+                ON scheduled_task_runs(status, available_at, lease_expires_at)
                 """
             )
 
@@ -178,6 +215,8 @@ class SchedulerStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA foreign_keys = ON")
         try:
             yield conn
             conn.commit()
@@ -200,9 +239,16 @@ class SchedulerStore:
         kwargs: dict[str, Any] | None = None,
         multitask_strategy: str = "reject",
     ) -> ScheduledTask:
+        normalized_expr = dict(schedule_expr)
+        if schedule_type == "interval" and not normalized_expr.get("start_at"):
+            seconds = int(normalized_expr.get("every_seconds") or 0)
+            if seconds < 1:
+                raise ValueError("schedule_expr.every_seconds must be >= 1 for interval schedules")
+            normalized_expr["start_at"] = _dt_to_iso(_utc_now() + timedelta(seconds=seconds))
+
         next_run_at = compute_next_run_at(
             schedule_type=schedule_type,
-            schedule_expr=schedule_expr,
+            schedule_expr=normalized_expr,
             timezone=timezone,
         )
         if next_run_at is None:
@@ -226,7 +272,7 @@ class SchedulerStore:
                         thread_id,
                         prompt,
                         schedule_type,
-                        json.dumps(schedule_expr, ensure_ascii=False),
+                        json.dumps(normalized_expr, ensure_ascii=False),
                         timezone,
                         _dt_to_iso(next_run_at),
                         created_by,
@@ -319,18 +365,33 @@ class SchedulerStore:
 
         return await asyncio.to_thread(_write)
 
-    async def claim_due_tasks(self, *, now: datetime, limit: int = 10) -> list[tuple[ScheduledTask, str, str]]:
-        """Claim due tasks and create run records.
+    async def claim_due_tasks(
+        self,
+        *,
+        now: datetime,
+        limit: int = 10,
+        lease_seconds: float = 120.0,
+        max_attempts: int = 3,
+    ) -> list[tuple[ScheduledTask, str, str, int]]:
+        """Materialize due occurrences and lease runnable rows atomically.
 
-        Returns tuples of (task, task_run_id, scheduled_at).
+        A task definition may advance as soon as its occurrence is persisted,
+        but the occurrence itself remains recoverable.  Expired ``claimed`` or
+        ``running`` leases are retried after a process crash.
         """
+        limit = max(1, min(limit, 100))
+        max_attempts = max(1, max_attempts)
+        now = now.astimezone(UTC)
         now_iso = _dt_to_iso(now)
+        lease_expires_at = _dt_to_iso(now + timedelta(seconds=max(1.0, lease_seconds)))
 
-        def _claim() -> list[tuple[ScheduledTask, str, str]]:
-            claimed: list[tuple[ScheduledTask, str, str]] = []
+        def _claim() -> list[tuple[ScheduledTask, str, str, int]]:
+            claimed: list[tuple[ScheduledTask, str, str, int]] = []
             with self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                rows = conn.execute(
+
+                # First turn due schedule definitions into durable occurrences.
+                due_rows = conn.execute(
                     """
                     SELECT * FROM scheduled_tasks
                     WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?
@@ -339,78 +400,339 @@ class SchedulerStore:
                     """,
                     (now_iso, limit),
                 ).fetchall()
-                for row in rows:
-                    task = self._row_to_task(row)
-                    scheduled_at = task.next_run_at or now_iso
+                for row in due_rows:
                     run_row_id = str(uuid.uuid4())
-                    next_dt = compute_next_run_at(
-                        schedule_type=task.schedule_type,
-                        schedule_expr=task.schedule_expr,
-                        timezone=task.timezone,
-                        after=now,
-                    )
-                    enabled = 1
+                    scheduled_at = row["next_run_at"] or now_iso
+                    try:
+                        task = self._row_to_task(row)
+                        schedule_expr = dict(task.schedule_expr)
+                        # Legacy interval rows may not have a persisted anchor.
+                        # Anchor them to the occurrence being consumed so polling
+                        # latency does not accumulate as schedule drift.
+                        if task.schedule_type == "interval" and not schedule_expr.get("start_at"):
+                            schedule_expr["start_at"] = scheduled_at
+                        next_dt = compute_next_run_at(
+                            schedule_type=task.schedule_type,
+                            schedule_expr=schedule_expr,
+                            timezone=task.timezone,
+                            after=now,
+                        )
+                    except Exception as exc:
+                        detail = f"Invalid schedule quarantined: {type(exc).__name__}: {exc}"[:2000]
+                        conn.execute(
+                            "UPDATE scheduled_tasks SET enabled = 0, next_run_at = NULL, updated_at = ? WHERE id = ?",
+                            (now_iso, row["id"]),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO scheduled_task_runs (
+                                id, task_id, scheduled_at, status, error,
+                                execution_status, execution_error,
+                                attempt_count, created_at, updated_at, finished_at
+                            ) VALUES (?, ?, ?, 'dead_letter', ?, 'error', ?, 0, ?, ?, ?)
+                            """,
+                            (run_row_id, row["id"], scheduled_at, detail, detail, now_iso, now_iso, now_iso),
+                        )
+                        logger.error("Scheduled task %s was quarantined: %s", row["id"], detail)
+                        continue
+
                     if task.schedule_type == "once":
                         enabled = 0
                         next_run_at = None
                     else:
                         next_run_at = _dt_to_iso(next_dt) if next_dt else None
-                        if next_run_at is None:
-                            enabled = 0
+                        enabled = 1 if next_run_at is not None else 0
                     conn.execute(
                         """
                         UPDATE scheduled_tasks
-                        SET enabled = ?, next_run_at = ?, updated_at = ?
+                        SET enabled = ?, next_run_at = ?, schedule_expr = ?, updated_at = ?
                         WHERE id = ?
                         """,
-                        (enabled, next_run_at, now_iso, task.id),
+                        (enabled, next_run_at, json.dumps(schedule_expr, ensure_ascii=False), now_iso, task.id),
                     )
                     conn.execute(
                         """
                         INSERT INTO scheduled_task_runs (
-                            id, task_id, scheduled_at, status, created_at, updated_at
-                        )
-                        VALUES (?, ?, ?, 'claimed', ?, ?)
+                            id, task_id, scheduled_at, status, attempt_count,
+                            available_at, created_at, updated_at
+                        ) VALUES (?, ?, ?, 'pending', 0, ?, ?, ?)
                         """,
-                        (run_row_id, task.id, scheduled_at, now_iso, now_iso),
+                        (run_row_id, task.id, scheduled_at, now_iso, now_iso, now_iso),
                     )
-                    claimed.append((task, run_row_id, scheduled_at))
-                conn.commit()
+
+                claimable_sql = """
+                    (
+                        status IN ('pending', 'retry')
+                        AND COALESCE(available_at, scheduled_at) <= ?
+                    ) OR (
+                        status IN ('claimed', 'running')
+                        AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                    )
+                """
+                # Exhausted stale/pending work is retained as a dead letter
+                # instead of being silently stranded forever.
+                conn.execute(
+                    f"""
+                    UPDATE scheduled_task_runs
+                    SET status = 'dead_letter',
+                        error = COALESCE(error, 'Maximum scheduler attempts exhausted'),
+                        finished_at = COALESCE(finished_at, ?),
+                        lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE attempt_count >= ? AND ({claimable_sql})
+                    """,
+                    (now_iso, now_iso, max_attempts, now_iso, now_iso),
+                )
+
+                candidates = conn.execute(
+                    f"""
+                    SELECT id, task_id, scheduled_at, attempt_count
+                    FROM scheduled_task_runs
+                    WHERE attempt_count < ? AND ({claimable_sql})
+                    ORDER BY COALESCE(available_at, scheduled_at), created_at
+                    LIMIT ?
+                    """,
+                    (max_attempts, now_iso, now_iso, limit * 4),
+                ).fetchall()
+                # Include leases acquired by every scheduler process, not only
+                # rows selected in this transaction.  Conversations share a
+                # checkpoint namespace and must be serialized across workers.
+                claimed_threads = {
+                    row["thread_id"]
+                    for row in conn.execute(
+                        """
+                        SELECT DISTINCT tasks.thread_id
+                        FROM scheduled_task_runs AS runs
+                        JOIN scheduled_tasks AS tasks ON tasks.id = runs.task_id
+                        WHERE runs.status IN ('claimed', 'running')
+                          AND runs.lease_expires_at IS NOT NULL
+                          AND runs.lease_expires_at > ?
+                        """,
+                        (now_iso,),
+                    ).fetchall()
+                }
+                for run_row in candidates:
+                    if len(claimed) >= limit:
+                        break
+                    task_row = conn.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (run_row["task_id"],)).fetchone()
+                    if task_row is None:
+                        conn.execute(
+                            "UPDATE scheduled_task_runs SET status = 'dead_letter', error = ?, finished_at = ?, updated_at = ? WHERE id = ?",
+                            ("Scheduled task definition no longer exists", now_iso, now_iso, run_row["id"]),
+                        )
+                        continue
+                    try:
+                        task = self._row_to_task(task_row)
+                    except Exception as exc:
+                        detail = f"Invalid task data: {type(exc).__name__}: {exc}"[:2000]
+                        conn.execute(
+                            "UPDATE scheduled_tasks SET enabled = 0, next_run_at = NULL, updated_at = ? WHERE id = ?",
+                            (now_iso, run_row["task_id"]),
+                        )
+                        conn.execute(
+                            "UPDATE scheduled_task_runs SET status = 'dead_letter', error = ?, execution_status = 'error', execution_error = ?, finished_at = ?, updated_at = ? WHERE id = ?",
+                            (detail, detail, now_iso, now_iso, run_row["id"]),
+                        )
+                        continue
+                    # No process may safely run two occurrences against the
+                    # same conversation/checkpoint concurrently.
+                    if task.thread_id in claimed_threads:
+                        continue
+                    claimed_threads.add(task.thread_id)
+                    conn.execute(
+                        """
+                        UPDATE scheduled_task_runs
+                        SET status = 'claimed', attempt_count = attempt_count + 1,
+                            available_at = NULL, lease_expires_at = ?, run_id = NULL,
+                            started_at = NULL, finished_at = NULL, error = NULL,
+                            execution_status = NULL, execution_error = NULL,
+                            delivery_status = NULL, delivery_error = NULL,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (lease_expires_at, now_iso, run_row["id"]),
+                    )
+                    claimed.append(
+                        (
+                            task,
+                            run_row["id"],
+                            run_row["scheduled_at"],
+                            int(run_row["attempt_count"] or 0) + 1,
+                        )
+                    )
             return claimed
 
         return await asyncio.to_thread(_claim)
 
-    async def mark_task_run_started(self, task_run_id: str, run_id: str) -> None:
+    async def mark_task_run_started(self, task_run_id: str, run_id: str, *, attempt_count: int) -> bool:
         now = _dt_to_iso(_utc_now())
 
-        def _write() -> None:
+        def _write() -> bool:
             with self._connect() as conn:
-                conn.execute(
+                cur = conn.execute(
                     """
                     UPDATE scheduled_task_runs
-                    SET run_id = ?, status = 'running', started_at = ?, updated_at = ?
-                    WHERE id = ?
+                    SET run_id = ?, status = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
+                    WHERE id = ? AND attempt_count = ? AND status IN ('claimed', 'running')
                     """,
-                    (run_id, now, now, task_run_id),
+                    (run_id, now, now, task_run_id, attempt_count),
                 )
+                return cur.rowcount > 0
 
-        await asyncio.to_thread(_write)
+        return await asyncio.to_thread(_write)
 
-    async def mark_task_run_finished(self, task_run_id: str, status: str, error: str | None = None) -> None:
+    async def renew_task_run_lease(
+        self,
+        task_run_id: str,
+        *,
+        attempt_count: int,
+        lease_seconds: float,
+    ) -> bool:
+        now = _utc_now()
+        lease_expires_at = _dt_to_iso(now + timedelta(seconds=max(1.0, lease_seconds)))
+        now_iso = _dt_to_iso(now)
+
+        def _write() -> bool:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE scheduled_task_runs
+                    SET lease_expires_at = ?, updated_at = ?
+                    WHERE id = ? AND attempt_count = ? AND status IN ('claimed', 'running')
+                    """,
+                    (lease_expires_at, now_iso, task_run_id, attempt_count),
+                )
+                return cur.rowcount > 0
+
+        return await asyncio.to_thread(_write)
+
+    async def get_task_run(self, task_run_id: str) -> dict[str, Any] | None:
+        def _read() -> dict[str, Any] | None:
+            with self._connect() as conn:
+                row = conn.execute("SELECT * FROM scheduled_task_runs WHERE id = ?", (task_run_id,)).fetchone()
+                return dict(row) if row else None
+
+        return await asyncio.to_thread(_read)
+
+    async def reschedule_task_run(
+        self,
+        task_run_id: str,
+        *,
+        error: str,
+        delay_seconds: float,
+        max_attempts: int,
+        attempt_count: int,
+        execution_status: str | None = None,
+        execution_error: str | None = None,
+        delivery_status: str | None = None,
+        delivery_error: str | None = None,
+    ) -> bool | None:
+        """Retry a leased occurrence, or dead-letter it when exhausted.
+
+        Returns ``True`` when another attempt was scheduled, ``False`` when
+        exhausted, and ``None`` when this caller no longer owns the lease.
+        """
+        now = _utc_now()
+        now_iso = _dt_to_iso(now)
+        available_at = _dt_to_iso(now + timedelta(seconds=max(0.0, delay_seconds)))
+
+        def _write() -> bool | None:
+            with self._connect() as conn:
+                retry = attempt_count < max(1, max_attempts)
+                status = "retry" if retry else "dead_letter"
+                cur = conn.execute(
+                    """
+                    UPDATE scheduled_task_runs
+                    SET status = ?, error = ?, available_at = ?, lease_expires_at = NULL,
+                        execution_status = ?, execution_error = ?,
+                        delivery_status = ?, delivery_error = ?,
+                        finished_at = ?, updated_at = ?
+                    WHERE id = ? AND attempt_count = ? AND status IN ('claimed', 'running')
+                    """,
+                    (
+                        status,
+                        error[:4000],
+                        available_at if retry else None,
+                        execution_status,
+                        execution_error,
+                        delivery_status,
+                        delivery_error,
+                        None if retry else now_iso,
+                        now_iso,
+                        task_run_id,
+                        attempt_count,
+                    ),
+                )
+                return retry if cur.rowcount > 0 else None
+
+        return await asyncio.to_thread(_write)
+
+    async def mark_task_run_finished(
+        self,
+        task_run_id: str,
+        status: str,
+        error: str | None = None,
+        *,
+        attempt_count: int | None = None,
+    ) -> bool:
+        return await self.mark_task_run_finished_detailed(
+            task_run_id,
+            status=status,
+            error=error,
+            execution_status=status,
+            execution_error=error,
+            delivery_status="not_requested",
+            delivery_error=None,
+            attempt_count=attempt_count,
+        )
+
+    async def mark_task_run_finished_detailed(
+        self,
+        task_run_id: str,
+        *,
+        status: str,
+        error: str | None,
+        execution_status: str | None,
+        execution_error: str | None,
+        delivery_status: str | None,
+        delivery_error: str | None,
+        attempt_count: int | None = None,
+    ) -> bool:
         now = _dt_to_iso(_utc_now())
 
-        def _write() -> None:
+        def _write() -> bool:
             with self._connect() as conn:
-                conn.execute(
-                    """
-                    UPDATE scheduled_task_runs
-                    SET status = ?, error = ?, finished_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (status, error, now, now, task_run_id),
+                attempt_clause = (
+                    ""
+                    if attempt_count is None
+                    else " AND attempt_count = ? AND status IN ('claimed', 'running')"
                 )
+                params: list[Any] = [
+                    status,
+                    error,
+                    execution_status,
+                    execution_error,
+                    delivery_status,
+                    delivery_error,
+                    now,
+                    now,
+                    task_run_id,
+                ]
+                if attempt_count is not None:
+                    params.append(attempt_count)
+                cur = conn.execute(
+                    f"""
+                    UPDATE scheduled_task_runs
+                    SET status = ?, error = ?, execution_status = ?, execution_error = ?,
+                        delivery_status = ?, delivery_error = ?, lease_expires_at = NULL,
+                        finished_at = ?, updated_at = ?
+                    WHERE id = ?{attempt_clause}
+                    """,
+                    params,
+                )
+                return cur.rowcount > 0
 
-        await asyncio.to_thread(_write)
+        return await asyncio.to_thread(_write)
 
     async def list_task_runs(self, task_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 100))
@@ -429,6 +751,47 @@ class SchedulerStore:
                 return [dict(row) for row in rows]
 
         return await asyncio.to_thread(_read)
+
+    async def cleanup_task_runs(self, *, older_than: datetime, max_per_task: int) -> int:
+        """Delete old terminal history while preserving live/retry occurrences."""
+        cutoff = _dt_to_iso(older_than)
+        max_per_task = max(1, max_per_task)
+        terminal = ("success", "error", "timeout", "interrupted", "cancelled", "dead_letter")
+
+        def _write() -> int:
+            deleted = 0
+            placeholders = ",".join("?" for _ in terminal)
+            with self._connect() as conn:
+                cur = conn.execute(
+                    f"DELETE FROM scheduled_task_runs WHERE status IN ({placeholders}) AND finished_at IS NOT NULL AND finished_at < ?",
+                    (*terminal, cutoff),
+                )
+                deleted += max(0, cur.rowcount)
+                task_ids = [
+                    row["task_id"]
+                    for row in conn.execute("SELECT DISTINCT task_id FROM scheduled_task_runs").fetchall()
+                ]
+                for task_id in task_ids:
+                    stale = conn.execute(
+                        f"""
+                        SELECT id FROM scheduled_task_runs
+                        WHERE task_id = ? AND status IN ({placeholders})
+                        ORDER BY created_at DESC
+                        LIMIT -1 OFFSET ?
+                        """,
+                        (task_id, *terminal, max_per_task),
+                    ).fetchall()
+                    if stale:
+                        ids = [row["id"] for row in stale]
+                        id_placeholders = ",".join("?" for _ in ids)
+                        cur = conn.execute(
+                            f"DELETE FROM scheduled_task_runs WHERE id IN ({id_placeholders})",
+                            ids,
+                        )
+                        deleted += max(0, cur.rowcount)
+            return deleted
+
+        return await asyncio.to_thread(_write)
 
     @staticmethod
     def _row_to_task(row: sqlite3.Row) -> ScheduledTask:
@@ -451,7 +814,11 @@ class SchedulerStore:
 
 
 class SchedulerService:
-    """Single-process scheduler loop that dispatches persisted tasks."""
+    """Lease-based scheduler with at-least-once occurrence execution.
+
+    Retrying an occurrence reruns its full prompt.  Scheduled prompts and tools
+    that mutate external systems should therefore be designed to be idempotent.
+    """
 
     def __init__(
         self,
@@ -460,15 +827,33 @@ class SchedulerService:
         manager: Any,
         poll_interval_seconds: float,
         default_timezone: str = "Asia/Shanghai",
+        max_concurrent_runs: int = 4,
+        max_attempts: int = 3,
+        retry_base_seconds: float = 15.0,
+        claim_lease_seconds: float = 120.0,
+        shutdown_grace_seconds: float = 10.0,
+        run_retention_days: int = 30,
+        max_runs_per_task: int = 1000,
     ) -> None:
         self.store = store
         self.manager = manager
         self.poll_interval_seconds = max(0.5, poll_interval_seconds)
         self.default_timezone = default_timezone
+        self.max_concurrent_runs = max(1, max_concurrent_runs)
+        self.max_attempts = max(1, max_attempts)
+        self.retry_base_seconds = max(0.0, retry_base_seconds)
+        self.claim_lease_seconds = max(5.0, claim_lease_seconds)
+        self.shutdown_grace_seconds = max(0.0, shutdown_grace_seconds)
+        self.run_retention_days = max(1, run_retention_days)
+        self.max_runs_per_task = max(1, max_runs_per_task)
         self._task: asyncio.Task | None = None
         self._stopping = asyncio.Event()
+        self._dispatch_tasks: set[asyncio.Task] = set()
+        self._last_cleanup_at = 0.0
 
     async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
         self.store.setup()
         set_scheduler_service(self)
         self._stopping.clear()
@@ -484,6 +869,14 @@ class SchedulerService:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        active = {task for task in self._dispatch_tasks if not task.done()}
+        if active and self.shutdown_grace_seconds > 0:
+            _done, active = await asyncio.wait(active, timeout=self.shutdown_grace_seconds)
+        if active:
+            for task in active:
+                task.cancel()
+            await asyncio.gather(*active, return_exceptions=True)
+        self._dispatch_tasks.clear()
         set_scheduler_service(None)
         logger.info("Scheduler service stopped")
 
@@ -498,22 +891,158 @@ class SchedulerService:
             await asyncio.sleep(self.poll_interval_seconds)
 
     async def tick(self) -> None:
-        claimed = await self.store.claim_due_tasks(now=_utc_now())
-        for task, task_run_id, scheduled_at in claimed:
-            asyncio.create_task(self._dispatch(task, task_run_id, scheduled_at))
+        loop = asyncio.get_running_loop()
+        if loop.time() - self._last_cleanup_at >= 3600:
+            deleted = await self.store.cleanup_task_runs(
+                older_than=_utc_now() - timedelta(days=self.run_retention_days),
+                max_per_task=self.max_runs_per_task,
+            )
+            if deleted:
+                logger.info("Cleaned up %d old scheduled-task run records", deleted)
+            self._last_cleanup_at = loop.time()
 
-    async def _dispatch(self, task: ScheduledTask, task_run_id: str, scheduled_at: str) -> None:
+        active_count = sum(1 for task in self._dispatch_tasks if not task.done())
+        capacity = self.max_concurrent_runs - active_count
+        if capacity <= 0:
+            return
+        claimed = await self.store.claim_due_tasks(
+            now=_utc_now(),
+            limit=min(10, capacity),
+            lease_seconds=self.claim_lease_seconds,
+            max_attempts=self.max_attempts,
+        )
+        for task, task_run_id, scheduled_at, attempt_count in claimed:
+            dispatch_task = asyncio.create_task(
+                self._dispatch(task, task_run_id, scheduled_at, attempt_count),
+                name=f"scheduled-dispatch-{task.id}-{task_run_id}",
+            )
+            self._dispatch_tasks.add(dispatch_task)
+            dispatch_task.add_done_callback(self._on_dispatch_done)
+
+    def _on_dispatch_done(self, task: asyncio.Task) -> None:
+        self._dispatch_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Scheduled dispatch task escaped with an error", exc_info=exc)
+
+    def _retry_delay_seconds(self, attempt_count: int) -> float:
+        return min(self.retry_base_seconds * (2 ** max(0, attempt_count - 1)), 300.0)
+
+    async def _renew_lease(self, task_run_id: str, attempt_count: int) -> None:
+        interval = max(1.0, min(self.claim_lease_seconds / 3, 30.0))
+        while True:
+            await asyncio.sleep(interval)
+            renewed = await self.store.renew_task_run_lease(
+                task_run_id,
+                attempt_count=attempt_count,
+                lease_seconds=self.claim_lease_seconds,
+            )
+            if not renewed:
+                return
+
+    async def _reschedule_failure(
+        self,
+        task_run_id: str,
+        *,
+        attempt_count: int,
+        error: str,
+        execution_status: str | None = None,
+        execution_error: str | None = None,
+        delivery_status: str | None = None,
+        delivery_error: str | None = None,
+        immediate: bool = False,
+    ) -> bool:
+        retry = await self.store.reschedule_task_run(
+            task_run_id,
+            error=error,
+            delay_seconds=0.0 if immediate else self._retry_delay_seconds(attempt_count),
+            max_attempts=self.max_attempts,
+            attempt_count=attempt_count,
+            execution_status=execution_status,
+            execution_error=execution_error,
+            delivery_status=delivery_status,
+            delivery_error=delivery_error,
+        )
+        if retry is None:
+            logger.warning(
+                "Ignored stale scheduler attempt %d for occurrence %s",
+                attempt_count,
+                task_run_id,
+            )
+        elif retry:
+            logger.warning(
+                "Scheduled occurrence %s will retry after attempt %d/%d: %s",
+                task_run_id,
+                attempt_count,
+                self.max_attempts,
+                error,
+            )
+        else:
+            logger.error(
+                "Scheduled occurrence %s moved to dead letter after %d attempt(s): %s",
+                task_run_id,
+                attempt_count,
+                error,
+            )
+        return bool(retry)
+
+    async def _dispatch(
+        self,
+        task: ScheduledTask,
+        task_run_id: str,
+        scheduled_at: str,
+        attempt_count: int | None = None,
+    ) -> None:
+        if attempt_count is None:
+            run_row = await self.store.get_task_run(task_run_id)
+            attempt_count = int((run_row or {}).get("attempt_count") or 1)
+        managed_run_id = f"{task_run_id}-a{attempt_count}"
+        heartbeat: asyncio.Task | None = None
+        delivery_task: asyncio.Task | None = None
         try:
+            owns_lease = await self.store.mark_task_run_started(
+                task_run_id,
+                managed_run_id,
+                attempt_count=attempt_count,
+            )
+            if not owns_lease:
+                logger.warning(
+                    "Skipped stale scheduler attempt %d for occurrence %s",
+                    attempt_count,
+                    task_run_id,
+                )
+                return
+            heartbeat = asyncio.create_task(
+                self._renew_lease(task_run_id, attempt_count),
+                name=f"scheduled-lease-{task_run_id}-a{attempt_count}",
+            )
             record = await self.manager.start_client_stream_run(
                 thread_id=task.thread_id,
                 message=task.prompt,
                 kwargs=task.kwargs,
+                run_id=managed_run_id,
                 entrypoint="scheduled_task",
                 on_disconnect="continue",
                 multitask_strategy=task.multitask_strategy,
             )
-            await self.store.mark_task_run_started(task_run_id, record.run_id)
-            delivery_task = self._start_delivery(task, record.run_id)
+            if record.run_id != managed_run_id:
+                await self.store.mark_task_run_started(
+                    task_run_id,
+                    record.run_id,
+                    attempt_count=attempt_count,
+                )
+            delivery_status = "not_requested"
+            delivery_error: str | None = None
+            if isinstance(task.metadata.get("delivery"), dict):
+                try:
+                    delivery_task = self._start_delivery(task, record.run_id)
+                    delivery_status = "running"
+                except Exception as exc:
+                    delivery_status = "error"
+                    delivery_error = f"Delivery unavailable: {exc}"[:2000]
+                    logger.warning("Scheduled task %s could not start delivery: %s", task.id, exc)
             if record.task is not None:
                 try:
                     await record.task
@@ -521,44 +1050,107 @@ class SchedulerService:
                     raise
                 except Exception:
                     logger.warning("Scheduled run task raised unexpectedly", exc_info=True)
-            delivery_error: str | None = None
             if delivery_task is not None:
                 try:
                     await delivery_task
+                    delivery_status = "success"
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    delivery_status = "error"
                     delivery_error = f"Delivery failed: {exc}"
                     logger.warning("Scheduled task %s delivery failed", task.id, exc_info=True)
             current = self.manager.run_manager.get(record.run_id)
-            status = current.status.value if current is not None else "unknown"
-            error = current.error if current is not None else None
-            if delivery_error:
-                status = "error"
-                error = delivery_error
-            await self.store.mark_task_run_finished(task_run_id, status, error)
+            execution_status = current.status.value if current is not None else "unknown"
+            execution_error = current.error if current is not None else "Managed run metadata disappeared"
+            # Do not rerun a full agent prompt for arbitrary execution errors:
+            # tools may already have committed external side effects.  Only a
+            # terminal LLM event explicitly classified as transient opts into
+            # occurrence retry (which still has at-least-once semantics).
+            llm_retriable = False
+            if current is not None:
+                metadata = getattr(current, "metadata", {}) or {}
+                llm_retriable = bool(metadata.get("llm_failure_retriable", False))
+
+            if execution_status != "success":
+                error = execution_error or f"Execution ended with status {execution_status}"
+                if llm_retriable:
+                    await self._reschedule_failure(
+                        task_run_id,
+                        attempt_count=attempt_count,
+                        error=error,
+                        execution_status=execution_status,
+                        execution_error=execution_error,
+                        delivery_status=delivery_status,
+                        delivery_error=delivery_error,
+                    )
+                else:
+                    await self.store.mark_task_run_finished_detailed(
+                        task_run_id,
+                        status="error",
+                        error=error,
+                        execution_status=execution_status,
+                        execution_error=execution_error,
+                        delivery_status=delivery_status,
+                        delivery_error=delivery_error,
+                        attempt_count=attempt_count,
+                    )
+                return
+
+            overall_status = "error" if delivery_status == "error" else "success"
+            overall_error = delivery_error if delivery_status == "error" else None
+            await self.store.mark_task_run_finished_detailed(
+                task_run_id,
+                status=overall_status,
+                error=overall_error,
+                execution_status=execution_status,
+                execution_error=execution_error,
+                delivery_status=delivery_status,
+                delivery_error=delivery_error,
+                attempt_count=attempt_count,
+            )
             logger.info("Scheduled task %s fired at %s as run %s", task.id, scheduled_at, record.run_id)
         except asyncio.CancelledError:
-            await self.store.mark_task_run_finished(task_run_id, "cancelled", "Scheduler shutdown")
+            if delivery_task is not None and not delivery_task.done():
+                delivery_task.cancel()
+                await asyncio.gather(delivery_task, return_exceptions=True)
+            await self._reschedule_failure(
+                task_run_id,
+                attempt_count=attempt_count,
+                error="Scheduler shutdown interrupted the occurrence",
+                execution_status="interrupted",
+                execution_error="Scheduler shutdown",
+                immediate=True,
+            )
             raise
         except Exception as exc:
             logger.exception("Scheduled task %s dispatch failed", task.id)
-            await self.store.mark_task_run_finished(task_run_id, "error", str(exc))
+            await self._reschedule_failure(
+                task_run_id,
+                attempt_count=attempt_count,
+                error=str(exc) or type(exc).__name__,
+                execution_status="error",
+                execution_error=str(exc) or type(exc).__name__,
+            )
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
 
     def _start_delivery(self, task: ScheduledTask, run_id: str) -> asyncio.Task | None:
         delivery = task.metadata.get("delivery")
-        if not isinstance(delivery, dict) or delivery.get("channel") != "feishu":
+        if not isinstance(delivery, dict):
             return None
+        if delivery.get("channel") != "feishu":
+            raise ValueError(f"unsupported delivery channel: {delivery.get('channel')!r}")
 
         chat_id = delivery.get("chat_id")
         if not isinstance(chat_id, str) or not chat_id:
-            logger.warning("Scheduled task %s has invalid Feishu delivery metadata", task.id)
-            return None
+            raise ValueError("invalid Feishu delivery metadata")
 
         feishu_channel = getattr(self.manager, "feishu_channel", None)
         if feishu_channel is None:
-            logger.warning("Scheduled task %s requested Feishu delivery but channel is unavailable", task.id)
-            return None
+            raise RuntimeError("Feishu channel is unavailable")
 
         return asyncio.create_task(
             feishu_channel.render_run_to_chat(

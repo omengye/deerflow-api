@@ -48,7 +48,6 @@ async def create_scheduled_task_tool(
     every_seconds: int | None = None,
     time_of_day: str | None = None,
     timezone: str | None = None,
-    thread_id: str | None = None,
     multitask_strategy: Literal["reject", "interrupt", "rollback"] = "reject",
 ) -> str:
     """Create a persistent scheduled task for this DeerFlow service.
@@ -64,10 +63,9 @@ async def create_scheduled_task_tool(
         every_seconds: Interval length in seconds for interval schedules.
         time_of_day: Local time for daily schedules, HH:MM or HH:MM:SS.
         timezone: IANA timezone, e.g. Asia/Shanghai. Defaults to service timezone.
-        thread_id: Optional target thread. Defaults to the current conversation thread.
         multitask_strategy: What to do if the target thread already has a run.
     """
-    target_thread_id = thread_id or _get_thread_id(runtime)
+    target_thread_id = _get_thread_id(runtime)
     if not target_thread_id:
         raise ValueError("thread_id is required when no current conversation thread is available")
 
@@ -107,17 +105,17 @@ async def create_scheduled_task_tool(
 async def list_scheduled_tasks_tool(
     runtime: ToolRuntime[AgentContext, ThreadState],
     include_disabled: bool = False,
-    all_threads: bool = False,
     limit: int = 50,
 ) -> str:
     """List persistent scheduled tasks.
 
     Args:
         include_disabled: Include disabled or completed one-time tasks.
-        all_threads: If true, list tasks across all threads. Otherwise list only this conversation thread.
         limit: Maximum number of tasks to return.
     """
-    thread_id = None if all_threads else _get_thread_id(runtime)
+    thread_id = _get_thread_id(runtime)
+    if not thread_id:
+        raise ValueError("A current thread is required to list scheduled tasks")
     tasks = await get_scheduler_service().store.list_tasks(
         thread_id=thread_id,
         include_disabled=include_disabled,
@@ -128,6 +126,7 @@ async def list_scheduled_tasks_tool(
 
 @tool("set_scheduled_task_enabled", parse_docstring=True)
 async def set_scheduled_task_enabled_tool(
+    runtime: ToolRuntime[AgentContext, ThreadState],
     task_id: str,
     enabled: bool,
 ) -> str:
@@ -137,35 +136,61 @@ async def set_scheduled_task_enabled_tool(
         task_id: The scheduled task ID.
         enabled: True to enable the task, false to pause it.
     """
-    task = await get_scheduler_service().store.set_enabled(task_id, enabled)
+    service = get_scheduler_service()
+    await _require_task_owned_by_current_thread(runtime, task_id)
+    task = await service.store.set_enabled(task_id, enabled)
     if task is None:
         raise ValueError(f"Scheduled task not found: {task_id}")
     return _json({"updated": task_to_dict(task)})
 
 
 @tool("delete_scheduled_task", parse_docstring=True)
-async def delete_scheduled_task_tool(task_id: str) -> str:
+async def delete_scheduled_task_tool(
+    runtime: ToolRuntime[AgentContext, ThreadState],
+    task_id: str,
+) -> str:
     """Delete a persistent scheduled task.
 
     Args:
         task_id: The scheduled task ID to delete.
     """
-    deleted = await get_scheduler_service().store.delete_task(task_id)
+    service = get_scheduler_service()
+    await _require_task_owned_by_current_thread(runtime, task_id)
+    deleted = await service.store.delete_task(task_id)
     if not deleted:
         raise ValueError(f"Scheduled task not found: {task_id}")
     return _json({"deleted": task_id})
 
 
 @tool("list_scheduled_task_runs", parse_docstring=True)
-async def list_scheduled_task_runs_tool(task_id: str, limit: int = 20) -> str:
+async def list_scheduled_task_runs_tool(
+    runtime: ToolRuntime[AgentContext, ThreadState],
+    task_id: str,
+    limit: int = 20,
+) -> str:
     """List execution history for a scheduled task.
 
     Args:
         task_id: The scheduled task ID.
         limit: Maximum number of execution records to return.
     """
+    await _require_task_owned_by_current_thread(runtime, task_id)
     runs = await get_scheduler_service().store.list_task_runs(task_id, limit=limit)
     return _json({"task_id": task_id, "runs": runs})
+
+
+async def _require_task_owned_by_current_thread(
+    runtime: ToolRuntime[AgentContext, ThreadState] | None,
+    task_id: str,
+):
+    thread_id = _get_thread_id(runtime)
+    if not thread_id:
+        raise ValueError("A current thread is required to manage scheduled tasks")
+    task = await get_scheduler_service().store.get_task(task_id)
+    if task is None or task.thread_id != thread_id:
+        # Do not reveal whether a cross-thread task ID exists.
+        raise ValueError(f"Scheduled task not found: {task_id}")
+    return task
 
 
 scheduled_task_tools = [

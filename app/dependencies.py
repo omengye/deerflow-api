@@ -169,6 +169,11 @@ class ClientManager:
 
         self._assert_storage_ready()
 
+        # Delivery must be ready before the scheduler claims overdue work.
+        # start_feishu_channel is idempotent and returns a disabled/not-configured
+        # status when the optional channel is not in use.
+        await self.start_feishu_channel()
+
         if settings.scheduler_enabled:
             from deerflow.runtime.scheduler import SchedulerService, SchedulerStore
 
@@ -181,6 +186,13 @@ class ClientManager:
                 manager=self,
                 poll_interval_seconds=settings.scheduler_poll_interval_seconds,
                 default_timezone=settings.scheduler_timezone,
+                max_concurrent_runs=settings.scheduler_max_concurrent_runs,
+                max_attempts=settings.scheduler_max_attempts,
+                retry_base_seconds=settings.scheduler_retry_base_seconds,
+                claim_lease_seconds=settings.scheduler_claim_lease_seconds,
+                shutdown_grace_seconds=settings.scheduler_shutdown_grace_seconds,
+                run_retention_days=settings.scheduler_run_retention_days,
+                max_runs_per_task=settings.scheduler_max_runs_per_task,
             )
             await self.scheduler_service.start()
 
@@ -506,6 +518,7 @@ class ClientManager:
         """Background producer for /chat/stream style runs."""
         run_id = record.run_id
         thread_id = record.thread_id
+        llm_failure: dict[str, Any] | None = None
         try:
             await self.run_manager.set_status(run_id, RunStatus.running)
             await self.stream_bridge.publish(
@@ -533,12 +546,22 @@ class ClientManager:
                     if record.abort_event.is_set():
                         break
                     data = event.data
+                    if isinstance(data, dict) and data.get("type") == "llm_failure":
+                        llm_failure = data
+                        record.metadata["llm_failure_reason"] = str(data.get("reason") or "unknown")
+                        record.metadata["llm_failure_retriable"] = bool(data.get("retriable", False))
                     if isinstance(data, dict):
                         data = {**data, "_agent_name": _agent_name}
                     await self.stream_bridge.publish(run_id, event.type, data)
 
             if record.abort_event.is_set():
                 await self.run_manager.set_status(run_id, RunStatus.interrupted)
+            elif llm_failure is not None:
+                await self.run_manager.set_status(
+                    run_id,
+                    RunStatus.error,
+                    error=str(llm_failure.get("message") or "LLM request failed"),
+                )
             else:
                 await self.run_manager.set_status(run_id, RunStatus.success)
         except asyncio.TimeoutError:
@@ -790,8 +813,6 @@ class ClientManager:
 
     async def shutdown(self):
         """Cleanup on shutdown."""
-        await self.stop_feishu_channel()
-
         if self.scheduler_service is not None:
             try:
                 await self.scheduler_service.stop()
@@ -799,6 +820,10 @@ class ClientManager:
                 logger.warning("Error stopping scheduler service", exc_info=True)
             finally:
                 self.scheduler_service = None
+
+        # No new deliveries can start after the scheduler has drained/cancelled
+        # all tracked dispatches.
+        await self.stop_feishu_channel()
 
         try:
             from deerflow.agents.memory.queue import get_memory_queue

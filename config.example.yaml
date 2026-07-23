@@ -38,6 +38,15 @@ api:
   scheduler_db_path: ./data/scheduled_tasks.db
   scheduler_poll_interval_seconds: 5
   scheduler_timezone: Asia/Shanghai
+  scheduler_max_concurrent_runs: 4
+  # Occurrences use at-least-once execution. Keep prompts and mutating tools
+  # idempotent because a transient failure can rerun the full prompt.
+  scheduler_max_attempts: 3
+  scheduler_retry_base_seconds: 15
+  scheduler_claim_lease_seconds: 120
+  scheduler_shutdown_grace_seconds: 10
+  scheduler_run_retention_days: 30
+  scheduler_max_runs_per_task: 1000
 
 stream_bridge:
   # memory: single-process development; redis: cross-process replay for SSE reconnects.

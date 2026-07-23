@@ -1145,6 +1145,41 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(client, FakeDeerFlowClient)
         self.assertEqual(captured_kwargs[0]["checkpointer"], async_checkpointer)
 
+    async def test_client_manager_marks_graceful_llm_failure_as_error(self) -> None:
+        manager = ClientManager()
+        client = _FakeClient(
+            events=[
+                StreamEvent(
+                    type="custom",
+                    data={
+                        "type": "llm_failure",
+                        "reason": "busy",
+                        "retriable": True,
+                        "message": "Provider unavailable after retries",
+                    },
+                ),
+                StreamEvent(type="messages-tuple", data={"type": "ai", "content": "Please retry later", "id": "msg-1"}),
+                StreamEvent(type="end", data={"usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}),
+            ]
+        )
+
+        async def fake_get_async_client(**_kwargs: Any) -> _FakeClient:
+            return client
+
+        manager.get_async_client = fake_get_async_client  # type: ignore[method-assign]
+        record = await manager.start_client_stream_run(
+            thread_id="thread-llm-failure",
+            message="hello",
+            kwargs={},
+            on_disconnect="continue",
+        )
+        assert record.task is not None
+        await record.task
+
+        self.assertEqual(record.status, RunStatus.error)
+        self.assertEqual(record.error, "Provider unavailable after retries")
+        self.assertTrue(record.metadata["llm_failure_retriable"])
+
     async def test_plan_mode_todo_middleware_keeps_todos_internal(self) -> None:
         from langchain.agents import create_agent
         from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel

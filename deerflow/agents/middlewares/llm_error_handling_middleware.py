@@ -28,6 +28,10 @@ _RETRIABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 _BUSY_PATTERNS = (
     "server busy",
     "temporarily unavailable",
+    # Some OpenAI-compatible gateways incorrectly translate an upstream 5xx
+    # into a 400 invalid_request_error.  Match the explicit upstream failure
+    # message without making ordinary client-side 400 responses retriable.
+    "upstream request failed",
     "try again later",
     "please retry",
     "please try again",
@@ -228,6 +232,23 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         except Exception:
             logger.debug("Failed to emit llm_retry event", exc_info=True)
 
+    def _emit_failure_event(self, exc: BaseException | None, reason: str, *, retriable: bool) -> None:
+        """Emit a machine-readable terminal failure for run-status tracking."""
+        try:
+            from langgraph.config import get_stream_writer
+
+            message = self._build_circuit_breaker_message() if exc is None else self._build_user_message(exc, reason)
+            get_stream_writer()(
+                {
+                    "type": "llm_failure",
+                    "reason": reason,
+                    "retriable": retriable,
+                    "message": message,
+                }
+            )
+        except Exception:
+            logger.debug("Failed to emit llm_failure event", exc_info=True)
+
     @override
     def wrap_model_call(
         self,
@@ -235,6 +256,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelCallResult:
         if self._check_circuit():
+            self._emit_failure_event(None, "circuit_open", retriable=True)
             return AIMessage(content=self._build_circuit_breaker_message())
 
         attempt = 1
@@ -257,6 +279,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                         attempt,
                         _extract_error_detail(exc),
                     )
+                    self._emit_failure_event(exc, reason, retriable=False)
                     return AIMessage(content=self._build_user_message(exc, reason))
                 if retriable and attempt < self.retry_max_attempts:
                     wait_ms = self._build_retry_delay_ms(attempt, exc)
@@ -279,6 +302,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                 )
                 if retriable:
                     self._record_failure()
+                self._emit_failure_event(exc, reason, retriable=retriable)
                 return AIMessage(content=self._build_user_message(exc, reason))
 
     @override
@@ -288,6 +312,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelCallResult:
         if self._check_circuit():
+            self._emit_failure_event(None, "circuit_open", retriable=True)
             return AIMessage(content=self._build_circuit_breaker_message())
 
         attempt = 1
@@ -313,6 +338,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                         attempt,
                         _extract_error_detail(exc),
                     )
+                    self._emit_failure_event(exc, reason, retriable=False)
                     return AIMessage(content=self._build_user_message(exc, reason))
                 if retriable and attempt < self.retry_max_attempts:
                     wait_ms = self._build_retry_delay_ms(attempt, exc)
@@ -335,6 +361,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                 )
                 if retriable:
                     self._record_failure()
+                self._emit_failure_event(exc, reason, retriable=retriable)
                 return AIMessage(content=self._build_user_message(exc, reason))
 
 

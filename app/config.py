@@ -331,7 +331,8 @@ class Settings(BaseModel):
     feishu: FeishuSettings | None = Field(default_factory=_load_feishu_settings)
 
     # Dynamic scheduled tasks. Tasks are created by agent tools and persisted
-    # in SQLite so they survive API restarts.
+    # in SQLite so they survive API restarts. Occurrences use at-least-once
+    # execution, so prompts with external side effects should be idempotent.
     scheduler_enabled: bool = Field(
         default_factory=lambda: _setting_bool("scheduler_enabled", "DEER_FLOW_SCHEDULER_ENABLED", True)
     )
@@ -349,6 +350,41 @@ class Settings(BaseModel):
     )
     scheduler_timezone: str = Field(
         default_factory=lambda: _setting_str("scheduler_timezone", "DEER_FLOW_SCHEDULER_TIMEZONE", "Asia/Shanghai")
+    )
+    scheduler_max_concurrent_runs: int = Field(
+        default_factory=lambda: _setting_int("scheduler_max_concurrent_runs", "DEER_FLOW_SCHEDULER_MAX_CONCURRENT_RUNS", 4),
+        ge=1,
+        le=100,
+    )
+    scheduler_max_attempts: int = Field(
+        default_factory=lambda: _setting_int("scheduler_max_attempts", "DEER_FLOW_SCHEDULER_MAX_ATTEMPTS", 3),
+        ge=1,
+        le=20,
+    )
+    scheduler_retry_base_seconds: float = Field(
+        default_factory=lambda: _setting_float("scheduler_retry_base_seconds", "DEER_FLOW_SCHEDULER_RETRY_BASE_SECONDS", 15.0),
+        ge=0,
+        le=3600,
+    )
+    scheduler_claim_lease_seconds: float = Field(
+        default_factory=lambda: _setting_float("scheduler_claim_lease_seconds", "DEER_FLOW_SCHEDULER_CLAIM_LEASE_SECONDS", 120.0),
+        ge=5,
+        le=86400,
+    )
+    scheduler_shutdown_grace_seconds: float = Field(
+        default_factory=lambda: _setting_float("scheduler_shutdown_grace_seconds", "DEER_FLOW_SCHEDULER_SHUTDOWN_GRACE_SECONDS", 10.0),
+        ge=0,
+        le=600,
+    )
+    scheduler_run_retention_days: int = Field(
+        default_factory=lambda: _setting_int("scheduler_run_retention_days", "DEER_FLOW_SCHEDULER_RUN_RETENTION_DAYS", 30),
+        ge=1,
+        le=3650,
+    )
+    scheduler_max_runs_per_task: int = Field(
+        default_factory=lambda: _setting_int("scheduler_max_runs_per_task", "DEER_FLOW_SCHEDULER_MAX_RUNS_PER_TASK", 1000),
+        ge=1,
+        le=100000,
     )
 
 settings = Settings()
