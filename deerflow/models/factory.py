@@ -119,11 +119,17 @@ def create_chat_model(
     if model_config.thinking is not None:
         merged_thinking = {**(effective_wte.get("thinking") or {}), **model_config.thinking}
         effective_wte = {**effective_wte, "thinking": merged_thinking}
-    if thinking_enabled and has_thinking_settings:
-        if not model_config.supports_thinking:
-            raise ValueError(f"Model {name} does not support thinking. Set `supports_thinking` to true in the `config.yaml` to enable thinking.") from None
-        if effective_wte:
-            model_settings_from_config.update(effective_wte)
+    # Thinking mode requires model support. This used to raise ValueError here,
+    # but per-agent subagent overrides (config.yaml subagents.agents.*.thinking_enabled)
+    # can now request thinking without knowing in advance which model the agent
+    # will resolve to -- hard-failing chat model construction for that is too
+    # strict. Warn and degrade to non-thinking instead, mirroring the lead
+    # agent's existing fallback (see agents/lead_agent/agent.py).
+    if thinking_enabled and not model_config.supports_thinking:
+        logger.warning(f"Thinking mode is enabled but model '{name}' does not support it; falling back to non-thinking mode.")
+        thinking_enabled = False
+    if thinking_enabled and has_thinking_settings and effective_wte:
+        model_settings_from_config.update(effective_wte)
     if not thinking_enabled:
         if model_config.when_thinking_disabled is not None:
             # User-provided disable settings take full precedence
@@ -164,7 +170,14 @@ def create_chat_model(
 
     if issubclass(model_class, CodexChatModel):
         # The ChatGPT Codex endpoint currently rejects max_tokens/max_output_tokens.
+        # A per-agent override supplies max_tokens via kwargs (not
+        # model_settings_from_config), and kwargs wins in the
+        # `{**model_settings_from_config, **kwargs}` merge below -- so it must
+        # be popped from both places, or an override would still reach the
+        # Codex endpoint and get rejected with a 400.
         model_settings_from_config.pop("max_tokens", None)
+        if kwargs.pop("max_tokens", None) is not None:
+            logger.warning(f"Model '{name}' is a Codex Responses API model, which does not support max_tokens; ignoring per-agent max_tokens override.")
 
         # Use explicit reasoning_effort from frontend if provided (low/medium/high)
         explicit_effort = kwargs.pop("reasoning_effort", None)

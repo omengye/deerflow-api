@@ -7,7 +7,6 @@ from functools import lru_cache
 from deerflow.config.agents_config import load_agent_soul
 from deerflow.skills import load_skills
 from deerflow.skills.types import Skill
-from deerflow.subagents import get_available_subagent_names
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +204,17 @@ def _build_subagent_section(max_concurrent: int) -> str:
     Returns:
         Formatted subagent section string.
     """
+    # Lazy import: deerflow.subagents.__init__ imports .executor, which imports
+    # deerflow.agents.thread_state -- and this module is imported eagerly by
+    # deerflow.agents.__init__ (prime_enabled_skills_cache() -> lead_agent.prompt).
+    # A module-level import here would make deerflow.subagents and deerflow.agents
+    # import each other, failing with "partially initialized module" whenever
+    # deerflow.subagents is imported before deerflow.agents (e.g. `import
+    # deerflow.subagents.executor` directly). Deferring to this call site --
+    # reached only when an actual prompt is built, well after both packages have
+    # finished initializing -- breaks the cycle.
+    from deerflow.subagents import get_available_subagent_names
+
     n = max_concurrent
     available_names = get_available_subagent_names()
     bash_available = "bash" in available_names
@@ -444,7 +454,8 @@ You: "Deploying to staging..." [proceed]
 - Output files: `/mnt/user-data/outputs` - Final deliverables must be saved here
 
 **File Management:**
-- Uploaded files are automatically listed in the <uploaded_files> section before each request
+- Files attached to the current message are described in the <uploaded_files> section, with their document outlines
+- Files uploaded earlier in the conversation are listed there by name only — call `list_uploaded_files` for their paths, then call it again with a `filename` to get that file's document outline
 - Use `read_file` tool to read uploaded files using their paths from the list
 - For PDF, PPT, Excel, and Word files, converted Markdown versions (*.md) are available alongside originals
 - All temporary work happens in `/mnt/user-data/workspace`

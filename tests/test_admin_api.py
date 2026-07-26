@@ -168,6 +168,35 @@ tool_groups: []
         self.assertTrue(payload["models"][0]["api_key"]["redacted"])
         self.assertTrue(payload["api"]["api_keys"]["redacted"])
 
+    def test_admin_config_summary_reports_acp_timeout(self) -> None:
+        """The ACP overview must surface timeout_seconds.
+
+        The summary is built from an explicit field allowlist, so a newly added
+        ACPAgentConfig field is invisible to the admin UI until it is listed
+        there. Operators need this one to tell a hung agent (no timeout) from a
+        slow one, and an explicit ``null`` -- "wait indefinitely" -- has to stay
+        distinguishable from the 600s default rather than being coerced to it.
+        """
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        raw["acp_agents"] = {
+            "codex": {"command": "codex-acp", "description": "Codex via ACP", "timeout_seconds": 120},
+            "claude_code": {"command": "claude-agent-acp", "description": "Claude Code via ACP"},
+            "unbounded": {"command": "other-acp", "description": "No timeout", "timeout_seconds": None},
+        }
+        self.config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+        reset_app_config()
+        client = self._client()
+
+        response = client.get("/api/admin/config", headers=self._auth_headers())
+
+        self.assertEqual(response.status_code, 200)
+        agents = {agent["name"]: agent for agent in response.json()["system_summary"]["acp_agents"]}
+        self.assertEqual(agents["codex"]["timeout_seconds"], 120)
+        # Omitted in config.yaml -> report the ACPAgentConfig default, not None.
+        self.assertEqual(agents["claude_code"]["timeout_seconds"], 600)
+        # Explicit null means unbounded and must not be reported as the default.
+        self.assertIsNone(agents["unbounded"]["timeout_seconds"])
+
     def test_update_models_preserves_redacted_existing_secret(self) -> None:
         client = self._client()
         config_response = client.get("/api/admin/config", headers=self._auth_headers())
@@ -338,6 +367,285 @@ tool_groups: []
         )
         self.assertEqual(subagents.status_code, 400)
 
+    def test_subagents_reject_unsupported_thinking_enabled(self) -> None:
+        client = self._client()
+
+        response = client.put(
+            "/api/admin/subagents",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    # "base" declares supports_thinking: false in setUp's fixture config.
+                    "agents": {"general-purpose": {"model": "base", "thinking_enabled": True}},
+                    "custom_agents": {},
+                },
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("supports_thinking", response.json()["detail"])
+
+    def test_subagents_reject_unsupported_reasoning_effort(self) -> None:
+        client = self._client()
+
+        response = client.put(
+            "/api/admin/subagents",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    # "base" has no supports_reasoning_effort in setUp's fixture config (defaults False).
+                    "agents": {"general-purpose": {"model": "base", "reasoning_effort": "medium"}},
+                    "custom_agents": {},
+                },
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("supports_reasoning_effort", response.json()["detail"])
+
+    def test_subagents_reject_invalid_reasoning_effort_value(self) -> None:
+        client = self._client()
+
+        response = client.put(
+            "/api/admin/subagents",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    # No model override -> model can't be resolved, but the value-domain
+                    # check still applies regardless of whether a model is resolvable.
+                    "agents": {"general-purpose": {"reasoning_effort": "not-a-real-value"}},
+                    "custom_agents": {},
+                },
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("reasoning_effort", response.json()["detail"])
+
+    def test_subagents_generation_overrides_allowed_when_model_inherited(self) -> None:
+        client = self._client()
+
+        response = client.put(
+            "/api/admin/subagents",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    # No "model" key -> agent inherits parent's model, which isn't known
+                    # statically here. thinking_enabled/reasoning_effort must be allowed
+                    # through; models/factory.py degrades gracefully at run time instead.
+                    "agents": {"general-purpose": {"thinking_enabled": True, "reasoning_effort": "medium"}},
+                    "custom_agents": {},
+                },
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        agent_raw = raw["subagents"]["agents"]["general-purpose"]
+        self.assertTrue(agent_raw["thinking_enabled"])
+        self.assertEqual(agent_raw["reasoning_effort"], "medium")
+
+    def test_subagents_generation_overrides_accepted_for_capable_model(self) -> None:
+        client = self._client()
+        config_response = client.get("/api/admin/config", headers=self._auth_headers())
+        model = config_response.json()["models"][0]
+        model["supports_thinking"] = True
+        model["supports_reasoning_effort"] = True
+        models_update = client.put(
+            "/api/admin/models",
+            headers=self._auth_headers(),
+            json={"models": [model], "default_model": "base", "reload": False},
+        )
+        self.assertEqual(models_update.status_code, 200)
+
+        response = client.put(
+            "/api/admin/subagents",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "agents": {
+                        "general-purpose": {
+                            "model": "base",
+                            "thinking_enabled": True,
+                            "reasoning_effort": "medium",
+                            "model_settings": {"temperature": 0.5, "max_tokens": 1000},
+                        }
+                    },
+                    "custom_agents": {},
+                },
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        agent_raw = raw["subagents"]["agents"]["general-purpose"]
+        self.assertTrue(agent_raw["thinking_enabled"])
+        self.assertEqual(agent_raw["reasoning_effort"], "medium")
+        self.assertEqual(agent_raw["model_settings"]["temperature"], 0.5)
+        self.assertEqual(agent_raw["model_settings"]["max_tokens"], 1000)
+
+    def test_subagents_reasoning_effort_minimal_allowed_for_non_codex_model(self) -> None:
+        client = self._client()
+        config_response = client.get("/api/admin/config", headers=self._auth_headers())
+        model = config_response.json()["models"][0]
+        model["supports_reasoning_effort"] = True
+        models_update = client.put(
+            "/api/admin/models",
+            headers=self._auth_headers(),
+            json={"models": [model], "default_model": "base", "reload": False},
+        )
+        self.assertEqual(models_update.status_code, 200)
+
+        # "base" resolves to langchain_openai:ChatOpenAI, a non-Codex model.
+        # "minimal" is a valid OpenAI-style reasoning_effort value for those
+        # (models/factory.py:143 sets it directly), even though it's outside
+        # the Codex-only value set.
+        response = client.put(
+            "/api/admin/subagents",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "agents": {"general-purpose": {"model": "base", "reasoning_effort": "minimal"}},
+                    "custom_agents": {},
+                },
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_subagents_reasoning_effort_xhigh_rejected_for_non_codex_model(self) -> None:
+        client = self._client()
+        config_response = client.get("/api/admin/config", headers=self._auth_headers())
+        model = config_response.json()["models"][0]
+        model["supports_reasoning_effort"] = True
+        models_update = client.put(
+            "/api/admin/models",
+            headers=self._auth_headers(),
+            json={"models": [model], "default_model": "base", "reload": False},
+        )
+        self.assertEqual(models_update.status_code, 200)
+
+        # "xhigh" is Codex-only (models/factory.py:179); "base" is a
+        # non-Codex (ChatOpenAI) model, so this must be rejected even though
+        # supports_reasoning_effort is true.
+        response = client.put(
+            "/api/admin/subagents",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "agents": {"general-purpose": {"model": "base", "reasoning_effort": "xhigh"}},
+                    "custom_agents": {},
+                },
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("reasoning_effort", response.json()["detail"])
+
+    def test_subagents_reasoning_effort_xhigh_allowed_for_codex_model(self) -> None:
+        client = self._client()
+        config_response = client.get("/api/admin/config", headers=self._auth_headers())
+        base_model = config_response.json()["models"][0]
+        codex_model = {
+            "name": "codex-model",
+            "use": "deerflow.models.openai_codex_provider:CodexChatModel",
+            "model": "gpt-5.4",
+            "supports_reasoning_effort": True,
+        }
+        models_update = client.put(
+            "/api/admin/models",
+            headers=self._auth_headers(),
+            json={"models": [base_model, codex_model], "default_model": "base", "reload": False},
+        )
+        self.assertEqual(models_update.status_code, 200)
+
+        response = client.put(
+            "/api/admin/subagents",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "agents": {"general-purpose": {"model": "codex-model", "reasoning_effort": "xhigh"}},
+                    "custom_agents": {},
+                },
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_subagents_reasoning_effort_minimal_rejected_for_codex_model(self) -> None:
+        client = self._client()
+        config_response = client.get("/api/admin/config", headers=self._auth_headers())
+        base_model = config_response.json()["models"][0]
+        codex_model = {
+            "name": "codex-model",
+            "use": "deerflow.models.openai_codex_provider:CodexChatModel",
+            "model": "gpt-5.4",
+            "supports_reasoning_effort": True,
+        }
+        models_update = client.put(
+            "/api/admin/models",
+            headers=self._auth_headers(),
+            json={"models": [base_model, codex_model], "default_model": "base", "reload": False},
+        )
+        self.assertEqual(models_update.status_code, 200)
+
+        # "minimal" is not a valid Codex Responses API reasoning_effort value
+        # (models/factory.py:179 only accepts low/medium/high/xhigh).
+        response = client.put(
+            "/api/admin/subagents",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "agents": {"general-purpose": {"model": "codex-model", "reasoning_effort": "minimal"}},
+                    "custom_agents": {},
+                },
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("reasoning_effort", response.json()["detail"])
+
+    def test_subagents_reasoning_effort_domain_extremes_allowed_when_model_inherited(self) -> None:
+        client = self._client()
+
+        for value in ("minimal", "xhigh"):
+            response = client.put(
+                "/api/admin/subagents",
+                headers=self._auth_headers(),
+                json={
+                    "config": {
+                        "enabled": True,
+                        # No "model" key -> Codex vs non-Codex can't be
+                        # statically resolved, so the permissive union of
+                        # both domains applies. "minimal" and "xhigh" sit at
+                        # opposite ends of the two domains, so both passing
+                        # proves the union (not just the intersection) is used.
+                        "agents": {"general-purpose": {"reasoning_effort": value}},
+                        "custom_agents": {},
+                    },
+                    "reload": False,
+                },
+            )
+            self.assertEqual(response.status_code, 200, f"expected '{value}' to be allowed when model is inherited")
+
     def test_config_health_reports_safe_contract_warnings(self) -> None:
         raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
         raw["guardrails"] = {"enabled": False, "providers": []}
@@ -428,6 +736,22 @@ tool_groups: []
             },
         )
         self.assertEqual(summarization.status_code, 400)
+
+    def test_summarization_reject_enabled_without_trigger(self) -> None:
+        client = self._client()
+        summarization = client.put(
+            "/api/admin/summarization",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "keep": {"type": "messages", "value": 20},
+                },
+                "reload": False,
+            },
+        )
+        self.assertEqual(summarization.status_code, 400)
+        self.assertIn("trigger", summarization.json()["detail"])
 
     def test_scheduled_tasks_can_be_listed_and_deleted(self) -> None:
         db_path = Path(self._tmp.name) / "scheduled_tasks.db"

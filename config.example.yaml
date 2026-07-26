@@ -20,6 +20,13 @@ api:
   data_dir: ./data
   deerflow_home: ./data/deerflow
   deerflow_host_base_dir: null
+  # Path to extensions_config.json (MCP servers, skills, and custom
+  # middlewares). Defaults to ./extensions_config.json (or legacy
+  # mcp_config.json) if null. That JSON file's "middlewares" field takes a
+  # list of "module.path:ClassName" entries — AgentMiddleware subclasses with
+  # a no-argument constructor — appended to the lead agent's middleware chain
+  # after the built-in middlewares and before ClarificationMiddleware.
+  # Example: "middlewares": ["my_package.middlewares:MyAuditMiddleware"]
   extensions_config_path: null
   cors_allow_origins:
     - http://localhost:3000
@@ -68,6 +75,13 @@ token_usage:
   enabled: false
 
 models:
+  # `supports_thinking` / `supports_reasoning_effort` are capability flags,
+  # not toggles -- they declare what the model can do, not whether thinking
+  # is currently on. They gate two things: (1) subagents.agents.*.thinking_enabled
+  # / reasoning_effort overrides below are rejected at admin-write time (and
+  # skipped/warned-and-degraded at run time) for models that don't declare
+  # support; (2) the actual on/off switch is `thinking_enabled` (top-level
+  # runtime setting, or a per-agent override under `subagents:`).
   - name: qwen3.6-plus
     display_name: Qwen 3.6 Plus
     use: langchain_openai:ChatOpenAI
@@ -143,6 +157,7 @@ sandbox:
 #     description: "Codex coding agent via ACP"
 #     model: null
 #     auto_approve_permissions: false
+#     timeout_seconds: 600
 #   claude_code:
 #     command: claude-agent-acp
 #     args: []
@@ -154,6 +169,7 @@ sandbox:
 #     description: "Claude Code coding agent via ACP"
 #     model: null
 #     auto_approve_permissions: false
+#     timeout_seconds: 600
 
 skills:
   enabled: true
@@ -211,6 +227,14 @@ subagents:
       description: "A general-purpose sub-agent for delegated tasks"
       model: qwen3.6-plus
       max_turns: 25
+      # Per-agent generation overrides (all optional, all None/absent = inherit).
+      # thinking_enabled/reasoning_effort require the resolved model above to
+      # declare supports_thinking / supports_reasoning_effort: true respectively.
+      # thinking_enabled: true
+      # reasoning_effort: medium  # one of: low, medium, high, xhigh
+      # model_settings:
+      #   temperature: 0.3
+      #   max_tokens: 4096
 
 tool_groups:
   - name: web
@@ -227,6 +251,13 @@ tool_output:
   externalize_min_chars: 12000
   preview_head_chars: 2000
   preview_tail_chars: 1000
+  # When a persisted output is JSON or JSON Lines, replace the head/tail
+  # preview above with a deterministic structural synopsis (top-level keys,
+  # value types, array lengths, a depth-limited sample of nested structure)
+  # instead of a raw character slice. Falls back to head/tail for anything
+  # that isn't JSON/JSONL, or if disabled.
+  structured_synopsis_enabled: true
+  structured_synopsis_max_chars: 4000
   fallback_max_chars: 30000
   fallback_head_chars: 8000
   fallback_tail_chars: 3000
@@ -321,6 +352,18 @@ title:
 
 summarization:
   enabled: false
+  # model_name: null means "follow the current run's model" (falls back to
+  # models[0] only if the run's model can't be resolved). Set an explicit
+  # name here to always summarize with a specific model regardless of which
+  # model is answering the run.
+  # model_name: null
+  # trigger is required whenever enabled is true (the admin API rejects
+  # enabled=true with no trigger). Example:
+  # trigger:
+  #   - type: messages
+  #     value: 50
+  #   - type: fraction
+  #     value: 0.8
 
 tracing:
   enabled: false

@@ -7,6 +7,7 @@ from langchain_core.runnables import RunnableConfig
 from deerflow.agents.lead_agent.prompt import apply_prompt_template
 from deerflow.agents.memory.summarization_hook import memory_flush_hook
 from deerflow.agents.middlewares.clarification_middleware import ClarificationMiddleware
+from deerflow.agents.middlewares.configured_extensions import load_configured_middlewares
 from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware, calibrate_loop_detection
 from deerflow.agents.middlewares.memory_middleware import MemoryMiddleware
 from deerflow.agents.middlewares.evolution_signal_middleware import EvolutionSignalMiddleware
@@ -57,8 +58,16 @@ def _resolve_model_name(requested_model_name: str | None = None, fallback_model_
     return default_model_name
 
 
-def _create_summarization_middleware() -> DeerFlowSummarizationMiddleware | None:
-    """Create and configure the summarization middleware from config."""
+def _create_summarization_middleware(run_model_name: str | None = None) -> DeerFlowSummarizationMiddleware | None:
+    """Create and configure the summarization middleware from config.
+
+    Args:
+        run_model_name: The model resolved for this run (see `make_lead_agent`).
+            Used as the summarization model when no explicit
+            `summarization.model_name` is configured, so a per-run model
+            choice (and its provider) is what actually summarizes that run's
+            history instead of unconditionally landing on `models[0]`.
+    """
     config = get_summarization_config()
 
     if not config.enabled:
@@ -75,16 +84,42 @@ def _create_summarization_middleware() -> DeerFlowSummarizationMiddleware | None
     # Prepare keep parameter
     keep = config.keep.to_tuple()
 
-    # Prepare model parameter
+    app_config = get_app_config()
+    default_model_name = app_config.models[0].name if app_config.models else None
+
+    # Resolve which model summarizes this agent's turns:
+    #   1. An explicit config.model_name always wins, provided it names a
+    #      configured model. `admin.py` validates writes through the API, but
+    #      config.yaml can still be hand-edited with a stale/typo'd name, and
+    #      that must degrade like every other tier here instead of hard-
+    #      failing lead-agent construction (create_chat_model raises on an
+    #      unknown name).
+    #   2. Otherwise follow the current run's model, provided it resolves to a
+    #      configured model — `client.py`'s model_name may not have been
+    #      validated yet, so don't trust it blindly.
+    #   3. Fall back to the default model (models[0]) if neither applies.
+    valid_run_model_name = run_model_name if run_model_name and app_config.get_model_config(run_model_name) else None
+    if run_model_name and valid_run_model_name is None:
+        logger.warning(f"Run model '{run_model_name}' not found in config; summarization falls back to the default model.")
+
+    valid_config_model_name = config.model_name if config.model_name and app_config.get_model_config(config.model_name) else None
+    if config.model_name and valid_config_model_name is None:
+        fallback_description = f"run model '{valid_run_model_name}'" if valid_run_model_name else f"default model '{default_model_name}'"
+        logger.warning(f"Configured summarization model '{config.model_name}' not found in config; falling back to {fallback_description}.")
+
+    primary_model_name = valid_config_model_name or valid_run_model_name
+
     # The summarization middleware is built once per lead-agent instance and
     # reused for every summarisation turn — same long-lived-pool risk as the
     # lead agent itself, so opt out of keep-alive consistently.
-    if config.model_name:
-        model = create_chat_model(name=config.model_name, thinking_enabled=False, disable_keepalive=True)
-    else:
-        # Use a lightweight model for summarization to save costs
-        # Falls back to default model if not explicitly specified
-        model = create_chat_model(thinking_enabled=False, disable_keepalive=True)
+    model = create_chat_model(name=primary_model_name, thinking_enabled=False, disable_keepalive=True)
+
+    # Second-chance model for when the primary summarization model errors out
+    # (see DeerFlowSummarizationMiddleware's tiered fallback). Only meaningful
+    # when it names a different, valid model than the primary one — lazily
+    # constructed inside the middleware, and only on first failure.
+    effective_primary_model_name = primary_model_name or default_model_name
+    fallback_model_name = valid_run_model_name if valid_run_model_name and valid_run_model_name != effective_primary_model_name else None
 
     # Prepare kwargs
     kwargs = {
@@ -107,7 +142,7 @@ def _create_summarization_middleware() -> DeerFlowSummarizationMiddleware | None
     # the sole entry point for DeerFlowSummarizationMiddleware, and the runtime
     # config is not expected to change after startup.
     try:
-        skills_container_path = get_app_config().skills.container_path or "/mnt/skills"
+        skills_container_path = app_config.skills.container_path or "/mnt/skills"
     except Exception:
         logger.exception("Failed to resolve skills container path; falling back to default")
         skills_container_path = "/mnt/skills"
@@ -120,6 +155,7 @@ def _create_summarization_middleware() -> DeerFlowSummarizationMiddleware | None
         preserve_recent_skill_count=config.preserve_recent_skill_count,
         preserve_recent_skill_tokens=config.preserve_recent_skill_tokens,
         preserve_recent_skill_tokens_per_skill=config.preserve_recent_skill_tokens_per_skill,
+        fallback_model_name=fallback_model_name,
     )
 
 
@@ -265,7 +301,7 @@ def _build_middlewares(config: RunnableConfig, model_name: str | None, agent_nam
     middlewares = build_lead_runtime_middlewares(lazy_init=True)
 
     # Add summarization middleware if enabled
-    summarization_middleware = _create_summarization_middleware()
+    summarization_middleware = _create_summarization_middleware(run_model_name=model_name)
     if summarization_middleware is not None:
         middlewares.append(summarization_middleware)
 
@@ -316,6 +352,11 @@ def _build_middlewares(config: RunnableConfig, model_name: str | None, agent_nam
     # Inject custom middlewares before ClarificationMiddleware
     if custom_middlewares:
         middlewares.extend(custom_middlewares)
+
+    # Inject middlewares declared via ExtensionsConfig.middlewares
+    # ("module.path:ClassName"), letting deployments extend the chain without
+    # forking the codebase.
+    middlewares.extend(load_configured_middlewares())
 
     # ClarificationMiddleware should always be last
     middlewares.append(ClarificationMiddleware())

@@ -7,8 +7,6 @@ from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
 from langgraph.runtime import Runtime
 
-from deerflow.subagents.executor import MAX_CONCURRENT_SUBAGENTS
-
 logger = logging.getLogger(__name__)
 
 # Valid range for max_concurrent_subagents
@@ -35,11 +33,28 @@ class SubagentLimitMiddleware(AgentMiddleware[AgentState]):
 
     Args:
         max_concurrent: Maximum number of concurrent subagent calls allowed.
-            Defaults to MAX_CONCURRENT_SUBAGENTS (3). Clamped to [2, 4].
+            Defaults to deerflow.subagents.executor.MAX_CONCURRENT_SUBAGENTS (3),
+            resolved lazily at construction time (see __init__). Clamped to [2, 4].
     """
 
-    def __init__(self, max_concurrent: int = MAX_CONCURRENT_SUBAGENTS):
+    def __init__(self, max_concurrent: int | None = None):
         super().__init__()
+        if max_concurrent is None:
+            # Lazy import: deerflow.subagents.__init__ imports .executor, which
+            # imports deerflow.agents.thread_state -- and this module sits on the
+            # import path deerflow.agents.__init__ pulls in eagerly while priming
+            # the skills cache (agents.__init__ -> lead_agent.__init__ ->
+            # lead_agent.agent -> this module, via SubagentLimitMiddleware's
+            # import in agent.py). A module-level import of MAX_CONCURRENT_SUBAGENTS
+            # here would make deerflow.subagents.executor import itself back,
+            # mid-init, and fail with "partially initialized module" whenever
+            # deerflow.subagents is imported before deerflow.agents finishes
+            # (e.g. `import deerflow.subagents.executor` directly). Deferring to
+            # construction time -- reached only once both packages have finished
+            # importing -- breaks the cycle.
+            from deerflow.subagents.executor import MAX_CONCURRENT_SUBAGENTS
+
+            max_concurrent = MAX_CONCURRENT_SUBAGENTS
         self.max_concurrent = _clamp_subagent_limit(max_concurrent)
 
     def _truncate_task_calls(self, state: AgentState) -> dict | None:

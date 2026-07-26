@@ -16,6 +16,15 @@ class ToolOutputConfig(BaseModel):
     )
     preview_head_chars: int = Field(default=2_000, ge=0, description="Head characters kept in persisted-output previews.")
     preview_tail_chars: int = Field(default=1_000, ge=0, description="Tail characters kept in persisted-output previews.")
+    structured_synopsis_enabled: bool = Field(
+        default=True,
+        description="When persisting an oversized tool output, replace the head/tail preview with a deterministic structural synopsis (keys, types, lengths) if the content is JSON or JSON Lines.",
+    )
+    structured_synopsis_max_chars: int = Field(
+        default=4_000,
+        ge=0,
+        description="Maximum characters for the structured synopsis inserted into persisted-output previews.",
+    )
     fallback_max_chars: int = Field(default=30_000, ge=0, description="Maximum inline characters when persistence is unavailable.")
     fallback_head_chars: int = Field(default=8_000, ge=0, description="Head characters for inline fallback truncation.")
     fallback_tail_chars: int = Field(default=3_000, ge=0, description="Tail characters for inline fallback truncation.")

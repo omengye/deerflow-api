@@ -1575,9 +1575,14 @@ def str_replace_tool(
                 path = _resolve_and_validate_user_data_path(path, thread_data)
             # Custom mount paths are resolved by LocalSandbox._resolve_path()
         with get_file_operation_lock(sandbox, path):
+            if old_str == "":
+                return (
+                    "Error: old_str must not be empty. To insert new content into a "
+                    "file, use the write_file tool instead."
+                )
             content = sandbox.read_file(path)
             if not content:
-                return "OK"
+                return f"Error: String to replace not found in file: {requested_path}"
             if old_str not in content:
                 return f"Error: String to replace not found in file: {requested_path}"
             if replace_all:

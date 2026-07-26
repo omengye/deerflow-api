@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import weakref
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -23,12 +25,48 @@ class _OAuthToken:
 
 
 class OAuthTokenManager:
-    """Acquire/cache/refresh OAuth tokens for MCP servers."""
+    """Acquire/cache/refresh OAuth tokens for MCP servers.
+
+    Callers reach ``get_authorization_header`` from many different event
+    loops, not just one long-lived loop: sync tool paths (see
+    ``deerflow.tools.sync.make_sync_tool_wrapper`` and
+    ``deerflow.mcp.cache.get_cached_mcp_tools``) run the coroutine via
+    ``asyncio.run(...)`` on a worker-thread pool, and ``asyncio.run``
+    creates and tears down a brand-new event loop for *every single call*.
+    An ``asyncio.Lock`` binds to whichever loop first awaits it, so a lock
+    created once in ``__init__`` (the previous implementation) would raise
+    "Future attached to a different loop" -- or simply hang -- the moment a
+    second loop tried to acquire it.
+
+    Because the refresh critical section must ``await`` an HTTP call
+    (``_fetch_token``), we cannot dodge the problem by only ever holding a
+    plain ``threading.Lock`` (that would mean holding a thread lock across
+    an ``await``, which is its own deadlock hazard under Windows'
+    ProactorEventLoop / thread-pool combo). Instead we keep one
+    ``asyncio.Lock`` *per event loop* for each server, created lazily and
+    stored in a ``WeakKeyDictionary`` keyed by the loop object so locks for
+    loops that have since been closed (e.g. every ``asyncio.run()`` call)
+    are garbage-collected instead of leaking. Bookkeeping around that
+    dictionary -- and around the token cache -- is protected by a plain
+    ``threading.Lock`` that is *only* ever held across synchronous dict
+    operations, never across an ``await``.
+
+    The tradeoff: concurrent refreshes from *different* event loops no
+    longer serialize against each other and may each fetch a fresh token
+    independently. That's a benign, last-write-wins race on the token
+    cache -- at worst one extra token request -- which is strictly better
+    than the deadlock/crash risk of a single cross-loop lock. Concurrent
+    callers *within the same loop* still coalesce onto a single in-flight
+    refresh, preserving the original single-fetch behavior.
+    """
 
     def __init__(self, oauth_by_server: dict[str, McpOAuthConfig]):
         self._oauth_by_server = oauth_by_server
         self._tokens: dict[str, _OAuthToken] = {}
-        self._locks: dict[str, asyncio.Lock] = {name: asyncio.Lock() for name in oauth_by_server}
+        # Guards `_tokens` reads/writes and `_loop_locks` bookkeeping below.
+        # Never held across an `await`.
+        self._state_lock = threading.Lock()
+        self._loop_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = weakref.WeakKeyDictionary()
 
     @classmethod
     def from_extensions_config(cls, extensions_config: ExtensionsConfig) -> OAuthTokenManager:
@@ -49,20 +87,46 @@ class OAuthTokenManager:
         if not oauth:
             return None
 
-        token = self._tokens.get(server_name)
+        token = self._get_cached_token(server_name)
         if token and not self._is_expiring(token, oauth):
             return f"{token.token_type} {token.access_token}"
 
-        lock = self._locks[server_name]
+        lock = self._get_loop_lock(server_name)
         async with lock:
-            token = self._tokens.get(server_name)
+            token = self._get_cached_token(server_name)
             if token and not self._is_expiring(token, oauth):
                 return f"{token.token_type} {token.access_token}"
 
             fresh = await self._fetch_token(oauth)
-            self._tokens[server_name] = fresh
+            self._store_token(server_name, fresh)
             logger.info(f"Refreshed OAuth access token for MCP server: {server_name}")
             return f"{fresh.token_type} {fresh.access_token}"
+
+    def _get_cached_token(self, server_name: str) -> _OAuthToken | None:
+        with self._state_lock:
+            return self._tokens.get(server_name)
+
+    def _store_token(self, server_name: str, token: _OAuthToken) -> None:
+        with self._state_lock:
+            self._tokens[server_name] = token
+
+    def _get_loop_lock(self, server_name: str) -> asyncio.Lock:
+        """Return the per-current-event-loop asyncio.Lock for `server_name`.
+
+        See the class docstring for why the lock must be scoped to the
+        running event loop rather than shared process-wide.
+        """
+        loop = asyncio.get_running_loop()
+        with self._state_lock:
+            per_loop = self._loop_locks.get(loop)
+            if per_loop is None:
+                per_loop = {}
+                self._loop_locks[loop] = per_loop
+            lock = per_loop.get(server_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                per_loop[server_name] = lock
+            return lock
 
     @staticmethod
     def _is_expiring(token: _OAuthToken, oauth: McpOAuthConfig) -> bool:

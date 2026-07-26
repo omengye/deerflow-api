@@ -27,7 +27,7 @@ class SummarizationConfig(BaseModel):
     )
     model_name: str | None = Field(
         default=None,
-        description="Model name to use for summarization (None = use a lightweight model)",
+        description="Model name to use for summarization (None = follow the current run's model)",
     )
     trigger: ContextSize | list[ContextSize] | None = Field(
         default=None,

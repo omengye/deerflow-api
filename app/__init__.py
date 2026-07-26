@@ -1,13 +1,10 @@
 """DeerFlow API Service — FastAPI wrapper around DeerFlow harness."""
+import logging
 import sys
 import asyncio
 from pathlib import Path
 
-# Python 3.14 on Windows: ProactorEventLoop transport.close() raises
-# RuntimeError('Event loop is closed') during async stream cleanup (anyio/httpx).
-# WindowsSelectorEventLoopPolicy avoids this entirely.
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+logger = logging.getLogger(__name__)
 
 # Load .env from project root before any config/settings are imported.
 try:
@@ -55,9 +52,54 @@ def _admin_ui_file_response(asset_path: str = "index.html") -> FileResponse:
     return FileResponse(target)
 
 
+def _install_proactor_shutdown_noise_filter() -> None:
+    """Silence a known-benign Windows ProactorEventLoop teardown error.
+
+    On Windows, ProactorEventLoop's pipe/socket transports can schedule a
+    deferred ``call_soon(self._call_connection_lost, ...)`` during
+    ``transport.close()``; if the loop is already closed by the time that
+    callback runs (observed with anyio/httpx async stream cleanup on
+    Python 3.14), asyncio's default exception handler logs it as an
+    unhandled ``RuntimeError('Event loop is closed')``. This is a
+    long-standing, still-open upstream issue (see cpython gh-149388,
+    encode/httpx discussions#2959) rather than something this app can fix;
+    it does not fail in-flight requests -- it only produces noisy logs
+    during transport GC/teardown.
+
+    A previous fix forced WindowsSelectorEventLoopPolicy globally via the
+    now-deprecated asyncio.set_event_loop_policy(). That is stronger than
+    needed and has a real cost: SelectorEventLoop cannot create subprocess
+    transports on Windows at all (NotImplementedError), which silently
+    breaks this project's default "stdio" MCP transport (deerflow.mcp.client
+    spawns MCP servers via subprocess). Since the underlying RuntimeError is
+    cosmetic (log noise, not a request failure -- confirmed by running the
+    full test suite and a targeted streaming-abandonment repro against the
+    default ProactorEventLoop without any policy override), we keep the
+    default Proactor loop (preserving subprocess/MCP-stdio support) and
+    instead filter just this one known-benign error out of the loop's
+    exception handler.
+    """
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+
+    def _handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        exc = context.get("exception")
+        if isinstance(exc, RuntimeError) and str(exc) == "Event loop is closed":
+            logger.debug("Suppressed benign Proactor shutdown error: %s", context.get("message"))
+            return
+        if previous_handler is not None:
+            previous_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_handler)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
+    if sys.platform == "win32":
+        _install_proactor_shutdown_noise_filter()
     manager = get_client_manager()
     await manager.startup()
     evolution_worker = None

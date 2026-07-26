@@ -66,6 +66,16 @@ class ExtensionsConfig(BaseModel):
         default_factory=dict,
         description="Map of skill name to state configuration",
     )
+    middlewares: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Custom AgentMiddleware class paths to load, in 'module.path:ClassName' "
+            "format (e.g. 'my_package.middlewares:MyMiddleware'). Each class is "
+            "instantiated with no arguments and appended to the lead agent's "
+            "middleware chain, after the built-in middlewares and before "
+            "ClarificationMiddleware."
+        ),
+    )
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     @classmethod

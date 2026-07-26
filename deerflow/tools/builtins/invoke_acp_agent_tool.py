@@ -1,5 +1,6 @@
 """Built-in tool for invoking external ACP-compatible agents."""
 
+import asyncio
 import logging
 import os
 import shutil
@@ -227,23 +228,30 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
 
             async with spawn_agent_process(client, cmd, *args, env=agent_env, cwd=physical_cwd) as (conn, proc):
                 logger.info("Spawning ACP agent '%s' with command '%s' and args %s in cwd %s", agent, cmd, args, physical_cwd)
-                await conn.initialize(
-                    protocol_version=PROTOCOL_VERSION,
-                    client_capabilities=ClientCapabilities(),
-                    client_info=Implementation(name="deerflow", title="DeerFlow", version="0.1.0"),
-                )
-                session_kwargs: dict[str, Any] = {"cwd": physical_cwd, "mcp_servers": mcp_servers}
-                if agent_config.model:
-                    session_kwargs["model"] = agent_config.model
-                session = await conn.new_session(**session_kwargs)
-                await conn.prompt(
-                    session_id=session.session_id,
-                    prompt=[text_block(prompt)],
-                )
+                async with asyncio.timeout(agent_config.timeout_seconds):
+                    await conn.initialize(
+                        protocol_version=PROTOCOL_VERSION,
+                        client_capabilities=ClientCapabilities(),
+                        client_info=Implementation(name="deerflow", title="DeerFlow", version="0.1.0"),
+                    )
+                    session_kwargs: dict[str, Any] = {"cwd": physical_cwd, "mcp_servers": mcp_servers}
+                    if agent_config.model:
+                        session_kwargs["model"] = agent_config.model
+                    session = await conn.new_session(**session_kwargs)
+                    await conn.prompt(
+                        session_id=session.session_id,
+                        prompt=[text_block(prompt)],
+                    )
             result = client.collected_text
             logger.info("ACP agent '%s' returned %s", agent, result[:1000])
             logger.info("ACP agent '%s' returned %d characters", agent, len(result))
             return result or "(no response)"
+        except TimeoutError:
+            logger.error("ACP agent '%s' invocation timed out after %s seconds", agent, agent_config.timeout_seconds)
+            return (
+                f"Error invoking ACP agent '{agent}': timed out after {agent_config.timeout_seconds} seconds. "
+                f"Increase `acp_agents.{agent}.timeout_seconds` in config.yaml if the agent needs more time."
+            )
         except Exception as e:
             logger.error("ACP agent '%s' invocation failed: %s", agent, e)
             return _format_invocation_error(agent, cmd, e)

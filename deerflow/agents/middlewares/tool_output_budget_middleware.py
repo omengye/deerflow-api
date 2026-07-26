@@ -13,11 +13,16 @@ from typing import TYPE_CHECKING, Any, override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
-from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
+from langchain.agents.middleware.types import (
+    ModelCallResult,
+    ModelRequest,
+    ModelResponse,
+)
 from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
+from deerflow.agents.middlewares.tool_output_synopsis import build_synopsis
 from deerflow.config.tool_output_config import ToolOutputConfig
 from deerflow.sandbox.sandbox_provider import get_sandbox_provider
 
@@ -133,8 +138,29 @@ def _externalize_to_sandbox(
     return virtual_path
 
 
-def _build_preview(content: str, *, tool_name: str, virtual_path: str, head_chars: int, tail_chars: int) -> str:
+def _build_preview(
+    content: str,
+    *,
+    tool_name: str,
+    virtual_path: str,
+    head_chars: int,
+    tail_chars: int,
+    synopsis_enabled: bool = False,
+    synopsis_max_chars: int = 0,
+) -> str:
     total = len(content)
+
+    synopsis = build_synopsis(content, tool_name=tool_name, max_chars=synopsis_max_chars) if synopsis_enabled and synopsis_max_chars > 0 else None
+    if synopsis is not None:
+        # Structured payloads (JSON/JSON Lines) get a schema-level synopsis
+        # instead of a raw head/tail slice: half of a JSON document is
+        # usually unparseable syntax that tells the model nothing about the
+        # data's shape, whereas the synopsis conveys keys/types/lengths
+        # directly. The synopsis therefore replaces head/tail rather than
+        # being appended alongside them.
+        ref = f"\n\n[Full {tool_name} output saved to {virtual_path} ({total} chars, ~{total // 4} tokens). Use read_file with start_line and end_line to access specific sections. Structured synopsis shown above in place of a raw preview.]\n\n"
+        return f"{synopsis}{ref}"
+
     head_end = _snap_to_line_boundary(content, min(head_chars, total))
     tail_start = max(head_end, total - tail_chars)
     tail_start_snapped = _snap_to_line_boundary(content, tail_start)
@@ -145,7 +171,7 @@ def _build_preview(content: str, *, tool_name: str, virtual_path: str, head_char
     tail = content[tail_start:] if tail_start < total else ""
     omitted = total - len(head) - len(tail)
     ref = f"\n\n[Full {tool_name} output saved to {virtual_path} ({total} chars, ~{total // 4} tokens). Use read_file with start_line and end_line to access specific sections. {omitted} chars omitted from this preview.]\n\n"
-    return "".join([head, ref, tail])
+    return f"{head}{ref}{tail}"
 
 
 def _build_fallback(content: str, *, tool_name: str, max_chars: int, head_chars: int, tail_chars: int) -> str:
@@ -170,7 +196,7 @@ def _build_fallback(content: str, *, tool_name: str, max_chars: int, head_chars:
     head = content[:head_end]
     tail = content[tail_start:] if tail_start < total else ""
     marker = marker_template.format(n=total - len(head) - len(tail), tn=tool_name)
-    return "".join([head, marker, tail])
+    return f"{head}{marker}{tail}"
 
 
 def _resolve_outputs_path(request: ToolCallRequest) -> str | None:
@@ -235,7 +261,15 @@ def _budget_content(
             virtual_path = _externalize(content, tool_name=tool_name, tool_call_id=tool_call_id, outputs_path=outputs_path, storage_subdir=config.storage_subdir)
 
         if virtual_path is not None:
-            return _build_preview(content, tool_name=tool_name, virtual_path=virtual_path, head_chars=config.preview_head_chars, tail_chars=config.preview_tail_chars)
+            return _build_preview(
+                content,
+                tool_name=tool_name,
+                virtual_path=virtual_path,
+                head_chars=config.preview_head_chars,
+                tail_chars=config.preview_tail_chars,
+                synopsis_enabled=config.structured_synopsis_enabled,
+                synopsis_max_chars=config.structured_synopsis_max_chars,
+            )
 
     if config.fallback_max_chars > 0 and len(content) > config.fallback_max_chars:
         return _build_fallback(content, tool_name=tool_name, max_chars=config.fallback_max_chars, head_chars=config.fallback_head_chars, tail_chars=config.fallback_tail_chars)

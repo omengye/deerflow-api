@@ -1,28 +1,54 @@
-"""Middleware to inject uploaded files information into agent context."""
+"""Middleware to inject uploaded files information into agent context.
+
+Only files attached to the *current* message get full metadata (size, path, and
+document outline).  Files uploaded earlier in the thread are announced as a bare
+name list; the model calls ``list_uploaded_files`` to fetch their details on
+demand.  Injecting every historical outline on every turn made upload metadata
+grow with ``file count x conversation turns``.
+
+The block is injected through ``wrap_model_call`` rather than ``before_agent``
+so it never enters the persisted message history.  Writing it back to state (as
+this middleware previously did, reusing the message id) checkpointed one block
+per turn, so a long thread accumulated many near-duplicate blocks in the
+history that the model then had to re-read on every subsequent request.
+"""
 
 import logging
+import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import NotRequired, override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
 from langchain_core.messages import HumanMessage
 from langgraph.runtime import Runtime
 
 from deerflow.config.paths import Paths, get_paths
-from deerflow.utils.file_conversion import extract_outline
+from deerflow.utils.file_conversion import CONVERTIBLE_EXTENSIONS, extract_outline
 
 logger = logging.getLogger(__name__)
 
 
 _OUTLINE_PREVIEW_LINES = 5
 
+# Historical files are listed by name only, but a thread can still accumulate
+# more uploads than is useful to name in every prompt.  Beyond this many, the
+# list is truncated and the model is pointed at ``list_uploaded_files``.
+_MAX_HISTORICAL_NAMES = 30
 
-def _extract_outline_for_file(file_path: Path) -> tuple[list[dict], list[str]]:
+# Matches a whole injected block, including blocks left in the persisted history
+# by the older before_agent implementation.
+_UPLOAD_BLOCK_RE = re.compile(r"<uploaded_files>[\s\S]*?</uploaded_files>\n*", re.IGNORECASE)
+
+
+def extract_outline_for_file(file_path: Path) -> tuple[list[dict], list[str]]:
     """Return the document outline and fallback preview for *file_path*.
 
     Looks for a sibling ``<stem>.md`` file produced by the upload conversion
-    pipeline.
+    pipeline.  For a file that is already Markdown, ``with_suffix(".md")``
+    resolves to the file itself, so its own headings are used.
 
     Returns:
         (outline, preview) where:
@@ -56,6 +82,126 @@ def _extract_outline_for_file(file_path: Path) -> tuple[list[dict], list[str]]:
     return [], preview
 
 
+def _strip_upload_block_text(text: str) -> str:
+    """Remove any ``<uploaded_files>...</uploaded_files>`` blocks from *text*."""
+    return _UPLOAD_BLOCK_RE.sub("", text).strip()
+
+
+def _strip_upload_blocks_from_content(content: str | list) -> tuple[str | list, bool]:
+    """Return *content* with any persisted ``<uploaded_files>`` blocks removed.
+
+    Handles both plain-string content and multimodal (list) content. For list
+    content, only ``type == "text"`` blocks are inspected; other blocks (e.g.
+    images) are kept exactly as-is. A text block that becomes empty once its
+    block is stripped is dropped entirely rather than left as a hollow ``""``
+    text element.
+
+    Returns ``(new_content, changed)`` — ``changed`` is False when nothing
+    needed stripping, in which case ``new_content`` is *content* unchanged.
+    """
+    if isinstance(content, str):
+        if "<uploaded_files>" not in content:
+            return content, False
+        stripped = _strip_upload_block_text(content)
+        return (stripped, True) if stripped != content else (content, False)
+
+    if isinstance(content, list):
+        new_blocks: list = []
+        changed = False
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str) and "<uploaded_files>" in text:
+                    stripped_text = _strip_upload_block_text(text)
+                    changed = True
+                    if stripped_text:
+                        new_blocks.append({**block, "text": stripped_text})
+                    continue  # empty after stripping -- drop the block
+            new_blocks.append(block)
+        return (new_blocks, True) if changed else (content, False)
+
+    return content, False
+
+
+def _strip_persisted_blocks(messages: list) -> list:
+    """Drop ``<uploaded_files>`` blocks already baked into the message history.
+
+    Threads created before injection moved to ``wrap_model_call`` have one block
+    checkpointed per turn.  Those stale copies would otherwise be re-sent on
+    every request forever, so they are removed from the model-bound view.  The
+    persisted checkpoint is left untouched; only what the model sees is cleaned.
+
+    Covers multimodal (list) content too: the older ``before_agent``
+    implementation could inject the block into an image+text message just as
+    readily as a plain-text one, so a thread with such a message would
+    otherwise keep re-sending that stale block on every request forever.
+    """
+    cleaned: list | None = None
+
+    for index, message in enumerate(messages):
+        if not isinstance(message, HumanMessage):
+            continue
+
+        new_content, changed = _strip_upload_blocks_from_content(message.content)
+        if not changed:
+            continue
+
+        if cleaned is None:
+            cleaned = list(messages)
+        cleaned[index] = HumanMessage(
+            content=new_content,
+            id=message.id,
+            additional_kwargs=message.additional_kwargs,
+        )
+
+    return cleaned if cleaned is not None else messages
+
+
+def _last_human_message_index(messages: list) -> int | None:
+    """Return the index of the most recent ``HumanMessage`` in *messages*, if any.
+
+    Searches from the end rather than assuming the last message is human: mid-turn
+    the model is called repeatedly with tool results appended, and after an
+    interrupted-then-resumed turn the tail of state can be a ``ToolMessage``
+    rather than the human turn that started it.
+    """
+    return next(
+        (i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)),
+        None,
+    )
+
+
+def converted_markdown_name(file_path: Path) -> str | None:
+    """Return the sibling ``.md`` filename for *file_path*, if one was generated.
+
+    Outline line numbers refer to the converted Markdown, not the original
+    binary document, so callers must show this path alongside the outline for
+    the line numbers to be usable with ``read_file``.  Returns ``None`` for a
+    file that is already Markdown (the outline refers to itself) or when no
+    conversion output exists.
+    """
+    md_path = file_path.with_suffix(".md")
+    if md_path == file_path or not md_path.is_file():
+        return None
+    return md_path.name
+
+
+def _is_conversion_artifact(file_path: Path, names: set[str]) -> bool:
+    """Return True when *file_path* is a ``.md`` produced from a sibling upload.
+
+    ``convert_file_to_markdown`` writes its output next to the source file as
+    ``<stem>.md``, so a converted PDF leaves both ``report.pdf`` and
+    ``report.md`` in the uploads directory.  Listing both doubles the injected
+    metadata and repeats the same outline twice, so the derived ``.md`` is
+    hidden whenever its source document is present.  A ``.md`` the user
+    uploaded directly has no such sibling and is still listed.
+    """
+    if file_path.suffix.lower() != ".md":
+        return False
+    stem = file_path.stem
+    return any(f"{stem}{ext}" in names for ext in CONVERTIBLE_EXTENSIONS)
+
+
 class UploadsMiddlewareState(AgentState):
     """State schema for uploads middleware."""
 
@@ -68,6 +214,11 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
     Reads file metadata from the current message's additional_kwargs.files
     (set by the frontend after upload) and prepends an <uploaded_files> block
     to the last human message so the model knows which files are available.
+
+    Files attached to the current message are described in full (size, path,
+    outline).  Earlier uploads are named only; the model calls
+    ``list_uploaded_files`` for their details.  The block is applied per model
+    call and is not written back to the message history.
     """
 
     state_schema = UploadsMiddlewareState
@@ -87,11 +238,15 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
         size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb / 1024:.1f} MB"
         lines.append(f"- {file['filename']} ({size_str})")
         lines.append(f"  Path: {file['path']}")
+        markdown_path = file.get("markdown_path")
+        if markdown_path:
+            lines.append(f"  Converted Markdown (read this one): {markdown_path}")
         outline = file.get("outline") or []
         if outline:
             truncated = outline[-1].get("truncated", False)
             visible = [e for e in outline if not e.get("truncated")]
-            lines.append("  Document outline (use `read_file` with line ranges to read sections):")
+            target = "the converted Markdown" if markdown_path else "the file"
+            lines.append(f"  Document outline — line numbers refer to {target} (use `read_file` with line ranges):")
             for entry in visible:
                 lines.append(f"    L{entry['line']}: {entry['title']}")
             if truncated:
@@ -105,37 +260,41 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
             lines.append("  Use `grep` to search for keywords (e.g. `grep(pattern='keyword', path='/mnt/user-data/uploads/')`).")
         lines.append("")
 
-    def _create_files_message(self, new_files: list[dict], historical_files: list[dict]) -> str:
+    def _create_files_message(self, new_files: list[dict], historical_names: list[str]) -> str:
         """Create a formatted message listing uploaded files.
 
         Args:
-            new_files: Files uploaded in the current message.
-            historical_files: Files uploaded in previous messages.
-                Each file dict may contain an optional ``outline`` key — a list of
-                ``{title, line}`` dicts extracted from the converted Markdown file.
+            new_files: Files uploaded in the current message. Each file dict may
+                contain an optional ``outline`` key — a list of ``{title, line}``
+                dicts extracted from the converted Markdown file.
+            historical_names: Filenames uploaded in previous messages. Listed by
+                name only; details are fetched via ``list_uploaded_files``.
 
         Returns:
             Formatted string inside <uploaded_files> tags.
         """
         lines = ["<uploaded_files>"]
 
-        lines.append("The following files were uploaded in this message:")
-        lines.append("")
         if new_files:
+            lines.append("The following files were uploaded in this message:")
+            lines.append("")
             for file in new_files:
                 self._format_file_entry(file, lines)
-        else:
-            lines.append("(empty)")
-            lines.append("")
 
-        if historical_files:
-            lines.append("The following files were uploaded in previous messages and are still available:")
+        if historical_names:
+            shown = historical_names[:_MAX_HISTORICAL_NAMES]
+            lines.append("Also uploaded earlier in this conversation and still available:")
+            lines.append(f"  {', '.join(shown)}")
+            if len(historical_names) > len(shown):
+                lines.append(f"  ... and {len(historical_names) - len(shown)} more")
+            lines.append("Call `list_uploaded_files` for their paths, then pass a filename to get that file's outline.")
             lines.append("")
-            for file in historical_files:
-                self._format_file_entry(file, lines)
 
         lines.append("To work with these files:")
-        lines.append("- Read from the file first — use the outline line numbers and `read_file` to locate relevant sections.")
+        if new_files:
+            lines.append("- Read from the file first — use the outline line numbers and `read_file` to locate relevant sections.")
+        else:
+            lines.append("- Use `list_uploaded_files` to see what is available, then call it with a filename for that file's outline before `read_file`.")
         lines.append("- Use `grep` to search for keywords when you are not sure which section to look at")
         lines.append("  (e.g. `grep(pattern='revenue', path='/mnt/user-data/uploads/')`).")
         lines.append("- Use `glob` to find files by name pattern")
@@ -183,111 +342,143 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
             )
         return files if files else None
 
-    @override
-    def before_agent(self, state: UploadsMiddlewareState, runtime: Runtime) -> dict | None:
-        """Inject uploaded files information before agent execution.
+    def _resolve_thread_id(self, runtime: Runtime | None) -> str | None:
+        """Resolve the thread id from runtime context or the ambient RunnableConfig."""
+        thread_id = (runtime.context or {}).get("thread_id") if runtime is not None else None
+        if thread_id:
+            return thread_id
+        try:
+            from langgraph.config import get_config
 
-        New files come from the current message's additional_kwargs.files.
-        Historical files are scanned from the thread's uploads directory,
-        excluding the new ones.
+            return get_config().get("configurable", {}).get("thread_id")
+        except RuntimeError:
+            return None  # get_config() raises outside a runnable context (e.g. unit tests)
 
-        Prepends <uploaded_files> context to the last human message content.
-        The original additional_kwargs (including files metadata) is preserved
-        on the updated message so the frontend can read it from the stream.
+    def _collect_files(self, last_message: HumanMessage, runtime: Runtime | None) -> tuple[list[dict], list[str]]:
+        """Return (new_files_with_outlines, historical_filenames).
 
-        Args:
-            state: Current agent state.
-            runtime: Runtime context containing thread_id.
-
-        Returns:
-            State updates including uploaded files list.
+        Outlines are extracted only for files attached to *last_message*.
+        Historical uploads are returned as names so the prompt stays small; the
+        model fetches their details through ``list_uploaded_files``.
         """
-        messages = list(state.get("messages", []))
-        if not messages:
-            return None
-
-        last_message_index = len(messages) - 1
-        last_message = messages[last_message_index]
-
-        if not isinstance(last_message, HumanMessage):
-            return None
-
-        # Resolve uploads directory for existence checks
-        thread_id = (runtime.context or {}).get("thread_id")
-        if thread_id is None:
-            try:
-                from langgraph.config import get_config
-
-                thread_id = get_config().get("configurable", {}).get("thread_id")
-            except RuntimeError:
-                pass  # get_config() raises outside a runnable context (e.g. unit tests)
+        thread_id = self._resolve_thread_id(runtime)
         uploads_dir = self._paths.sandbox_uploads_dir(thread_id) if thread_id else None
 
-        # Get newly uploaded files from the current message's additional_kwargs.files
         new_files = self._files_from_kwargs(last_message, uploads_dir) or []
-
-        # Collect historical files from the uploads directory (all except the new ones)
         new_filenames = {f["filename"] for f in new_files}
-        historical_files: list[dict] = []
-        if uploads_dir and uploads_dir.exists():
-            for file_path in sorted(uploads_dir.iterdir()):
-                if file_path.is_file() and file_path.name not in new_filenames:
-                    stat = file_path.stat()
-                    outline, preview = _extract_outline_for_file(file_path)
-                    historical_files.append(
-                        {
-                            "filename": file_path.name,
-                            "size": stat.st_size,
-                            "path": f"/mnt/user-data/uploads/{file_path.name}",
-                            "extension": file_path.suffix,
-                            "outline": outline,
-                            "outline_preview": preview,
-                        }
-                    )
 
-        # Attach outlines to new files as well
+        historical_names: list[str] = []
+        if uploads_dir and uploads_dir.is_dir():
+            entries = [p for p in uploads_dir.iterdir() if p.is_file()]
+            names = {p.name for p in entries}
+            historical_names = sorted(
+                p.name
+                for p in entries
+                if p.name not in new_filenames and not _is_conversion_artifact(p, names)
+            )
+
         if uploads_dir:
             for file in new_files:
                 phys_path = uploads_dir / file["filename"]
-                outline, preview = _extract_outline_for_file(phys_path)
+                outline, preview = extract_outline_for_file(phys_path)
                 file["outline"] = outline
                 file["outline_preview"] = preview
+                md_name = converted_markdown_name(phys_path)
+                if md_name:
+                    file["markdown_path"] = f"/mnt/user-data/uploads/{md_name}"
 
-        if not new_files and not historical_files:
+        return new_files, historical_names
+
+    def _build_injected_messages(self, messages: list, runtime: Runtime | None) -> list | None:
+        """Return *messages* with an <uploaded_files> block on the last human turn.
+
+        Targets the most recent HumanMessage rather than the final message: within
+        a turn the model is called repeatedly with tool results appended, and the
+        file context must stay visible for all of those calls.
+
+        Returns ``None`` when there is nothing to inject, so callers can pass the
+        original list through untouched.
+        """
+        messages = _strip_persisted_blocks(messages)
+
+        last_index = _last_human_message_index(messages)
+        if last_index is None:
             return None
 
-        logger.debug(f"New files: {[f['filename'] for f in new_files]}, historical: {[f['filename'] for f in historical_files]}")
+        last_message = messages[last_index]
 
-        # Create files message and prepend to the last human message content
-        files_message = self._create_files_message(new_files, historical_files)
+        new_files, historical_names = self._collect_files(last_message, runtime)
+        if not new_files and not historical_names:
+            return None
 
-        # Extract original content - handle both string and list formats
+        logger.debug("New files: %s, historical: %d", [f["filename"] for f in new_files], len(historical_names))
+
+        files_message = self._create_files_message(new_files, historical_names)
+
         original_content = last_message.content
         if isinstance(original_content, str):
-            # Simple case: string content, just prepend files message
             updated_content = f"{files_message}\n\n{original_content}"
         elif isinstance(original_content, list):
-            # Complex case: list content (multimodal), preserve all blocks
-            # Prepend files message as the first text block
-            files_block = {"type": "text", "text": f"{files_message}\n\n"}
-            # Keep all original blocks (including images)
-            updated_content = [files_block, *original_content]
+            # Multimodal content: prepend as a text block, keep image blocks intact.
+            updated_content = [{"type": "text", "text": f"{files_message}\n\n"}, *original_content]
         else:
-            # Other types, preserve as-is
-            updated_content = original_content
+            return None
 
-        # Create new message with combined content.
         # Preserve additional_kwargs (including files metadata) so the frontend
         # can read structured file info from the streamed message.
-        updated_message = HumanMessage(
+        patched = list(messages)
+        patched[last_index] = HumanMessage(
             content=updated_content,
             id=last_message.id,
             additional_kwargs=last_message.additional_kwargs,
         )
+        return patched
 
-        messages[last_message_index] = updated_message
+    @override
+    def before_agent(self, state: UploadsMiddlewareState, runtime: Runtime) -> dict | None:
+        """Record metadata for files attached to the current message.
 
-        return {
-            "uploaded_files": new_files,
-            "messages": messages,
-        }
+        Only the ``uploaded_files`` state key is written — the prompt block itself
+        is injected per model call by :meth:`wrap_model_call` so it never enters
+        the persisted history.
+
+        Locates the human turn the same way :meth:`_build_injected_messages`
+        does (most recent ``HumanMessage``, not just the final message) so the
+        two stay consistent — e.g. after an interrupted-then-resumed turn
+        leaves a ``ToolMessage`` at the tail of state.
+        """
+        messages = state.get("messages") or []
+        if not messages:
+            return None
+
+        last_index = _last_human_message_index(messages)
+        if last_index is None:
+            return None
+        last_message = messages[last_index]
+
+        new_files, _ = self._collect_files(last_message, runtime)
+        if not new_files:
+            return None
+        return {"uploaded_files": new_files}
+
+    @override
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelCallResult:
+        patched = self._build_injected_messages(request.messages, getattr(request, "runtime", None))
+        if patched is not None:
+            request = request.override(messages=patched)
+        return handler(request)
+
+    @override
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelCallResult:
+        patched = self._build_injected_messages(request.messages, getattr(request, "runtime", None))
+        if patched is not None:
+            request = request.override(messages=patched)
+        return await handler(request)

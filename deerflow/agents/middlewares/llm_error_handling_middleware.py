@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -192,7 +193,11 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         if retry_after is not None:
             return retry_after
         backoff = self.retry_base_delay_ms * (2 ** max(0, attempt - 1))
-        return min(backoff, self.retry_cap_delay_ms)
+        capped_backoff = min(backoff, self.retry_cap_delay_ms)
+        # Full jitter (AWS-recommended): sample uniformly from [0, capped_backoff] so
+        # concurrent callers hit by the same burst-rate 429 (e.g. provider "slope"
+        # limits) don't realign their retries on the same instant.
+        return int(random.uniform(0, capped_backoff))
 
     def _build_retry_message(self, attempt: int, wait_ms: int, reason: str) -> str:
         seconds = max(1, round(wait_ms / 1000))

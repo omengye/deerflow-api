@@ -723,13 +723,17 @@
     const tools = Array.isArray(summary.tools) ? summary.tools : [];
     const riskyTools = tools.filter((tool) => ["bash", "file:write"].includes(tool.group)).length;
     const autoApproved = acpAgents.filter((agent) => agent.auto_approve_permissions).length;
+    const unboundedAcp = acpAgents.filter((agent) => agent.timeout_seconds === null).length;
     const rows = [
       ["Sandbox", sandbox.use || "未配置"],
       ["Sandbox 镜像", sandbox.image || "默认"],
       ["挂载数量", sandbox.mounts_count ?? 0],
       ["Stream Bridge", bridge.type || "memory"],
       ["Redis", bridge.redis_configured ? "已配置" : "未配置"],
-      ["ACP Agents", `${acpAgents.length} 个；自动批准权限 ${autoApproved} 个`],
+      [
+        "ACP Agents",
+        `${acpAgents.length} 个；自动批准权限 ${autoApproved} 个${unboundedAcp ? `；未设超时 ${unboundedAcp} 个` : ""}`,
+      ],
       ["内置 Tools", `${tools.length} 个；写入/执行类 ${riskyTools} 个`],
     ];
     el.agentSystemSummary.innerHTML = rows

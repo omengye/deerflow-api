@@ -686,6 +686,10 @@ def _admin_config_response(raw_config: dict[str, Any], path: Path) -> dict[str, 
                     "description": config.get("description"),
                     "model": config.get("model"),
                     "auto_approve_permissions": bool(config.get("auto_approve_permissions")),
+                    # Surface the effective invocation timeout (ACPAgentConfig defaults
+                    # to 600s; an explicit null means "wait indefinitely") so operators
+                    # can tell a hung ACP agent from a slow one without reading the file.
+                    "timeout_seconds": config.get("timeout_seconds", 600),
                     "environment_keys": sorted(str(key) for key in (config.get("env") or {}).keys())
                     if isinstance(config.get("env"), dict)
                     else [],
@@ -879,11 +883,140 @@ def _validate_configured_model_name(config_data: dict[str, Any], model_name: str
         raise HTTPException(status_code=400, detail=f"{field} '{model_name}' is not configured")
 
 
+# Codex Responses API models only accept low/medium/high/xhigh (models/factory.py:179).
+# Other models get reasoning_effort passed through as-is to the underlying SDK;
+# that path also feeds OpenAI-style "minimal" (models/factory.py:143 sets it
+# directly when thinking is disabled), which Codex does not accept. The two
+# domains only share low/medium/high, so a single flat allowlist would either
+# wrongly reject "minimal" for non-Codex models or wrongly accept "xhigh" for
+# them -- the value domain has to be resolved per model family.
+_CODEX_REASONING_EFFORT_VALUES = ("low", "medium", "high", "xhigh")
+_STANDARD_REASONING_EFFORT_VALUES = ("minimal", "low", "medium", "high")
+_REASONING_EFFORT_VALUES = tuple(sorted(set(_CODEX_REASONING_EFFORT_VALUES) | set(_STANDARD_REASONING_EFFORT_VALUES)))
+
+
+def _find_configured_model(config_data: dict[str, Any], model_name: str) -> dict[str, Any] | None:
+    for model in config_data.get("models", []):
+        if isinstance(model, dict) and model.get("name") == model_name:
+            return model
+    return None
+
+
+def _is_codex_model(raw_model: dict[str, Any]) -> bool | None:
+    """Best-effort static check of whether a configured model resolves to
+    CodexChatModel, mirroring models/factory.py's own
+    ``issubclass(model_class, CodexChatModel)`` check (factory.py:171).
+
+    Returns None if the model's ``use`` path can't be resolved at admin-write
+    time (missing/malformed field, import failure, etc.) -- callers should
+    treat that the same as an unresolvable model and fall back to the
+    permissive union of reasoning_effort values.
+    """
+    use_path = raw_model.get("use")
+    if not isinstance(use_path, str) or not use_path:
+        return None
+    try:
+        from langchain.chat_models import BaseChatModel
+
+        from deerflow.models.openai_codex_provider import CodexChatModel
+        from deerflow.reflection import resolve_class
+
+        model_class = resolve_class(use_path, BaseChatModel)
+    except (ImportError, ValueError):
+        # resolve_class only raises ImportError (bad/missing module path) or
+        # ValueError (not a class, or not a BaseChatModel subclass) --
+        # deerflow/reflection/resolvers.py.
+        return None
+    return issubclass(model_class, CodexChatModel)
+
+
+def _reasoning_effort_values_for(raw_model: dict[str, Any] | None) -> tuple[str, ...]:
+    """Reasoning-effort value domain for a (possibly unresolved) model."""
+    if raw_model is None:
+        return _REASONING_EFFORT_VALUES
+    is_codex = _is_codex_model(raw_model)
+    if is_codex is True:
+        return _CODEX_REASONING_EFFORT_VALUES
+    if is_codex is False:
+        return _STANDARD_REASONING_EFFORT_VALUES
+    return _REASONING_EFFORT_VALUES
+
+
+def _validate_subagent_generation_settings(
+    config_data: dict[str, Any],
+    *,
+    model_name: str | None,
+    thinking_enabled: bool | None,
+    reasoning_effort: str | None,
+    field: str,
+) -> None:
+    """Cross-check a per-agent thinking_enabled/reasoning_effort override against
+    the resolved model's declared capabilities (supports_thinking / supports_reasoning_effort).
+
+    ``model_name`` is the *effective* model for this agent, i.e. only set when
+    the agent explicitly overrides its model (SubagentOverrideConfig.model is
+    not None, or CustomSubagentConfig.model is not "inherit"). When the agent
+    has no per-agent model override, it inherits whichever model the parent
+    run happens to use -- that's not knowable at config-write time, so we
+    skip the capability check and allow the override through. models/factory.py
+    still degrades gracefully (warns + falls back to non-thinking) if the
+    resolved model turns out not to support it at run time, so this is a
+    best-effort admin-time check, not the only guardrail.
+
+    The reasoning_effort *value-domain* check (as opposed to the
+    supports_reasoning_effort capability check below) always runs when
+    reasoning_effort is set, regardless of model resolvability -- only the
+    allowed domain itself narrows once the model is statically known to be
+    Codex or non-Codex (see _reasoning_effort_values_for).
+    """
+    raw_model = _find_configured_model(config_data, model_name) if model_name not in (None, "inherit") else None
+
+    if reasoning_effort is not None:
+        allowed_values = _reasoning_effort_values_for(raw_model)
+        if reasoning_effort not in allowed_values:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field}.reasoning_effort must be one of {allowed_values}, got '{reasoning_effort}'",
+            )
+
+    if raw_model is None:
+        # Model override absent/inherited, or an unknown model name (which
+        # _validate_configured_model_name already rejects separately).
+        return
+
+    if thinking_enabled and not raw_model.get("supports_thinking", False):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field}.thinking_enabled requires model '{model_name}' to have supports_thinking: true",
+        )
+    if reasoning_effort is not None and not raw_model.get("supports_reasoning_effort", False):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field}.reasoning_effort requires model '{model_name}' to have supports_reasoning_effort: true",
+        )
+
+
 def _validate_subagent_models(config_data: dict[str, Any], config: SubagentsAppConfig) -> None:
     for name, override in config.agents.items():
-        _validate_configured_model_name(config_data, override.model, field=f"subagents.agents.{name}.model")
+        field = f"subagents.agents.{name}"
+        _validate_configured_model_name(config_data, override.model, field=f"{field}.model")
+        _validate_subagent_generation_settings(
+            config_data,
+            model_name=override.model,
+            thinking_enabled=override.thinking_enabled,
+            reasoning_effort=override.reasoning_effort,
+            field=field,
+        )
     for name, custom in config.custom_agents.items():
-        _validate_configured_model_name(config_data, custom.model, field=f"subagents.custom_agents.{name}.model")
+        field = f"subagents.custom_agents.{name}"
+        _validate_configured_model_name(config_data, custom.model, field=f"{field}.model")
+        _validate_subagent_generation_settings(
+            config_data,
+            model_name=custom.model,
+            thinking_enabled=custom.thinking_enabled,
+            reasoning_effort=custom.reasoning_effort,
+            field=field,
+        )
 
 
 def _validate_context_size(value: ContextSize, *, field: str) -> None:
@@ -897,6 +1030,8 @@ def _validate_context_size(value: ContextSize, *, field: str) -> None:
 
 def _validate_summarization_config(config: SummarizationConfig) -> None:
     triggers = config.trigger if isinstance(config.trigger, list) else [config.trigger] if config.trigger else []
+    if config.enabled and not triggers:
+        raise HTTPException(status_code=400, detail="summarization.trigger is required when summarization.enabled is true")
     for index, trigger in enumerate(triggers):
         _validate_context_size(trigger, field=f"summarization.trigger[{index}]")
     _validate_context_size(config.keep, field="summarization.keep")

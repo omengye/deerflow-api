@@ -180,10 +180,29 @@ class SubagentExecutor:
             transports bound to the dying loop).
         """
         model_name = _get_model_name(self.config, self.parent_model)
+
+        # thinking_enabled: explicit per-agent override (config.yaml
+        # subagents.agents.*.thinking_enabled) takes precedence over the
+        # parent's value inherited via self.thinking_enabled. None means "no
+        # override configured", so it's a true three-state precedence, not a
+        # simple `or` -- `False` must be able to override a `True` parent.
+        effective_thinking_enabled = self.config.thinking_enabled if self.config.thinking_enabled is not None else self.thinking_enabled
+
+        # model_settings/reasoning_effort are override-only (no parent
+        # inheritance path exists for subagents today, same as model/skills)
+        # so we just forward whatever is configured as extra kwargs.
+        # factory.py:create_chat_model already merges **kwargs over the
+        # model's own config.yaml settings, so no factory changes were
+        # needed to support per-agent overrides here.
+        model_kwargs: dict[str, Any] = dict(self.config.model_settings) if self.config.model_settings else {}
+        if self.config.reasoning_effort is not None:
+            model_kwargs["reasoning_effort"] = self.config.reasoning_effort
+
         model = create_chat_model(
             name=model_name,
-            thinking_enabled=self.thinking_enabled,
+            thinking_enabled=effective_thinking_enabled,
             disable_keepalive=True,
+            **model_kwargs,
         )
 
         from deerflow.agents.middlewares.loop_detection_middleware import (

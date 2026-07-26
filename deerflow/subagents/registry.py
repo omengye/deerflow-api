@@ -36,6 +36,9 @@ def _build_custom_subagent_config(name: str) -> SubagentConfig | None:
         model=custom.model,
         max_turns=custom.max_turns,
         timeout_seconds=custom.timeout_seconds,
+        model_settings=custom.model_settings.model_dump(exclude_none=True) if custom.model_settings is not None else None,
+        thinking_enabled=custom.thinking_enabled,
+        reasoning_effort=custom.reasoning_effort,
     )
 
 
@@ -45,7 +48,8 @@ def get_subagent_config(name: str) -> SubagentConfig | None:
     Resolution order (mirrors Codex's config layering):
     1. Built-in subagents (general-purpose, bash)
     2. Custom subagents from config.yaml custom_agents section
-    3. Per-agent overrides from config.yaml agents section (timeout, max_turns, model, skills)
+    3. Per-agent overrides from config.yaml agents section (timeout, max_turns, model,
+       skills, model_settings, thinking_enabled, reasoning_effort)
 
     Args:
         name: The name of the subagent.
@@ -103,6 +107,27 @@ def get_subagent_config(name: str) -> SubagentConfig | None:
     if effective_skills is not None and effective_skills != config.skills:
         logger.debug("Subagent '%s': skills overridden (%s -> %s)", name, config.skills, effective_skills)
         overrides["skills"] = effective_skills
+
+    # Model settings / thinking_enabled / reasoning_effort: per-agent override
+    # only, same as model/skills above -- there is no global default for these,
+    # only the model's own defaults (model_settings) or the parent agent's
+    # value (thinking_enabled, resolved later in executor.py).
+    effective_model_settings = app_config.get_model_settings_for(name)
+    if effective_model_settings is not None:
+        dumped_model_settings = effective_model_settings.model_dump(exclude_none=True)
+        if dumped_model_settings != (config.model_settings or {}):
+            logger.debug("Subagent '%s': model_settings overridden (%s -> %s)", name, config.model_settings, dumped_model_settings)
+            overrides["model_settings"] = dumped_model_settings
+
+    effective_thinking_enabled = app_config.get_thinking_enabled_for(name)
+    if effective_thinking_enabled is not None and effective_thinking_enabled != config.thinking_enabled:
+        logger.debug("Subagent '%s': thinking_enabled overridden (%s -> %s)", name, config.thinking_enabled, effective_thinking_enabled)
+        overrides["thinking_enabled"] = effective_thinking_enabled
+
+    effective_reasoning_effort = app_config.get_reasoning_effort_for(name)
+    if effective_reasoning_effort is not None and effective_reasoning_effort != config.reasoning_effort:
+        logger.debug("Subagent '%s': reasoning_effort overridden (%s -> %s)", name, config.reasoning_effort, effective_reasoning_effort)
+        overrides["reasoning_effort"] = effective_reasoning_effort
 
     if overrides:
         config = replace(config, **overrides)

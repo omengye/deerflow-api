@@ -1,12 +1,17 @@
+import json
 import os
 from types import SimpleNamespace
 
 from langchain_core.messages import ToolMessage
 
-from deerflow.agents.middlewares.tool_error_handling_middleware import build_subagent_runtime_middlewares
-from deerflow.agents.middlewares.tool_output_budget_middleware import ToolOutputBudgetMiddleware, _build_fallback
-from deerflow.config.app_config import AppConfig
-from deerflow.config.app_config import reset_app_config, set_app_config
+from deerflow.agents.middlewares.tool_error_handling_middleware import (
+    build_subagent_runtime_middlewares,
+)
+from deerflow.agents.middlewares.tool_output_budget_middleware import (
+    ToolOutputBudgetMiddleware,
+    _build_fallback,
+)
+from deerflow.config.app_config import AppConfig, reset_app_config, set_app_config
 from deerflow.config.sandbox_config import SandboxConfig
 from deerflow.config.tool_output_config import ToolOutputConfig
 
@@ -37,6 +42,37 @@ def test_large_tool_output_externalized(tmp_path) -> None:
     files = os.listdir(storage_dir)
     assert len(files) == 1
     assert (storage_dir / files[0]).read_text(encoding="utf-8") == "a" * 100
+
+
+def test_externalized_json_output_gets_structured_synopsis(tmp_path) -> None:
+    config = ToolOutputConfig(externalize_min_chars=20, preview_head_chars=8, preview_tail_chars=4, structured_synopsis_enabled=True, structured_synopsis_max_chars=2_000)
+    middleware = ToolOutputBudgetMiddleware(config=config)
+    payload = {"status": "ok", "items": [{"id": i} for i in range(50)]}
+    message = ToolMessage(content=json.dumps(payload), name="bash", tool_call_id="tc-1")
+
+    result = middleware.wrap_tool_call(_request(str(tmp_path)), lambda _: message)
+
+    assert isinstance(result, ToolMessage)
+    content = str(result.content)
+    assert "[Structured synopsis of bash output: JSON]" in content
+    assert "items: array (len=50)" in content
+    assert "Full bash output saved to /mnt/user-data/outputs/.tool-results/bash-" in content
+    # Raw head/tail slices of the JSON text are replaced by the synopsis.
+    assert '{"status"' not in content
+
+
+def test_structured_synopsis_disabled_falls_back_to_head_tail(tmp_path) -> None:
+    config = ToolOutputConfig(externalize_min_chars=20, preview_head_chars=8, preview_tail_chars=4, structured_synopsis_enabled=False)
+    middleware = ToolOutputBudgetMiddleware(config=config)
+    payload = {"status": "ok", "items": [{"id": i} for i in range(50)]}
+    message = ToolMessage(content=json.dumps(payload), name="bash", tool_call_id="tc-1")
+
+    result = middleware.wrap_tool_call(_request(str(tmp_path)), lambda _: message)
+
+    assert isinstance(result, ToolMessage)
+    content = str(result.content)
+    assert "[Structured synopsis" not in content
+    assert "Full bash output saved to /mnt/user-data/outputs/.tool-results/bash-" in content
 
 
 def test_tool_output_budget_middleware_is_in_runtime_chain() -> None:

@@ -7,6 +7,33 @@ from pydantic import BaseModel, ConfigDict, Field
 logger = logging.getLogger(__name__)
 
 
+class ModelSettingsConfig(BaseModel):
+    """Generation parameter overrides passed straight through to the chat model constructor.
+
+    Deliberately scoped to the handful of provider-agnostic sampling knobs
+    (temperature, max_tokens) that make sense to tune per subagent. Anything
+    provider-specific (e.g. top_p) belongs on the model's own `models:` entry
+    in config.yaml instead, where `extra: allow` already lets that model
+    declare arbitrary default kwargs. `extra: forbid` here is intentional and
+    asymmetric with that: a typo in a per-agent override (e.g. `tempurature`)
+    should fail loudly at config-load time instead of silently being dropped.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: float | None = Field(
+        default=None,
+        ge=0,
+        le=2,
+        description="Sampling temperature override for this subagent (None = inherit)",
+    )
+    max_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description="Max output tokens override for this subagent (None = inherit)",
+    )
+
+
 class SubagentOverrideConfig(BaseModel):
     """Per-agent configuration overrides."""
 
@@ -30,6 +57,18 @@ class SubagentOverrideConfig(BaseModel):
     skills: list[str] | None = Field(
         default=None,
         description="Skill names whitelist for this subagent (None = inherit all enabled skills, [] = no skills)",
+    )
+    model_settings: ModelSettingsConfig | None = Field(
+        default=None,
+        description="Generation parameter overrides (temperature, max_tokens) for this subagent (None = inherit)",
+    )
+    thinking_enabled: bool | None = Field(
+        default=None,
+        description="Enable/disable thinking mode for this subagent (None = inherit from parent agent)",
+    )
+    reasoning_effort: str | None = Field(
+        default=None,
+        description="Reasoning effort override for this subagent, one of low/medium/high/xhigh (None = inherit)",
     )
 
 
@@ -69,6 +108,18 @@ class CustomSubagentConfig(BaseModel):
         default=900,
         ge=1,
         description="Maximum execution time in seconds",
+    )
+    model_settings: ModelSettingsConfig | None = Field(
+        default=None,
+        description="Generation parameter overrides (temperature, max_tokens) for this subagent (None = model defaults)",
+    )
+    thinking_enabled: bool | None = Field(
+        default=None,
+        description="Enable/disable thinking mode for this subagent (None = model/factory default)",
+    )
+    reasoning_effort: str | None = Field(
+        default=None,
+        description="Reasoning effort for this subagent, one of low/medium/high/xhigh (None = model/factory default)",
     )
 
 
@@ -151,6 +202,48 @@ class SubagentsAppConfig(BaseModel):
             return override.skills
         return None
 
+    def get_model_settings_for(self, agent_name: str) -> ModelSettingsConfig | None:
+        """Get the model_settings override for a specific agent.
+
+        Args:
+            agent_name: The name of the subagent.
+
+        Returns:
+            ModelSettingsConfig if overridden, None otherwise (subagent will use model defaults).
+        """
+        override = self.agents.get(agent_name)
+        if override is not None and override.model_settings is not None:
+            return override.model_settings
+        return None
+
+    def get_thinking_enabled_for(self, agent_name: str) -> bool | None:
+        """Get the thinking_enabled override for a specific agent.
+
+        Args:
+            agent_name: The name of the subagent.
+
+        Returns:
+            True/False if overridden, None otherwise (subagent will inherit from parent agent).
+        """
+        override = self.agents.get(agent_name)
+        if override is not None and override.thinking_enabled is not None:
+            return override.thinking_enabled
+        return None
+
+    def get_reasoning_effort_for(self, agent_name: str) -> str | None:
+        """Get the reasoning_effort override for a specific agent.
+
+        Args:
+            agent_name: The name of the subagent.
+
+        Returns:
+            Reasoning effort string if overridden, None otherwise (subagent will use model/factory default).
+        """
+        override = self.agents.get(agent_name)
+        if override is not None and override.reasoning_effort is not None:
+            return override.reasoning_effort
+        return None
+
 
 _subagents_config: SubagentsAppConfig = SubagentsAppConfig()
 
@@ -176,6 +269,12 @@ def load_subagents_config_from_dict(config_dict: dict) -> None:
             parts.append(f"model={override.model}")
         if override.skills is not None:
             parts.append(f"skills={override.skills}")
+        if override.model_settings is not None:
+            parts.append(f"model_settings={override.model_settings.model_dump(exclude_none=True)}")
+        if override.thinking_enabled is not None:
+            parts.append(f"thinking_enabled={override.thinking_enabled}")
+        if override.reasoning_effort is not None:
+            parts.append(f"reasoning_effort={override.reasoning_effort}")
         if parts:
             overrides_summary[name] = ", ".join(parts)
 

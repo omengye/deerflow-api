@@ -24,6 +24,14 @@ class ACPAgentConfig(BaseModel):
             "are denied — the agent must be configured to operate without requesting permissions."
         ),
     )
+    timeout_seconds: float | None = Field(
+        default=600,
+        description=(
+            "Maximum time in seconds to wait for the agent to initialize, start a session, and "
+            "respond to a prompt. If exceeded, the ACP subprocess is terminated and an error is "
+            "returned to the caller. Set to None to wait indefinitely."
+        ),
+    )
 
 
 _acp_agents: dict[str, ACPAgentConfig] = {}
