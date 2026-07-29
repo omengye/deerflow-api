@@ -242,6 +242,7 @@ tool_groups:
   - name: file:write
   - name: bash
   - name: object_storage
+  - name: host:opencli
 
 tool_search:
   enabled: false
@@ -338,6 +339,9 @@ tools:
   - name: str_replace
     group: file:write
     use: deerflow.sandbox.tools:str_replace_tool
+  - name: host_opencli
+    group: host:opencli
+    use: deerflow.tools.host_opencli:host_opencli_tool
   - name: bash
     group: bash
     use: deerflow.sandbox.tools:bash_tool
