@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import settings
-from deerflow.runtime import DisconnectMode, MemoryStreamBridge, RunManager, RunRecord, RunStatus, make_stream_bridge
+from deerflow.runtime import ConflictError, DisconnectMode, MemoryStreamBridge, RunManager, RunRecord, RunStatus, make_stream_bridge
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,8 @@ class ClientManager:
         self._client_map: dict[tuple[object, ...], Any] = {}  # config_key -> DeerFlowClient
         self._async_client_map: dict[tuple[object, ...], Any] = {}  # config_key -> DeerFlowClient with async checkpointer
         self._running_threads: set[str] = set()  # thread_ids currently running
+        self._running_thread_counts: dict[str, int] = {}
+        self._deleting_threads: set[str] = set()
         self._thread_lock = threading.Lock()
         self.run_manager = RunManager()
         self._stream_bridge_cm = None
@@ -75,6 +77,7 @@ class ClientManager:
         self._metadata_cleanup_handles: dict[str, asyncio.TimerHandle] = {}
         self._lifecycle_tasks: set[asyncio.Task] = set()
         self.scheduler_service = None
+        self.thread_cleanup_service = None
         self.feishu_channel = None
 
     def feishu_status(self) -> dict[str, Any]:
@@ -168,6 +171,17 @@ class ClientManager:
             )
 
         self._assert_storage_ready()
+
+        if settings.checkpointer_type == "sqlite":
+            from app.thread_cleanup import ThreadCleanupService
+
+            checkpoint_path = Path(settings.checkpointer_path)
+            self.thread_cleanup_service = ThreadCleanupService(
+                db_path=checkpoint_path,
+                manager=self,
+                config=settings.thread_cleanup,
+            )
+            await self.thread_cleanup_service.start()
 
         # Delivery must be ready before the scheduler claims overdue work.
         # start_feishu_channel is idempotent and returns a disabled/not-configured
@@ -487,6 +501,15 @@ class ClientManager:
         multitask_strategy: str = "reject",
     ) -> RunRecord:
         """Create a run and stream DeerFlowClient events through the bridge."""
+        try:
+            await self.touch_thread_activity(thread_id, source=entrypoint)
+        except Exception as exc:
+            from app.thread_cleanup import ThreadCleanupInProgressError
+
+            if isinstance(exc, ThreadCleanupInProgressError):
+                raise ConflictError(str(exc)) from exc
+            raise
+
         record = await self.run_manager.create_or_reject(
             thread_id,
             run_id=run_id,
@@ -495,15 +518,22 @@ class ClientManager:
             metadata={"request_id": request_id, "entrypoint": entrypoint},
             kwargs=kwargs,
         )
-        self.mark_thread_running(thread_id)
-        task = asyncio.create_task(
-            self._produce_client_stream(
-                record=record,
-                message=message,
-                kwargs=kwargs,
-                request_id=request_id,
-            )
+        if not self.mark_thread_running(thread_id):
+            await self.run_manager.cleanup(record.run_id, delay=0)
+            raise ConflictError(f"Thread {thread_id} is currently being deleted")
+        producer = self._produce_client_stream(
+            record=record,
+            message=message,
+            kwargs=kwargs,
+            request_id=request_id,
         )
+        try:
+            task = asyncio.create_task(producer)
+        except BaseException:
+            producer.close()
+            self.mark_thread_done(thread_id)
+            await self.run_manager.cleanup(record.run_id, delay=0)
+            raise
         record.task = task
         return record
 
@@ -699,17 +729,47 @@ class ClientManager:
                 exc_info=(type(error), error, error.__traceback__),
             )
 
-    def mark_thread_running(self, thread_id: str):
+    def mark_thread_running(self, thread_id: str) -> bool:
         with self._thread_lock:
+            if thread_id in self._deleting_threads:
+                return False
+            self._running_thread_counts[thread_id] = (
+                self._running_thread_counts.get(thread_id, 0) + 1
+            )
             self._running_threads.add(thread_id)
+            return True
 
     def mark_thread_done(self, thread_id: str):
         with self._thread_lock:
-            self._running_threads.discard(thread_id)
+            count = self._running_thread_counts.get(thread_id, 0)
+            if count > 1:
+                self._running_thread_counts[thread_id] = count - 1
+            else:
+                self._running_thread_counts.pop(thread_id, None)
+                self._running_threads.discard(thread_id)
 
     def is_thread_running(self, thread_id: str) -> bool:
         with self._thread_lock:
             return thread_id in self._running_threads
+
+    async def touch_thread_activity(self, thread_id: str, *, source: str = "runtime") -> None:
+        service = self.thread_cleanup_service
+        if service is not None:
+            await service.touch_thread(thread_id, source=source)
+
+    async def configure_thread_cleanup(self, config) -> None:
+        service = self.thread_cleanup_service
+        if service is None:
+            if settings.checkpointer_type != "sqlite":
+                raise RuntimeError("Thread cleanup requires the SQLite checkpointer")
+            from app.thread_cleanup import ThreadCleanupService
+
+            checkpoint_path = Path(settings.checkpointer_path)
+            service = ThreadCleanupService(db_path=checkpoint_path, manager=self, config=config)
+            self.thread_cleanup_service = service
+            await service.start()
+        else:
+            await service.reconfigure(config)
 
     def delete_thread_completely(self, thread_id: str) -> dict[str, Any]:
         """Delete both checkpointer data and file system data for a thread.
@@ -718,19 +778,28 @@ class ClientManager:
         """
         import shutil
 
-        # Atomic check-and-reject: hold the running-threads lock so a concurrent
-        # mark_thread_running cannot start a run between our check and delete.
+        # Only the state transition is protected by the lock. SQLite deletion,
+        # filesystem removal and the Docker fallback can all be slow and must
+        # not block unrelated run-state checks.
         with self._thread_lock:
             if thread_id in self._running_threads:
                 return {"success": False, "running": True, "detail": f"Thread {thread_id} is currently running"}
+            if thread_id in self._deleting_threads:
+                return {"success": False, "running": True, "deleting": True, "detail": f"Thread {thread_id} is already being deleted"}
+            self._deleting_threads.add(thread_id)
 
+        try:
             # 1. Delete from checkpointer
             checkpointer = self.get_checkpointer()
             if checkpointer is not None and hasattr(checkpointer, "delete_thread"):
                 try:
                     checkpointer.delete_thread(thread_id)
-                except Exception:
+                except Exception as exc:
                     logger.warning("checkpointer delete_thread failed for %s", thread_id, exc_info=True)
+                    return {
+                        "success": False,
+                        "detail": f"Failed to delete checkpoint data for {thread_id}: {type(exc).__name__}",
+                    }
 
             # 2. Delete file system data
             try:
@@ -748,12 +817,23 @@ class ClientManager:
                         # backend process cannot delete those, so fall back to a
                         # throwaway root container to remove the whole directory.
                         _rmtree_via_root_container(paths, thread_id)
-            except Exception:
+            except Exception as exc:
                 logger.warning("filesystem cleanup failed for %s", thread_id, exc_info=True)
+                return {
+                    "success": False,
+                    "detail": f"Checkpoint data deleted but filesystem cleanup failed for {thread_id}: {type(exc).__name__}",
+                }
 
-            self._running_threads.discard(thread_id)
-
-        return {"success": True, "message": f"Deleted thread {thread_id}"}
+            service = self.thread_cleanup_service
+            if service is not None:
+                try:
+                    service.forget_thread_sync(thread_id)
+                except Exception:
+                    logger.warning("thread activity cleanup failed for %s", thread_id, exc_info=True)
+            return {"success": True, "message": f"Deleted thread {thread_id}"}
+        finally:
+            with self._thread_lock:
+                self._deleting_threads.discard(thread_id)
 
     def update_thread_metadata(self, thread_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
         """Update thread metadata via direct SQLite write.
@@ -813,6 +893,14 @@ class ClientManager:
 
     async def shutdown(self):
         """Cleanup on shutdown."""
+        if self.thread_cleanup_service is not None:
+            try:
+                await self.thread_cleanup_service.stop()
+            except Exception:
+                logger.warning("Error stopping thread cleanup service", exc_info=True)
+            finally:
+                self.thread_cleanup_service = None
+
         if self.scheduler_service is not None:
             try:
                 await self.scheduler_service.stop()

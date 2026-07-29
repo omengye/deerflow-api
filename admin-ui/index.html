@@ -42,6 +42,7 @@
           <button class="nav-item" data-view-target="mcp" type="button">MCP</button>
           <button class="nav-item" data-view-target="feishu" type="button">Feishu</button>
           <button class="nav-item" data-view-target="scheduler" type="button">定时任务</button>
+          <button class="nav-item" data-view-target="storage" type="button">存储维护</button>
           <button class="nav-item" data-view-target="runtime" type="button">运行配置</button>
         </nav>
 
@@ -787,6 +788,109 @@
               </table>
             </div>
             <p id="scheduledTasksMessage" class="form-message" role="status"></p>
+          </section>
+        </section>
+
+        <section id="storageView" class="view-section">
+          <div class="section-grid">
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>自动清理配置</h3>
+                  <p>按最后活跃时间删除完整会话；运行中和定时任务引用的会话会被保护。</p>
+                </div>
+                <button id="saveThreadCleanupButton" class="primary-button" type="button">保存配置</button>
+              </div>
+              <form id="threadCleanupForm" class="form-grid compact">
+                <label>
+                  <span>不活跃保留天数</span>
+                  <input id="threadCleanupInactiveDays" type="number" min="1" max="3650" required />
+                </label>
+                <label>
+                  <span>每日执行时间</span>
+                  <input id="threadCleanupDailyAt" type="time" required />
+                </label>
+                <label>
+                  <span>时区</span>
+                  <input id="threadCleanupTimezone" type="text" placeholder="Asia/Shanghai" required />
+                </label>
+                <label>
+                  <span>每批删除数量</span>
+                  <input id="threadCleanupBatchSize" type="number" min="1" max="100" required />
+                </label>
+                <label>
+                  <span>批次间隔（秒）</span>
+                  <input id="threadCleanupBatchInterval" type="number" min="0" max="60" step="0.1" required />
+                </label>
+                <label>
+                  <span>单次最大删除量</span>
+                  <input id="threadCleanupMaxDeletes" type="number" min="1" max="2000" required />
+                </label>
+                <label>
+                  <span>执行前安静期（分钟）</span>
+                  <input id="threadCleanupQuietPeriod" type="number" min="0" max="1440" required />
+                </label>
+                <label>
+                  <span>活跃时延后（分钟）</span>
+                  <input id="threadCleanupPostpone" type="number" min="1" max="1440" required />
+                </label>
+                <label class="checkbox-row">
+                  <input id="threadCleanupEnabled" type="checkbox" />
+                  <span>启用自动清理</span>
+                </label>
+                <label class="checkbox-row">
+                  <input id="threadCleanupProtectScheduled" type="checkbox" />
+                  <span>保护定时任务关联会话</span>
+                </label>
+                <label class="checkbox-row">
+                  <input id="threadCleanupStopOnActivity" type="checkbox" />
+                  <span>清理中出现新活动时停止</span>
+                </label>
+              </form>
+              <p id="threadCleanupMessage" class="form-message" role="status"></p>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>数据库状态</h3>
+                  <p>删除产生的空闲页可被 SQLite 复用；物理文件缩小仍需维护窗口执行 VACUUM。</p>
+                </div>
+                <button id="refreshThreadCleanupButton" class="secondary-button" type="button">刷新状态</button>
+              </div>
+              <div id="threadCleanupDatabaseDetails" class="readonly-grid"></div>
+            </section>
+          </div>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>清理任务</h3>
+                <p>预览不会删除数据；立即清理会在后台运行并持续显示进度。</p>
+              </div>
+              <div class="button-row">
+                <button id="previewThreadCleanupButton" class="secondary-button" type="button">预览候选</button>
+                <button id="runThreadCleanupButton" class="danger-button" type="button">立即清理</button>
+              </div>
+            </div>
+            <div id="threadCleanupRunDetails" class="readonly-grid"></div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Thread ID</th>
+                    <th>最后活跃</th>
+                    <th>不活跃天数</th>
+                    <th>Checkpoint / Writes</th>
+                    <th>估算占用</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody id="threadCleanupCandidatesBody">
+                  <tr><td colspan="6">点击“预览候选”查看。</td></tr>
+                </tbody>
+              </table>
+            </div>
           </section>
         </section>
 

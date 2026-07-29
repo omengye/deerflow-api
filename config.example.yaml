@@ -1,7 +1,7 @@
 # DeerFlow config.yaml
 # ⚠️ 配置你的 API Key 后再启动服务
 
-config_version: 12
+config_version: 13
 log_level: info
 
 # API service settings. Prefer putting operational configuration here instead
@@ -54,6 +54,20 @@ api:
   scheduler_shutdown_grace_seconds: 10
   scheduler_run_retention_days: 30
   scheduler_max_runs_per_task: 1000
+  # Delete complete conversation state after the thread has had no mutating
+  # activity for this many days. Cleanup is indexed and runs in small batches.
+  thread_cleanup:
+    enabled: true
+    inactive_days: 30
+    run_daily_at: "03:00"
+    timezone: Asia/Shanghai
+    batch_size: 20
+    batch_interval_seconds: 1
+    max_deletions_per_run: 200
+    protect_scheduled_threads: true
+    quiet_period_minutes: 10
+    postpone_minutes: 10
+    stop_on_new_activity: true
 
 stream_bridge:
   # memory: single-process development; redis: cross-process replay for SSE reconnects.

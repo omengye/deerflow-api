@@ -2,6 +2,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import yaml
@@ -25,6 +26,7 @@ class AdminApiTests(unittest.TestCase):
         self._original_auth_enabled = settings.auth_enabled
         self._original_api_keys = list(settings.api_keys)
         self._original_config_path = settings.config_path
+        self._original_checkpointer_type = settings.checkpointer_type
         self._original_runtime = {
             "model_name": settings.model_name,
             "thinking_enabled": settings.thinking_enabled,
@@ -37,6 +39,7 @@ class AdminApiTests(unittest.TestCase):
             "allowed_upload_extensions": list(settings.allowed_upload_extensions),
         }
         self._original_feishu = settings.feishu
+        self._original_thread_cleanup = settings.thread_cleanup.model_copy(deep=True)
         self._tmp = tempfile.TemporaryDirectory()
         self.config_path = Path(self._tmp.name) / "config.yaml"
         self.skills_root = Path(self._tmp.name) / "skills"
@@ -124,9 +127,11 @@ tool_groups: []
         settings.auth_enabled = self._original_auth_enabled
         settings.api_keys = self._original_api_keys
         settings.config_path = self._original_config_path
+        settings.checkpointer_type = self._original_checkpointer_type
         for key, value in self._original_runtime.items():
             setattr(settings, key, value)
         settings.feishu = self._original_feishu
+        settings.thread_cleanup = self._original_thread_cleanup
         reset_app_config()
         reset_extensions_config()
         self._tmp.cleanup()
@@ -793,6 +798,128 @@ tool_groups: []
         self.assertEqual(deleted.json()["deleted"], task.id)
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(asyncio.run(store.list_tasks(include_disabled=True)), [])
+
+    def test_thread_cleanup_config_can_be_read_validated_and_hot_applied(self) -> None:
+        client = self._client()
+        manager = SimpleNamespace(
+            thread_cleanup_service=object(),
+            configure_thread_cleanup=AsyncMock(),
+        )
+
+        read = client.get("/api/admin/thread-cleanup/config", headers=self._auth_headers())
+        invalid = client.put(
+            "/api/admin/thread-cleanup/config",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "inactive_days": 14,
+                    "run_daily_at": "03:30",
+                    "timezone": "Not/A-Timezone",
+                    "batch_size": 10,
+                    "max_deletions_per_run": 50,
+                    "protect_scheduled_threads": True,
+                }
+            },
+        )
+        with patch.object(admin_router, "get_client_manager", return_value=manager):
+            updated = client.put(
+                "/api/admin/thread-cleanup/config",
+                headers=self._auth_headers(),
+                json={
+                    "config": {
+                        "enabled": False,
+                        "inactive_days": 45,
+                        "run_daily_at": "04:15",
+                        "timezone": "Asia/Shanghai",
+                        "batch_size": 25,
+                        "batch_interval_seconds": 2.5,
+                        "max_deletions_per_run": 300,
+                        "protect_scheduled_threads": False,
+                        "quiet_period_minutes": 20,
+                        "postpone_minutes": 12,
+                        "stop_on_new_activity": False,
+                    }
+                },
+            )
+
+        self.assertEqual(read.status_code, 200)
+        self.assertTrue(read.json()["config"]["enabled"])
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["effect"], "hot_applied")
+        self.assertEqual(settings.thread_cleanup.inactive_days, 45)
+        self.assertEqual(settings.thread_cleanup.batch_interval_seconds, 2.5)
+        self.assertEqual(settings.thread_cleanup.quiet_period_minutes, 20)
+        self.assertEqual(settings.thread_cleanup.postpone_minutes, 12)
+        self.assertFalse(settings.thread_cleanup.stop_on_new_activity)
+        manager.configure_thread_cleanup.assert_awaited_once()
+        persisted = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["api"]["thread_cleanup"]["run_daily_at"], "04:15")
+        self.assertFalse(persisted["api"]["thread_cleanup"]["enabled"])
+
+    def test_thread_cleanup_status_preview_and_run_api(self) -> None:
+        client = self._client()
+        service = SimpleNamespace(
+            status=AsyncMock(return_value={"running_job": None, "database": {"database_bytes": 123}}),
+            preview=AsyncMock(
+                return_value={
+                    "candidates": [{"thread_id": "old-thread"}],
+                    "eligible_count": 1,
+                    "estimated_reclaimable_bytes": 100,
+                }
+            ),
+            start_run=AsyncMock(return_value={"job_id": "cleanup-test", "status": "pending"}),
+        )
+        manager = SimpleNamespace(thread_cleanup_service=service)
+
+        with patch.object(admin_router, "get_client_manager", return_value=manager):
+            status_response = client.get(
+                "/api/admin/thread-cleanup/status",
+                headers=self._auth_headers(),
+            )
+            preview_response = client.get(
+                "/api/admin/thread-cleanup/preview?limit=17",
+                headers=self._auth_headers(),
+            )
+            run_response = client.post(
+                "/api/admin/thread-cleanup/runs",
+                headers=self._auth_headers(),
+                json={"dry_run": True, "limit": 17},
+            )
+
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(status_response.json()["database"]["database_bytes"], 123)
+        self.assertEqual(preview_response.status_code, 200)
+        self.assertEqual(preview_response.json()["eligible_count"], 1)
+        self.assertEqual(run_response.status_code, 202)
+        self.assertEqual(run_response.json()["job_id"], "cleanup-test")
+        service.status.assert_awaited_once_with()
+        service.preview.assert_awaited_once_with(limit=17)
+        service.start_run.assert_awaited_once_with(trigger="manual", dry_run=True, limit=17)
+
+    def test_thread_cleanup_operations_require_sqlite_service(self) -> None:
+        client = self._client()
+        manager = SimpleNamespace(thread_cleanup_service=None)
+        settings.checkpointer_type = "memory"
+
+        with patch.object(admin_router, "get_client_manager", return_value=manager):
+            responses = [
+                client.get("/api/admin/thread-cleanup/status", headers=self._auth_headers()),
+                client.get("/api/admin/thread-cleanup/preview", headers=self._auth_headers()),
+                client.post(
+                    "/api/admin/thread-cleanup/runs",
+                    headers=self._auth_headers(),
+                    json={},
+                ),
+                client.put(
+                    "/api/admin/thread-cleanup/config",
+                    headers=self._auth_headers(),
+                    json={"config": settings.thread_cleanup.model_dump()},
+                ),
+            ]
+
+        self.assertTrue(all(response.status_code == 409 for response in responses))
 
     def test_update_models_rejects_duplicate_names(self) -> None:
         client = self._client()

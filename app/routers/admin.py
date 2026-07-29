@@ -16,10 +16,10 @@ from urllib.parse import urlparse
 
 import httpx
 import yaml
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.config import FeishuSettings, settings
+from app.config import FeishuSettings, ThreadCleanupSettings, settings
 from app.dependencies import get_client_manager
 from app.proposal_review import (
     approve_skill_proposal,
@@ -166,6 +166,19 @@ class AdminRuntimePatchRequest(BaseModel):
     scheduler_run_retention_days: int | None = Field(default=None, ge=1, le=3650)
     scheduler_max_runs_per_task: int | None = Field(default=None, ge=1, le=100000)
     reload: bool = True
+
+
+class AdminThreadCleanupUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: ThreadCleanupSettings
+
+
+class AdminThreadCleanupRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dry_run: bool = False
+    limit: int | None = Field(default=None, ge=1, le=2000)
 
 
 class AdminMcpTestRequest(BaseModel):
@@ -1301,8 +1314,65 @@ async def admin_me():
             "runtime_write": True,
             "mcp_admin": True,
             "feishu_admin": True,
+            "thread_cleanup_admin": True,
         },
     }
+
+
+def _thread_cleanup_service():
+    service = get_client_manager().thread_cleanup_service
+    if service is None:
+        raise HTTPException(status_code=409, detail="Thread cleanup requires the SQLite checkpointer")
+    return service
+
+
+@router.get("/thread-cleanup/config")
+async def get_thread_cleanup_config():
+    """Return validated inactive-thread cleanup configuration."""
+    return {"config": settings.thread_cleanup.model_dump()}
+
+
+@router.put("/thread-cleanup/config")
+async def update_thread_cleanup_config(req: AdminThreadCleanupUpdateRequest = Body()):
+    """Persist and hot-apply inactive-thread cleanup configuration."""
+    manager = get_client_manager()
+    if manager.thread_cleanup_service is None and settings.checkpointer_type != "sqlite":
+        raise HTTPException(status_code=409, detail="Thread cleanup requires the SQLite checkpointer")
+    path = _config_path()
+    config_data = _load_config_data(path)
+    api_config = config_data.setdefault("api", {})
+    if not isinstance(api_config, dict):
+        raise HTTPException(status_code=400, detail="api section must be an object")
+    api_config["thread_cleanup"] = req.config.model_dump()
+    _atomic_write_config(config_data, path=path)
+    settings.thread_cleanup = req.config
+    try:
+        await manager.configure_thread_cleanup(req.config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "config": req.config.model_dump(), "effect": "hot_applied"}
+
+
+@router.get("/thread-cleanup/status")
+async def get_thread_cleanup_status():
+    """Return cleanup schedule, active job and SQLite space metrics."""
+    return await _thread_cleanup_service().status()
+
+
+@router.get("/thread-cleanup/preview")
+async def preview_thread_cleanup(limit: int = Query(default=100, ge=1, le=500)):
+    """Preview inactive cleanup candidates without deleting them."""
+    return await _thread_cleanup_service().preview(limit=limit)
+
+
+@router.post("/thread-cleanup/runs", status_code=status.HTTP_202_ACCEPTED)
+async def start_thread_cleanup_run(req: AdminThreadCleanupRunRequest = Body(default_factory=AdminThreadCleanupRunRequest)):
+    """Start a background cleanup job and return immediately."""
+    return await _thread_cleanup_service().start_run(
+        trigger="manual",
+        dry_run=req.dry_run,
+        limit=req.limit,
+    )
 
 
 @router.get("/config")

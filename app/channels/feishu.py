@@ -747,7 +747,10 @@ class FeishuChannel:
         async with lock:
             from app.dependencies import get_client_manager
 
-            result = get_client_manager().delete_thread_completely(thread_id)
+            result = await asyncio.to_thread(
+                get_client_manager().delete_thread_completely,
+                thread_id,
+            )
             # Remove the lock entry so the next message starts with a clean state.
             self._chat_locks.pop(chat_id, None)
             self._sent_artifacts_by_thread.pop(thread_id, None)
@@ -1129,7 +1132,9 @@ class FeishuChannel:
                 tmp_path.write_bytes(data)
                 tmp_paths.append(tmp_path)
 
-            client = get_client_manager().get_client()
+            manager = get_client_manager()
+            await manager.touch_thread_activity(thread_id, source="feishu_upload")
+            client = manager.get_client()
             result = await asyncio.to_thread(client.upload_files, thread_id, tmp_paths)
         files = result.get("files", []) if isinstance(result, dict) else []
         return [item for item in files if isinstance(item, dict)]

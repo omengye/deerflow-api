@@ -47,6 +47,10 @@
     configHealth: null,
     scheduledTasks: [],
     schedulerStatus: null,
+    threadCleanupConfig: null,
+    threadCleanupStatus: null,
+    threadCleanupPreview: null,
+    threadCleanupPollTimer: null,
     feishu: null,
     customSkills: [],
     evolutionStatus: null,
@@ -68,6 +72,7 @@
     mcp: "MCP",
     feishu: "Feishu",
     scheduler: "定时任务",
+    storage: "存储维护",
     runtime: "运行配置",
   };
 
@@ -254,6 +259,26 @@
     scheduledTasksSummary: document.getElementById("scheduledTasksSummary"),
     scheduledTasksTableBody: document.getElementById("scheduledTasksTableBody"),
     scheduledTasksMessage: document.getElementById("scheduledTasksMessage"),
+    threadCleanupForm: document.getElementById("threadCleanupForm"),
+    threadCleanupEnabled: document.getElementById("threadCleanupEnabled"),
+    threadCleanupInactiveDays: document.getElementById("threadCleanupInactiveDays"),
+    threadCleanupDailyAt: document.getElementById("threadCleanupDailyAt"),
+    threadCleanupTimezone: document.getElementById("threadCleanupTimezone"),
+    threadCleanupBatchSize: document.getElementById("threadCleanupBatchSize"),
+    threadCleanupBatchInterval: document.getElementById("threadCleanupBatchInterval"),
+    threadCleanupMaxDeletes: document.getElementById("threadCleanupMaxDeletes"),
+    threadCleanupQuietPeriod: document.getElementById("threadCleanupQuietPeriod"),
+    threadCleanupPostpone: document.getElementById("threadCleanupPostpone"),
+    threadCleanupProtectScheduled: document.getElementById("threadCleanupProtectScheduled"),
+    threadCleanupStopOnActivity: document.getElementById("threadCleanupStopOnActivity"),
+    saveThreadCleanupButton: document.getElementById("saveThreadCleanupButton"),
+    refreshThreadCleanupButton: document.getElementById("refreshThreadCleanupButton"),
+    previewThreadCleanupButton: document.getElementById("previewThreadCleanupButton"),
+    runThreadCleanupButton: document.getElementById("runThreadCleanupButton"),
+    threadCleanupMessage: document.getElementById("threadCleanupMessage"),
+    threadCleanupDatabaseDetails: document.getElementById("threadCleanupDatabaseDetails"),
+    threadCleanupRunDetails: document.getElementById("threadCleanupRunDetails"),
+    threadCleanupCandidatesBody: document.getElementById("threadCleanupCandidatesBody"),
   };
 
   function defaultBaseUrl() {
@@ -435,6 +460,8 @@
       loadSummarizationConfig(),
       loadConfigHealth(),
       loadScheduledTasks(),
+      loadThreadCleanupConfig(),
+      loadThreadCleanupStatus(),
       loadHealth(),
       loadModels(),
       loadSkills(),
@@ -518,6 +545,21 @@
       storageExists: Boolean(data?.storage_exists),
     };
     renderScheduledTasks();
+    return data;
+  }
+
+  async function loadThreadCleanupConfig() {
+    const data = await request("/api/admin/thread-cleanup/config");
+    state.threadCleanupConfig = data?.config && typeof data.config === "object" ? data.config : {};
+    renderThreadCleanup();
+    return data;
+  }
+
+  async function loadThreadCleanupStatus() {
+    const data = await request("/api/admin/thread-cleanup/status", { timeoutMs: 120000 });
+    state.threadCleanupStatus = data;
+    renderThreadCleanup();
+    scheduleThreadCleanupPoll();
     return data;
   }
 
@@ -1420,6 +1462,100 @@
       .join("");
   }
 
+  function formatBytes(value) {
+    const bytes = Number(value || 0);
+    if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+    return `${(bytes / (1024 ** index)).toFixed(index >= 3 ? 2 : 1)} ${units[index]}`;
+  }
+
+  function renderThreadCleanup() {
+    if (!el.threadCleanupDatabaseDetails) return;
+    const config = state.threadCleanupConfig || state.threadCleanupStatus?.config || {};
+    if (!el.threadCleanupForm?.contains(document.activeElement)) {
+      el.threadCleanupEnabled.checked = config.enabled !== false;
+      el.threadCleanupInactiveDays.value = config.inactive_days ?? 30;
+      el.threadCleanupDailyAt.value = config.run_daily_at || "03:00";
+      el.threadCleanupTimezone.value = config.timezone || "Asia/Shanghai";
+      el.threadCleanupBatchSize.value = config.batch_size ?? 20;
+      el.threadCleanupBatchInterval.value = config.batch_interval_seconds ?? 1;
+      el.threadCleanupMaxDeletes.value = config.max_deletions_per_run ?? 200;
+      el.threadCleanupQuietPeriod.value = config.quiet_period_minutes ?? 10;
+      el.threadCleanupPostpone.value = config.postpone_minutes ?? 10;
+      el.threadCleanupProtectScheduled.checked = config.protect_scheduled_threads !== false;
+      el.threadCleanupStopOnActivity.checked = config.stop_on_new_activity !== false;
+    }
+
+    const status = state.threadCleanupStatus || {};
+    const database = status.database || {};
+    const databaseRows = [
+      ["数据库文件", formatBytes(database.database_bytes)],
+      ["有效数据估算", formatBytes(database.estimated_live_bytes)],
+      ["内部可复用空间", formatBytes(database.reusable_bytes)],
+      ["WAL", formatBytes(database.wal_bytes)],
+      [
+        "Checkpoint / Writes",
+        database.row_counts_exact === false
+          ? "大库状态页省略精确统计"
+          : `${database.checkpoint_rows ?? "--"} / ${database.write_rows ?? "--"}`,
+      ],
+      ["已索引会话", `${database.indexed_threads ?? "--"}（保护 ${database.protected_threads ?? "--"}）`],
+    ];
+    el.threadCleanupDatabaseDetails.innerHTML = databaseRows
+      .map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`)
+      .join("");
+
+    const run = status.running_job || status.last_run;
+    const runRows = [
+      ["自动清理", config.enabled === false ? "已停用" : "已启用"],
+      ["下次执行", formatScheduledTime(status.next_run_at)],
+      ["任务状态", run?.status || "尚未执行"],
+      ["开始 / 完成", `${formatScheduledTime(run?.started_at)} / ${formatScheduledTime(run?.completed_at)}`],
+      ["扫描 / 删除", `${run?.scanned ?? 0} / ${run?.deleted ?? 0}`],
+      ["跳过 / 失败", `${run?.skipped ?? 0} / ${run?.failed ?? 0}`],
+      ["逻辑释放估算", formatBytes(run?.estimated_reclaimed_bytes)],
+      ["当前线程", run?.current_thread_id || "--"],
+    ];
+    el.threadCleanupRunDetails.innerHTML = runRows
+      .map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`)
+      .join("");
+
+    const candidates = state.threadCleanupPreview?.candidates;
+    if (!Array.isArray(candidates)) return;
+    el.threadCleanupCandidatesBody.innerHTML = candidates.length
+      ? candidates.map((candidate) => {
+          const stateText = candidate.running ? "运行中" : candidate.scheduled ? "定时任务保护" : "可清理";
+          const tone = candidate.running || candidate.scheduled ? "warn" : "ok";
+          return `
+            <tr>
+              <td class="mono">${escapeHtml(candidate.thread_id)}</td>
+              <td class="mono">${escapeHtml(formatScheduledTime(candidate.last_activity_at))}</td>
+              <td>${escapeHtml(candidate.inactive_days)}</td>
+              <td>${escapeHtml(candidate.checkpoint_rows)} / ${escapeHtml(candidate.write_rows)}</td>
+              <td>${escapeHtml(formatBytes(candidate.estimated_bytes))}</td>
+              <td>${badge(stateText, tone)}</td>
+            </tr>
+          `;
+        }).join("")
+      : `<tr><td colspan="6">当前没有符合保留策略的候选会话。</td></tr>`;
+  }
+
+  function scheduleThreadCleanupPoll() {
+    if (state.threadCleanupPollTimer) {
+      window.clearTimeout(state.threadCleanupPollTimer);
+      state.threadCleanupPollTimer = null;
+    }
+    if (!state.threadCleanupStatus?.running_job) return;
+    state.threadCleanupPollTimer = window.setTimeout(async () => {
+      try {
+        await loadThreadCleanupStatus();
+      } catch (error) {
+        el.threadCleanupMessage.textContent = `任务状态读取失败：${error.message}`;
+      }
+    }, 2000);
+  }
+
   function renderCustomSkillSelect() {
     if (!el.customSkillSelect) return;
     const current = el.customSkillSelect.value;
@@ -1601,6 +1737,90 @@
       el.runtimeMessage.textContent = `保存失败：${error.message}`;
     } finally {
       setBusy(el.saveRuntimeButton, false);
+    }
+  }
+
+  async function saveThreadCleanupConfig() {
+    el.threadCleanupMessage.textContent = "";
+    if (!el.threadCleanupForm.checkValidity()) {
+      el.threadCleanupForm.reportValidity();
+      el.threadCleanupMessage.textContent = "请修正超出允许范围的自动清理配置。";
+      return;
+    }
+    const config = {
+      enabled: el.threadCleanupEnabled.checked,
+      inactive_days: Number(el.threadCleanupInactiveDays.value),
+      run_daily_at: el.threadCleanupDailyAt.value || "03:00",
+      timezone: el.threadCleanupTimezone.value.trim() || "Asia/Shanghai",
+      batch_size: Number(el.threadCleanupBatchSize.value),
+      batch_interval_seconds: Number(el.threadCleanupBatchInterval.value),
+      max_deletions_per_run: Number(el.threadCleanupMaxDeletes.value),
+      quiet_period_minutes: Number(el.threadCleanupQuietPeriod.value),
+      postpone_minutes: Number(el.threadCleanupPostpone.value),
+      protect_scheduled_threads: el.threadCleanupProtectScheduled.checked,
+      stop_on_new_activity: el.threadCleanupStopOnActivity.checked,
+    };
+    setBusy(el.saveThreadCleanupButton, true, "保存中");
+    try {
+      const data = await request("/api/admin/thread-cleanup/config", {
+        method: "PUT",
+        body: { config },
+      });
+      state.threadCleanupConfig = data.config;
+      el.threadCleanupMessage.textContent = "配置已保存并热更新。";
+      await loadThreadCleanupStatus();
+      showToast("自动清理配置已保存。");
+    } catch (error) {
+      el.threadCleanupMessage.textContent = `保存失败：${error.message}`;
+    } finally {
+      setBusy(el.saveThreadCleanupButton, false);
+    }
+  }
+
+  async function previewThreadCleanup() {
+    el.threadCleanupMessage.textContent = "";
+    setBusy(el.previewThreadCleanupButton, true, "扫描中");
+    try {
+      const data = await request("/api/admin/thread-cleanup/preview?limit=100", { timeoutMs: 120000 });
+      state.threadCleanupPreview = data;
+      renderThreadCleanup();
+      el.threadCleanupMessage.textContent = `找到 ${data.candidates?.length || 0} 个候选，其中 ${data.eligible_count || 0} 个可清理，估算 ${formatBytes(data.estimated_reclaimable_bytes)}。`;
+    } catch (error) {
+      el.threadCleanupMessage.textContent = `预览失败：${error.message}`;
+    } finally {
+      setBusy(el.previewThreadCleanupButton, false);
+    }
+  }
+
+  async function runThreadCleanup() {
+    const days = state.threadCleanupConfig?.inactive_days ?? 30;
+    if (!window.confirm(`确认后台删除最后活跃超过 ${days} 天的完整会话？该操作不可撤销。`)) return;
+    el.threadCleanupMessage.textContent = "";
+    setBusy(el.runThreadCleanupButton, true, "启动中");
+    try {
+      const data = await request("/api/admin/thread-cleanup/runs", {
+        method: "POST",
+        body: { dry_run: false },
+      });
+      el.threadCleanupMessage.textContent = data.already_running
+        ? `已有任务正在执行：${data.job_id}`
+        : `清理任务已启动：${data.job_id}`;
+      await loadThreadCleanupStatus();
+    } catch (error) {
+      el.threadCleanupMessage.textContent = `启动失败：${error.message}`;
+    } finally {
+      setBusy(el.runThreadCleanupButton, false);
+    }
+  }
+
+  async function refreshThreadCleanup() {
+    setBusy(el.refreshThreadCleanupButton, true, "刷新中");
+    try {
+      await Promise.all([loadThreadCleanupConfig(), loadThreadCleanupStatus()]);
+    } catch (error) {
+      el.threadCleanupMessage.textContent = `刷新失败：${error.message}`;
+    } finally {
+      setBusy(el.refreshThreadCleanupButton, false);
     }
   }
 
@@ -2501,6 +2721,10 @@
     el.saveSummarizationButton.addEventListener("click", saveSummarizationConfig);
     el.refreshConfigHealthButton.addEventListener("click", refreshConfigHealth);
     el.refreshScheduledTasksButton.addEventListener("click", refreshScheduledTasks);
+    el.saveThreadCleanupButton.addEventListener("click", saveThreadCleanupConfig);
+    el.refreshThreadCleanupButton.addEventListener("click", refreshThreadCleanup);
+    el.previewThreadCleanupButton.addEventListener("click", previewThreadCleanup);
+    el.runThreadCleanupButton.addEventListener("click", runThreadCleanup);
     el.saveFeishuButton.addEventListener("click", saveFeishuConfig);
     el.restartFeishuButton.addEventListener("click", restartFeishuChannel);
 

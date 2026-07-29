@@ -1,14 +1,16 @@
 """Thread (session) management endpoints."""
+import asyncio
 import logging
 import re
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.dependencies import get_client_manager
 from app.schemas import ThreadResponse, ThreadDetail
+from app.thread_cleanup import ThreadCleanupInProgressError
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,7 @@ def _validate_thread_id(thread_id: str) -> None:
 async def create_thread():
     """Create a new session (returns a fresh UUID)."""
     thread_id = str(uuid.uuid4())
+    await get_client_manager().touch_thread_activity(thread_id, source="create")
     return ThreadResponse(thread_id=thread_id)
 
 
@@ -135,7 +138,11 @@ async def update_thread(thread_id: str, req: ThreadUpdateRequest = Body()):
     if not metadata:
         raise HTTPException(status_code=400, detail="At least one field (title/metadata) is required")
 
-    result = manager.update_thread_metadata(thread_id, metadata)
+    try:
+        await manager.touch_thread_activity(thread_id, source="metadata_update")
+    except ThreadCleanupInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    result = await asyncio.to_thread(manager.update_thread_metadata, thread_id, metadata)
     if not result.get("success"):
         raise HTTPException(status_code=500, detail=result.get("detail", "Update failed"))
 
@@ -148,7 +155,7 @@ async def delete_thread(thread_id: str):
     _validate_thread_id(thread_id)
     manager = get_client_manager()
 
-    result = manager.delete_thread_completely(thread_id)
+    result = await asyncio.to_thread(manager.delete_thread_completely, thread_id)
     if not result.get("success"):
         if result.get("running"):
             raise HTTPException(status_code=409, detail=result.get("detail", "Thread is running"))
@@ -194,73 +201,20 @@ async def get_thread_status(thread_id: str):
 
 
 class CleanupRequest(BaseModel):
-    older_than_days: int = 7
+    older_than_days: int = Field(default=7, ge=1, le=3650)
     status_filter: str | None = None  # None = all, "idle" = only idle
-    max_pages: int = 20  # safety bound: scan up to max_pages * page_size threads
+    max_pages: int = Field(default=20, ge=1, le=100)  # safety bound before the service cap
 
 
 @router.post("/threads/cleanup")
 async def cleanup_threads(req: CleanupRequest = Body()):
-    """Batch delete sessions based on age and status.
-
-    Iterates over threads in pages instead of pulling the full list into
-    memory. Returns count of deleted sessions.
-    """
-    from datetime import datetime, timezone
-
+    """Start indexed session cleanup in the background (legacy endpoint)."""
     manager = get_client_manager()
-    client = manager.get_client()
-
-    now = datetime.now(timezone.utc)
-    cutoff_ts = now.timestamp() - (req.older_than_days * 86400)
-    deleted = 0
-    pages_scanned = 0
-
-    try:
-        while pages_scanned < max(1, req.max_pages):
-            pages_scanned += 1
-            page_size = _CLEANUP_PAGE_SIZE
-            try:
-                page = client.list_threads(limit=page_size)
-            except TypeError:
-                # Older client signatures may not accept limit kwarg.
-                page = client.list_threads()
-            thread_list = page.get("thread_list", page.get("threads", []))
-            if not thread_list:
-                break
-
-            page_deleted = 0
-            for t in thread_list:
-                created_at = t.get("created_at")
-                if created_at:
-                    try:
-                        if "T" in str(created_at):
-                            ts = datetime.fromisoformat(str(created_at)).timestamp()
-                        else:
-                            ts = float(created_at)
-                        if ts > cutoff_ts:
-                            continue
-                    except (ValueError, TypeError):
-                        continue
-
-                thread_id = t.get("thread_id")
-                if not thread_id or not _THREAD_ID_RE.match(str(thread_id)):
-                    continue
-
-                if req.status_filter == "idle" and manager.is_thread_running(thread_id):
-                    continue
-
-                result = manager.delete_thread_completely(thread_id)
-                if result.get("success"):
-                    deleted += 1
-                    page_deleted += 1
-
-            # Stop when a full page yields nothing eligible (avoids infinite
-            # loop against backends that always return the same window).
-            if page_deleted == 0 or len(thread_list) < page_size:
-                break
-
-        return {"success": True, "deleted_count": deleted, "pages_scanned": pages_scanned}
-    except Exception:
-        logger.exception("Unhandled error during cleanup")
-        raise HTTPException(status_code=500, detail="Internal server error")
+    service = manager.thread_cleanup_service
+    if service is None:
+        raise HTTPException(status_code=409, detail="Thread cleanup requires the SQLite checkpointer")
+    return await service.start_run(
+        trigger="legacy_api",
+        inactive_days=req.older_than_days,
+        limit=min(max(1, req.max_pages) * _CLEANUP_PAGE_SIZE, service.config.max_deletions_per_run),
+    )

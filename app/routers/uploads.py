@@ -10,6 +10,7 @@ from fastapi.responses import Response
 
 from app.config import settings
 from app.dependencies import get_client_manager
+from app.thread_cleanup import ThreadCleanupInProgressError
 from deerflow.uploads.manager import PathTraversalError, claim_unique_filename, normalize_filename
 
 logger = logging.getLogger(__name__)
@@ -121,13 +122,17 @@ async def upload_files(thread_id: str, files: list[UploadFile] = File(...)):
                     )
                 tmp_paths.append(tmp_path)
 
-            return client.upload_files(thread_id, tmp_paths)
+            await manager.touch_thread_activity(thread_id, source="upload")
+            result = client.upload_files(thread_id, tmp_paths)
+            return result
     except HTTPException:
         raise
     except (PathTraversalError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except ThreadCleanupInProgressError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception:
         logger.exception("Unhandled error in upload_files (thread=%s)", thread_id)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -155,12 +160,15 @@ async def delete_upload(thread_id: str, filename: str):
     client = manager.get_client()
 
     try:
+        await manager.touch_thread_activity(thread_id, source="upload_delete")
         client.delete_upload(thread_id, filename)
         return {"success": True, "message": f"Deleted {filename}"}
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except (PathTraversalError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except ThreadCleanupInProgressError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception:
         logger.exception("Unhandled error in delete_upload (thread=%s, filename=%s)", thread_id, filename)
         raise HTTPException(status_code=500, detail="Internal server error")

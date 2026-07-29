@@ -4,9 +4,10 @@ import os
 import socket
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,45 @@ class FeishuSettings(BaseModel):
     verification_token: str = ""
 
 
+class ThreadCleanupSettings(BaseModel):
+    """Automatic inactive-thread cleanup settings."""
+
+    enabled: bool = True
+    inactive_days: int = Field(default=30, ge=1, le=3650)
+    run_daily_at: str = Field(
+        default="03:00",
+        pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$",
+    )
+    timezone: str = Field(default="Asia/Shanghai", min_length=1, max_length=128)
+    batch_size: int = Field(default=20, ge=1, le=100)
+    batch_interval_seconds: float = Field(default=1.0, ge=0, le=60)
+    max_deletions_per_run: int = Field(default=200, ge=1, le=2000)
+    protect_scheduled_threads: bool = True
+    quiet_period_minutes: int = Field(default=10, ge=0, le=1440)
+    postpone_minutes: int = Field(default=10, ge=1, le=1440)
+    stop_on_new_activity: bool = True
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError(f"Unknown timezone: {value}") from None
+        return value
+
+
+def _load_thread_cleanup_settings() -> "ThreadCleanupSettings":
+    raw = _API_CONFIG.get("thread_cleanup")
+    if not isinstance(raw, dict):
+        return ThreadCleanupSettings()
+    try:
+        return ThreadCleanupSettings.model_validate(raw)
+    except Exception:
+        logger.warning("Invalid api.thread_cleanup configuration; using defaults", exc_info=True)
+        return ThreadCleanupSettings()
+
+
 def _load_feishu_settings() -> "FeishuSettings | None":
     raw = _API_CONFIG.get("feishu")
 
@@ -329,6 +369,10 @@ class Settings(BaseModel):
 
     # Feishu (Lark) channel — optional, disabled unless configured.
     feishu: FeishuSettings | None = Field(default_factory=_load_feishu_settings)
+
+    # Inactive conversation cleanup. Enabled by default so persistent
+    # checkpoints have a bounded lifecycle on long-running installations.
+    thread_cleanup: ThreadCleanupSettings = Field(default_factory=_load_thread_cleanup_settings)
 
     # Dynamic scheduled tasks. Tasks are created by agent tools and persisted
     # in SQLite so they survive API restarts. Occurrences use at-least-once

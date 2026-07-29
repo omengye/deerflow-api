@@ -8,12 +8,17 @@ them instead of silently failing.
 
 from __future__ import annotations
 
+import asyncio
+import io
 import types
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException, UploadFile
 
 from app.dependencies import ClientManager
+from app.thread_cleanup import ThreadCleanupInProgressError
+from deerflow.runtime import ConflictError
 
 
 class _FakePaths:
@@ -92,3 +97,130 @@ def test_cleanup_uses_plain_rmtree_when_permitted(tmp_path, monkeypatch):
 
     assert result["success"] is True
     assert removed == [thread_dir]
+
+
+@pytest.mark.asyncio
+async def test_touch_failure_does_not_leave_pending_run_record() -> None:
+    manager = ClientManager()
+
+    class RejectingCleanupService:
+        async def touch_thread(self, thread_id: str, *, source: str) -> None:
+            del source
+            raise ThreadCleanupInProgressError(f"Thread {thread_id} is being deleted")
+
+    manager.thread_cleanup_service = RejectingCleanupService()
+
+    with pytest.raises(ConflictError):
+        await manager.start_client_stream_run(
+            thread_id="claimed-thread",
+            run_id="run-touch-failed",
+            message="hello",
+            kwargs={},
+        )
+
+    assert manager.run_manager.get("run-touch-failed") is None
+    assert await manager.run_manager.has_inflight("claimed-thread") is False
+    assert manager.is_thread_running("claimed-thread") is False
+
+
+@pytest.mark.asyncio
+async def test_run_record_is_rolled_back_if_delete_starts_after_touch() -> None:
+    manager = ClientManager()
+    with manager._thread_lock:
+        manager._deleting_threads.add("deleting-thread")
+
+    with pytest.raises(ConflictError):
+        await manager.start_client_stream_run(
+            thread_id="deleting-thread",
+            run_id="run-delete-race",
+            message="hello",
+            kwargs={},
+        )
+
+    assert manager.run_manager.get("run-delete-race") is None
+    assert await manager.run_manager.has_inflight("deleting-thread") is False
+
+
+@pytest.mark.asyncio
+async def test_run_record_and_running_marker_roll_back_if_task_creation_fails(
+    monkeypatch,
+) -> None:
+    manager = ClientManager()
+
+    def fail_create_task(_coroutine):
+        raise RuntimeError("injected task creation failure")
+
+    monkeypatch.setattr("app.dependencies.asyncio.create_task", fail_create_task)
+    with pytest.raises(RuntimeError, match="injected task creation failure"):
+        await manager.start_client_stream_run(
+            thread_id="task-failure-thread",
+            run_id="run-task-failed",
+            message="hello",
+            kwargs={},
+        )
+
+    assert manager.run_manager.get("run-task-failed") is None
+    assert manager.is_thread_running("task-failure-thread") is False
+
+
+@pytest.mark.asyncio
+async def test_slow_delete_does_not_hold_run_state_lock(tmp_path, monkeypatch) -> None:
+    manager = _make_manager()
+    thread_id = "slow-delete"
+    thread_dir = tmp_path / "threads" / thread_id
+    thread_dir.mkdir(parents=True)
+    monkeypatch.setattr(
+        "deerflow.config.paths.get_paths",
+        lambda: _FakePaths(thread_dir, f"/host/data/threads/{thread_id}"),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def slow_rmtree(_path) -> None:
+        loop.call_soon_threadsafe(entered.set)
+        asyncio.run_coroutine_threadsafe(release.wait(), loop).result(timeout=2)
+
+    monkeypatch.setattr("shutil.rmtree", slow_rmtree)
+    delete_task = asyncio.create_task(
+        asyncio.to_thread(manager.delete_thread_completely, thread_id)
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    # This call takes the same lock used by mark_thread_running/delete state.
+    # It must remain responsive while filesystem deletion is blocked.
+    assert await asyncio.wait_for(
+        asyncio.to_thread(manager.is_thread_running, "unrelated-thread"),
+        timeout=0.2,
+    ) is False
+    release.set()
+    result = await delete_task
+    assert result["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_upload_touch_failure_happens_before_persistent_upload(monkeypatch) -> None:
+    upload_calls: list[str] = []
+
+    class FakeClient:
+        def upload_files(self, thread_id: str, _paths) -> dict[str, object]:
+            upload_calls.append(thread_id)
+            return {"success": True}
+
+    class FakeManager:
+        def get_client(self) -> FakeClient:
+            return FakeClient()
+
+        async def touch_thread_activity(self, thread_id: str, *, source: str) -> None:
+            del source
+            raise ThreadCleanupInProgressError(f"Thread {thread_id} is being deleted")
+
+    monkeypatch.setattr("app.routers.uploads.get_client_manager", lambda: FakeManager())
+    from app.routers.uploads import upload_files
+
+    incoming = UploadFile(filename="note.txt", file=io.BytesIO(b"hello"))
+    with pytest.raises(HTTPException) as exc_info:
+        await upload_files("claimed-thread", [incoming])
+
+    assert exc_info.value.status_code == 409
+    assert upload_calls == []
