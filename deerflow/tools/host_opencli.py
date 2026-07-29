@@ -14,27 +14,27 @@ import os
 
 from langchain_core.tools import tool
 
-ALLOWED_SITES = frozenset({"twitter", "github"})
+ALLOWED_SITES = frozenset({"web", "twitter", "xiaohongshu", "xiaoyuzhou", "weixin", "douyin", "bilibili"})
 
 _DEFAULT_TIMEOUT_SECONDS = 120
 _MAX_STDOUT_CHARS = 1_000_000
 _MAX_STDERR_CHARS = 100_000
 
 
-def _opencli_argv(site: str, command: str, args: list[str] | None) -> list[str]:
-    argv = [os.environ.get("OPENCLI_BIN", "opencli"), site, command, *(args or [])]
+def _opencli_argv(site: str, command: str, arguments: list[str] | None) -> list[str]:
+    argv = [os.environ.get("OPENCLI_BIN", "opencli"), site, command, *(arguments or [])]
     if not any(arg == "-f" or arg == "--format" or arg.startswith("--format=") for arg in argv[3:]):
         argv.extend(["--format", "json"])
     return argv
 
 
-async def _run_host_opencli(site: str, command: str, args: list[str] | None = None) -> str:
+async def _run_host_opencli(site: str, command: str, arguments: list[str] | None = None) -> str:
     if site not in ALLOWED_SITES:
         return f"Error: OpenCLI site is not allowed: {site}"
     if not command.strip():
         return "Error: OpenCLI command must not be empty"
 
-    argv = _opencli_argv(site, command, args)
+    argv = _opencli_argv(site, command, arguments)
     env = os.environ.copy()
     env.setdefault("OPENCLI_BROWSER_CONNECT_TIMEOUT", "45")
     env.setdefault("OPENCLI_BROWSER_COMMAND_TIMEOUT", "90")
@@ -77,7 +77,7 @@ async def host_opencli_tool(
     description: str,
     site: str,
     command: str,
-    args: list[str] | None = None,
+    arguments: list[str] | None = None,
 ) -> str:
     """Run an OpenCLI site-adapter command on the DeerFlow host.
 
@@ -85,6 +85,6 @@ async def host_opencli_tool(
         description: Briefly explain why this OpenCLI command is needed.
         site: Allowed OpenCLI site adapter, such as ``twitter`` or ``github``.
         command: Command exposed by the selected OpenCLI site adapter.
-        args: Optional positional arguments and flags passed to the command.
+        arguments: Optional positional arguments and flags passed to the command.
     """
-    return await _run_host_opencli(site, command, args)
+    return await _run_host_opencli(site, command, arguments)

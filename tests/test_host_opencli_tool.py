@@ -18,6 +18,42 @@ class _FakeProcess:
         return self.returncode
 
 
+def test_host_opencli_schema_exposes_arguments_without_pydantic_varargs() -> None:
+    schema = host_opencli_module.host_opencli_tool.tool_call_schema.model_json_schema()
+
+    assert "arguments" in schema["properties"]
+    arguments_schema = schema["properties"]["arguments"]
+    assert {"items": {"type": "string"}, "type": "array"} in arguments_schema["anyOf"]
+    assert "v__args" not in schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_host_opencli_tool_routes_arguments_from_agent_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_run(site: str, command: str, arguments: list[str] | None = None) -> str:
+        captured.update(site=site, command=command, arguments=arguments)
+        return "OK"
+
+    monkeypatch.setattr(host_opencli_module, "_run_host_opencli", fake_run)
+
+    result = await host_opencli_module.host_opencli_tool.ainvoke(
+        {
+            "description": "Search Twitter",
+            "site": "twitter",
+            "command": "search",
+            "arguments": ["openai", "--limit", "5"],
+        }
+    )
+
+    assert result == "OK"
+    assert captured == {
+        "site": "twitter",
+        "command": "search",
+        "arguments": ["openai", "--limit", "5"],
+    }
+
+
 @pytest.mark.asyncio
 async def test_host_opencli_allows_an_entire_site(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
