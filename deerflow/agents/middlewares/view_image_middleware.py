@@ -1,15 +1,20 @@
 """Middleware for injecting image details into conversation before LLM call."""
 
+import asyncio
+import base64
 import logging
-from typing import override
+from pathlib import Path
+from typing import Awaitable, Callable, override
 
-from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import AgentMiddleware, ModelCallResult, ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
 
 from deerflow.agents.thread_state import ThreadState
 
 logger = logging.getLogger(__name__)
+
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
 
 class ViewImageMiddlewareState(ThreadState):
@@ -23,8 +28,8 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
     1. Runs before each LLM call
     2. Checks if the last assistant message contains view_image tool calls
     3. Verifies all tool calls in that message have been completed (have corresponding ToolMessages)
-    4. If conditions are met, creates a human message with all viewed image details (including base64 data)
-    5. Adds the message to state so the LLM can see and analyze the images
+    4. If conditions are met, creates an ephemeral human message containing image data
+    5. Adds that message only to the immediate model request, never persisted state
 
     This enables the LLM to automatically receive and analyze images that were loaded via view_image tool,
     without requiring explicit user prompts to describe the images.
@@ -91,6 +96,25 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
         # Check if all tool calls have been completed
         return tool_call_ids.issubset(completed_tool_ids)
 
+    def _image_base64(self, image_path: str, image_data: dict, state: ViewImageMiddlewareState) -> str:
+        legacy = image_data.get("base64")
+        if isinstance(legacy, str) and legacy:
+            return legacy
+
+        thread_data = state.get("thread_data")
+        if not isinstance(thread_data, dict):
+            raise ValueError("Thread data is unavailable for image injection")
+        from deerflow.sandbox.tools import resolve_and_validate_user_data_path, validate_local_tool_path
+
+        validate_local_tool_path(image_path, thread_data, read_only=True)
+        actual_path = Path(resolve_and_validate_user_data_path(image_path, thread_data))
+        if not actual_path.is_file():
+            raise FileNotFoundError(image_path)
+        size = actual_path.stat().st_size
+        if size > _MAX_IMAGE_BYTES:
+            raise ValueError(f"Image exceeds {_MAX_IMAGE_BYTES} bytes")
+        return base64.b64encode(actual_path.read_bytes()).decode("ascii")
+
     def _create_image_details_message(self, state: ViewImageMiddlewareState) -> list[str | dict]:
         """Create a formatted message with all viewed image details.
 
@@ -121,7 +145,11 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
 
         for image_path, image_data in viewed_images.items():
             mime_type = image_data.get("mime_type", "unknown")
-            base64_data = image_data.get("base64", "")
+            try:
+                base64_data = self._image_base64(image_path, image_data, state)
+            except Exception:
+                logger.warning("Skipping unavailable viewed image: %s", image_path, exc_info=True)
+                base64_data = ""
 
             # Add text description
             content_blocks.append({"type": "text", "text": f"\n- **{image_path}** ({mime_type})"})
@@ -174,68 +202,52 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
 
         return True
 
-    def _inject_image_message(self, state: ViewImageMiddlewareState) -> dict | None:
-        """Internal helper to inject image details message.
-
-        Args:
-            state: Current state
-
-        Returns:
-            State update with additional human message, or None if no update needed
-        """
+    def _ephemeral_messages(self, state: ViewImageMiddlewareState, messages: list) -> list | None:
+        """Append image data for one model call without checkpointing it."""
         if not self._should_inject_image_message(state):
             return None
 
         # Create the image details message with text and image content
         image_content = self._create_image_details_message(state)
 
-        # Create a new human message with mixed content (text + images)
-        # Mark with structured metadata so deduplication is robust against message summarization
+        # This marker is visible to middleware in the immediate model request,
+        # but the message is deliberately never returned as a state update.
         human_msg = HumanMessage(
             content=image_content,
             additional_kwargs={"_view_image_injection": True}
         )
 
-        logger.debug("Injecting image details message with images before LLM call")
-
-        # Clear viewed_images after injection to prevent token/checkpoint bloat from accumulating
-        # base64 data across multiple view_image calls. The merge_viewed_images reducer treats
-        # empty dict as a clear signal.
-        return {
-            "messages": [human_msg],
-            "viewed_images": {}
-        }
+        logger.debug("Injecting ephemeral image details before LLM call")
+        return [*messages, human_msg]
 
     @override
-    def before_model(self, state: ViewImageMiddlewareState, runtime: Runtime) -> dict | None:
-        """Inject image details message before LLM call if view_image tools have completed (sync version).
-
-        This runs before each LLM call, checking if the previous turn included view_image
-        tool calls that have all completed. If so, it injects a human message with the image
-        details so the LLM can see and analyze the images.
-
-        Args:
-            state: Current state
-            runtime: Runtime context (unused but required by interface)
-
-        Returns:
-            State update with additional human message, or None if no update needed
-        """
-        return self._inject_image_message(state)
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelCallResult:
+        patched = self._ephemeral_messages(request.state, request.messages)
+        if patched is not None:
+            request = request.override(messages=patched)
+        return handler(request)
 
     @override
-    async def abefore_model(self, state: ViewImageMiddlewareState, runtime: Runtime) -> dict | None:
-        """Inject image details message before LLM call if view_image tools have completed (async version).
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelCallResult:
+        patched = await asyncio.to_thread(self._ephemeral_messages, request.state, request.messages)
+        if patched is not None:
+            request = request.override(messages=patched)
+        return await handler(request)
 
-        This runs before each LLM call, checking if the previous turn included view_image
-        tool calls that have all completed. If so, it injects a human message with the image
-        details so the LLM can see and analyze the images.
+    @override
+    def after_model(self, state: ViewImageMiddlewareState, runtime: Runtime) -> dict | None:
+        if state.get("viewed_images"):
+            return {"viewed_images": {}}
+        return None
 
-        Args:
-            state: Current state
-            runtime: Runtime context (unused but required by interface)
-
-        Returns:
-            State update with additional human message, or None if no update needed
-        """
-        return self._inject_image_message(state)
+    @override
+    async def aafter_model(self, state: ViewImageMiddlewareState, runtime: Runtime) -> dict | None:
+        return self.after_model(state, runtime)

@@ -30,8 +30,8 @@ class ToolOutputConfig(BaseModel):
     fallback_tail_chars: int = Field(default=3_000, ge=0, description="Tail characters for inline fallback truncation.")
     storage_subdir: str = Field(default=".tool-results", description="Subdirectory under thread outputs for persisted tool results.")
     exempt_tools: list[str] = Field(
-        default_factory=lambda: ["read_file", "read_file_tool"],
-        description="Tool names exempt from budget enforcement.",
+        default_factory=list,
+        description="Tool names exempt from budget enforcement. Keep empty to prevent checkpoint bloat.",
     )
     tool_overrides: dict[str, int] = Field(
         default_factory=dict,

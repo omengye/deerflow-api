@@ -1,11 +1,21 @@
+import base64
+from pathlib import Path
+from types import SimpleNamespace
+
+from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from deerflow.agents.middlewares.view_image_middleware import ViewImageMiddleware
+from deerflow.tools.builtins.view_image_tool import view_image_tool
 
 
-def test_view_image_middleware_injects_image_with_analysis_instruction() -> None:
-    middleware = ViewImageMiddleware()
-    state = {
+IMAGE_PATH = "/mnt/user-data/uploads/test.png"
+
+
+def _state(tmp_path: Path) -> dict:
+    image_bytes = b"\x89PNG\r\n\x1a\ntransient-image"
+    tmp_path.joinpath("test.png").write_bytes(image_bytes)
+    return {
         "messages": [
             HumanMessage(content="Describe this image"),
             AIMessage(
@@ -13,7 +23,7 @@ def test_view_image_middleware_injects_image_with_analysis_instruction() -> None
                 tool_calls=[
                     {
                         "name": "view_image",
-                        "args": {"image_path": "/mnt/user-data/uploads/test.png"},
+                        "args": {"image_path": IMAGE_PATH},
                         "id": "call-1",
                         "type": "tool_call",
                     }
@@ -21,69 +31,94 @@ def test_view_image_middleware_injects_image_with_analysis_instruction() -> None
             ),
             ToolMessage(content="Successfully read image", tool_call_id="call-1"),
         ],
-        "viewed_images": {
-            "/mnt/user-data/uploads/test.png": {
-                "base64": "aW1hZ2U=",
-                "mime_type": "image/png",
-            }
-        },
+        "viewed_images": {IMAGE_PATH: {"mime_type": "image/png"}},
+        "thread_data": {"uploads_path": str(tmp_path)},
     }
 
-    update = middleware.before_model(state, None)  # type: ignore[arg-type]
 
-    assert update is not None
-    injected = update["messages"][0]
+def _request(state: dict) -> ModelRequest:
+    return ModelRequest(model=None, messages=state["messages"], state=state, runtime=None)
+
+
+def test_view_image_middleware_injects_image_only_for_model_call(tmp_path: Path) -> None:
+    middleware = ViewImageMiddleware()
+    state = _state(tmp_path)
+    persisted_messages = state["messages"]
+    seen_request: ModelRequest | None = None
+
+    def handler(request: ModelRequest) -> AIMessage:
+        nonlocal seen_request
+        seen_request = request
+        return AIMessage(content="analysis")
+
+    result = middleware.wrap_model_call(_request(state), handler)
+
+    assert isinstance(result, AIMessage)
+    assert seen_request is not None
+    assert len(seen_request.messages) == len(persisted_messages) + 1
+    injected = seen_request.messages[-1]
     assert isinstance(injected, HumanMessage)
     assert isinstance(injected.content, list)
     assert injected.content[0]["type"] == "text"
     assert "Use the attached image(s) to answer" in injected.content[0]["text"]
     assert "Do not merely confirm" in injected.content[0]["text"]
-    assert injected.content[1]["type"] == "text"
-    assert "/mnt/user-data/uploads/test.png" in injected.content[1]["text"]
+    assert IMAGE_PATH in injected.content[1]["text"]
     assert injected.content[2] == {
         "type": "image_url",
-        "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
-    }
-    # Verify structured marker is present for robust deduplication
-    assert injected.additional_kwargs.get("_view_image_injection") is True
-    # Verify viewed_images is cleared after injection to prevent accumulation
-    assert update["viewed_images"] == {}
-
-
-def test_view_image_middleware_does_not_inject_duplicate_image_message() -> None:
-    middleware = ViewImageMiddleware()
-    image_message = HumanMessage(
-        content=[
-            {
-                "type": "text",
-                "text": "Image input for analysis. Use the attached image(s) to answer the user's most recent request.",
-            }
-        ],
-        additional_kwargs={"_view_image_injection": True}
-    )
-    state = {
-        "messages": [
-            HumanMessage(content="Describe this image"),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "view_image",
-                        "args": {"image_path": "/mnt/user-data/uploads/test.png"},
-                        "id": "call-1",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            ToolMessage(content="Successfully read image", tool_call_id="call-1"),
-            image_message,
-        ],
-        "viewed_images": {
-            "/mnt/user-data/uploads/test.png": {
-                "base64": "aW1hZ2U=",
-                "mime_type": "image/png",
-            }
+        "image_url": {
+            "url": f"data:image/png;base64,{base64.b64encode(tmp_path.joinpath('test.png').read_bytes()).decode('ascii')}"
         },
     }
+    assert injected.additional_kwargs.get("_view_image_injection") is True
 
-    assert middleware.before_model(state, None) is None  # type: ignore[arg-type]
+    # The request override must not mutate data that will be checkpointed.
+    assert state["messages"] is persisted_messages
+    assert len(persisted_messages) == 3
+    assert "base64" not in state["viewed_images"][IMAGE_PATH]
+
+
+def test_view_image_middleware_clears_lightweight_state_after_model(tmp_path: Path) -> None:
+    middleware = ViewImageMiddleware()
+    state = _state(tmp_path)
+
+    assert middleware.after_model(state, None) == {"viewed_images": {}}  # type: ignore[arg-type]
+
+
+def test_view_image_middleware_does_not_inject_duplicate_legacy_message(tmp_path: Path) -> None:
+    middleware = ViewImageMiddleware()
+    state = _state(tmp_path)
+    state["messages"].append(
+        HumanMessage(
+            content=[
+                {
+                    "type": "text",
+                    "text": "Image input for analysis. Use the attached image(s) to answer the user's most recent request.",
+                }
+            ],
+            additional_kwargs={"_view_image_injection": True},
+        )
+    )
+    seen_messages: list = []
+
+    def handler(request: ModelRequest) -> AIMessage:
+        seen_messages.extend(request.messages)
+        return AIMessage(content="ok")
+
+    middleware.wrap_model_call(_request(state), handler)
+
+    assert seen_messages == state["messages"]
+
+
+def test_view_image_tool_persists_metadata_without_base64(tmp_path: Path) -> None:
+    tmp_path.joinpath("test.png").write_bytes(b"\x89PNG\r\n\x1a\nlightweight-state")
+    runtime = SimpleNamespace(state={"thread_data": {"uploads_path": str(tmp_path)}})
+
+    command = view_image_tool.func(
+        runtime=runtime,
+        image_path=IMAGE_PATH,
+        tool_call_id="call-1",
+    )
+
+    assert command.update["viewed_images"] == {
+        IMAGE_PATH: {"mime_type": "image/png"},
+    }

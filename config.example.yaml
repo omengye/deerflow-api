@@ -277,9 +277,9 @@ tool_output:
   fallback_head_chars: 8000
   fallback_tail_chars: 3000
   storage_subdir: ".tool-results"
-  exempt_tools:
-    - read_file
-    - read_file_tool
+  # Keep this empty in production. Exempt tools may persist arbitrarily large
+  # results into every later checkpoint in the thread.
+  exempt_tools: []
   # tool_overrides:
   #   web_search: 8000
   #   bash: 20000

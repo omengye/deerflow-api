@@ -28,6 +28,10 @@ def test_fallback_never_exceeds_max_chars() -> None:
     assert "omitted from bash output" in result
 
 
+def test_no_tool_is_exempt_from_output_budget_by_default() -> None:
+    assert ToolOutputConfig().exempt_tools == []
+
+
 def test_large_tool_output_externalized(tmp_path) -> None:
     config = ToolOutputConfig(externalize_min_chars=20, preview_head_chars=8, preview_tail_chars=4)
     middleware = ToolOutputBudgetMiddleware(config=config)

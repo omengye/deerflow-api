@@ -1,4 +1,3 @@
-import base64
 import mimetypes
 from pathlib import Path
 from typing import Annotated
@@ -150,11 +149,10 @@ def view_image_tool(
             update={"messages": [ToolMessage(f"Error: Image contents are {detected_mime_type}, but file extension indicates {expected_mime_type}", tool_call_id=tool_call_id)]},
         )
     mime_type = detected_mime_type
-    image_base64 = base64.b64encode(image_data).decode("utf-8")
-
-    # Update viewed_images in state
-    # The merge_viewed_images reducer will handle merging with existing images
-    new_viewed_images = {image_path: {"base64": image_base64, "mime_type": mime_type}}
+    # Persist only lightweight metadata. ViewImageMiddleware reloads and
+    # base64-encodes the image for the immediate model request, so binary image
+    # payloads are never copied into every later checkpoint.
+    new_viewed_images = {image_path: {"mime_type": mime_type}}
 
     return Command(
         update={"viewed_images": new_viewed_images, "messages": [ToolMessage("Successfully read image", tool_call_id=tool_call_id)]},

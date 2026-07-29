@@ -27,7 +27,9 @@ class ThreadDataState(TypedDict):
 
 
 class ViewedImageData(TypedDict):
-    base64: str
+    # ``base64`` is optional only for backward compatibility with checkpoints
+    # created before image payloads were made model-call-ephemeral.
+    base64: NotRequired[str]
     mime_type: str
 
 
