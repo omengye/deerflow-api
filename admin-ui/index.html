@@ -458,6 +458,13 @@
                   <option value="all">全部记录</option>
                 </select>
               </label>
+              <button
+                id="archiveEvolutionProposalsButton"
+                class="secondary-button"
+                type="button"
+                title="归档当前筛选结果中的终态 Proposal"
+                disabled
+              >归档当前终态</button>
               <span id="evolutionActionMessage" class="inline-message" role="status" aria-live="polite"></span>
             </div>
             <div class="table-wrap">
@@ -519,8 +526,15 @@
             <div class="panel-header">
               <div>
                 <h3>自动发现与发布观察</h3>
-                <p>仅展示脱敏 Signal；probation 记录当前 Revision 的观察、告警和自动回滚状态。</p>
+                <p id="evolutionCleanupHint">仅展示脱敏 Signal；probation 记录当前 Revision 的观察、告警和自动回滚状态。</p>
               </div>
+              <button
+                id="cleanupEvolutionObservabilityButton"
+                class="danger-button"
+                type="button"
+                aria-describedby="evolutionCleanupHint"
+                disabled
+              >清理观察记录</button>
             </div>
             <div class="table-wrap">
               <table class="evolution-table">

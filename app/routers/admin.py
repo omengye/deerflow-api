@@ -137,6 +137,12 @@ class AdminProposalReviewRequest(BaseModel):
     note: str | None = Field(default=None, max_length=2000)
 
 
+class AdminProposalArchiveBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proposal_ids: list[str] = Field(min_length=1, max_length=2000)
+
+
 class AdminSkillRollbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1837,6 +1843,79 @@ async def delete_admin_evolution_signal(signal_id: str):
         raise _safe_skill_error(exc) from exc
 
 
+@router.post("/evolution/observability/cleanup")
+async def cleanup_admin_evolution_observability():
+    """Delete all cancellable Signals and completed probation records."""
+    try:
+        with _admin_app_config_context():
+            store = get_evolution_store()
+            worker = get_evolution_worker()
+            deleted_signal_ids: list[str] = []
+            skipped_signals: list[dict[str, str]] = []
+            preserved_proposal_ids: set[str] = set()
+
+            for signal in store.list_signals():
+                if signal.status == "processing":
+                    skipped_signals.append(
+                        {"signal_id": signal.id, "status": signal.status, "reason": "processing"}
+                    )
+                    continue
+                if not worker.cancel(signal.id):
+                    skipped_signals.append(
+                        {"signal_id": signal.id, "status": signal.status, "reason": "processing_started"}
+                    )
+                    continue
+                deleted = store.delete_signal(signal.id)
+                deleted_signal_ids.append(deleted.id)
+                if deleted.proposal_id:
+                    preserved_proposal_ids.add(deleted.proposal_id)
+                store.append_audit(
+                    actor="admin",
+                    action="signal.deleted",
+                    details={
+                        "signal_id": deleted.id,
+                        "status": deleted.status,
+                        "proposal_id": deleted.proposal_id,
+                        "batch": True,
+                    },
+                )
+
+            deleted_probations = store.delete_probations_by_status({"graduated"})
+            for skill_name, probation in deleted_probations.items():
+                store.append_audit(
+                    actor="admin",
+                    action="probation.cleaned",
+                    details={
+                        "skill_name": skill_name,
+                        "revision": probation.get("revision"),
+                        "status": probation.get("status"),
+                    },
+                )
+
+            preserved_probation_counts: dict[str, int] = {}
+            for probation in store.get_probations().values():
+                probation_status = str(probation.get("status") or "unknown")
+                preserved_probation_counts[probation_status] = (
+                    preserved_probation_counts.get(probation_status, 0) + 1
+                )
+
+            return {
+                "success": True,
+                "deleted_signal_count": len(deleted_signal_ids),
+                "deleted_signal_ids": deleted_signal_ids,
+                "skipped_signal_count": len(skipped_signals),
+                "skipped_signals": skipped_signals,
+                "preserved_proposal_count": len(preserved_proposal_ids),
+                "preserved_proposal_ids": sorted(preserved_proposal_ids),
+                "deleted_probation_count": len(deleted_probations),
+                "deleted_probations": sorted(deleted_probations),
+                "preserved_probation_counts": preserved_probation_counts,
+                "observations_preserved": True,
+            }
+    except Exception as exc:
+        raise _safe_skill_error(exc) from exc
+
+
 @router.get("/evolution/proposals")
 async def list_admin_evolution_proposals(
     status: str | None = Query(default=None),
@@ -1908,6 +1987,54 @@ async def archive_admin_evolution_proposal(proposal_id: str):
             return {"success": True, "proposal": proposal.model_dump(mode="json")}
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise _safe_skill_error(exc) from exc
+
+
+@router.post("/evolution/proposals/archive-batch")
+async def archive_admin_evolution_proposals_batch(
+    req: AdminProposalArchiveBatchRequest = Body(),
+):
+    """Archive an explicit set of terminal Proposals and report partial skips."""
+    try:
+        with _admin_app_config_context():
+            store = get_evolution_store()
+            service = SkillEvolutionService(store)
+            proposal_ids = list(dict.fromkeys(req.proposal_ids))
+            archived_ids: list[str] = []
+            already_archived_ids: list[str] = []
+            skipped: list[dict[str, str | None]] = []
+
+            with store.lock:
+                for proposal_id in proposal_ids:
+                    try:
+                        proposal = store.load_proposal(proposal_id)
+                    except FileNotFoundError:
+                        skipped.append(
+                            {"proposal_id": proposal_id, "status": None, "reason": "not_found"}
+                        )
+                        continue
+                    if proposal.archived_at is not None:
+                        already_archived_ids.append(proposal.id)
+                        continue
+                    if proposal.status not in {"published", "rejected", "failed", "stale"}:
+                        skipped.append(
+                            {"proposal_id": proposal.id, "status": proposal.status, "reason": "not_terminal"}
+                        )
+                        continue
+                    service.archive_proposal(proposal.id)
+                    archived_ids.append(proposal.id)
+
+            return {
+                "success": True,
+                "requested_count": len(proposal_ids),
+                "archived_count": len(archived_ids),
+                "archived_ids": archived_ids,
+                "already_archived_count": len(already_archived_ids),
+                "already_archived_ids": already_archived_ids,
+                "skipped_count": len(skipped),
+                "skipped": skipped,
+            }
     except Exception as exc:
         raise _safe_skill_error(exc) from exc
 

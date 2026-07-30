@@ -16,7 +16,12 @@ from app.routers import admin as admin_router
 from deerflow.config.app_config import reset_app_config
 from deerflow.config.extensions_config import reset_extensions_config
 from deerflow.runtime.scheduler import SchedulerStore
-from deerflow.skills.evolution import EvolutionSignal, SkillEvolutionService, get_evolution_store
+from deerflow.skills.evolution import (
+    EvolutionSignal,
+    SkillEvolutionService,
+    SkillProposal,
+    get_evolution_store,
+)
 from deerflow.skills.evolution.store import utc_now_iso
 from deerflow.skills.security_scanner import ScanResult
 
@@ -1150,6 +1155,81 @@ tool_groups: []
         self.assertIn('"action": "proposal.archived"', audit)
         self.assertIn('"action": "proposal.restored"', audit)
 
+    def test_evolution_proposal_batch_archive_only_archives_terminal_records(self) -> None:
+        now = utc_now_iso()
+        proposals = (
+            SkillProposal(
+                id="p_batch_published",
+                status="published",
+                action="edit",
+                skill_name="published-skill",
+                created_at=now,
+                updated_at=now,
+            ),
+            SkillProposal(
+                id="p_batch_rejected",
+                status="rejected",
+                action="edit",
+                skill_name="rejected-skill",
+                created_at=now,
+                updated_at=now,
+            ),
+            SkillProposal(
+                id="p_batch_pending",
+                status="pending_review",
+                action="edit",
+                skill_name="pending-skill",
+                created_at=now,
+                updated_at=now,
+            ),
+            SkillProposal(
+                id="p_batch_archived",
+                status="failed",
+                action="edit",
+                skill_name="already-archived-skill",
+                created_at=now,
+                updated_at=now,
+                archived_at=now,
+                archived_by="admin",
+            ),
+        )
+        with admin_router._admin_app_config_context():
+            store = get_evolution_store()
+            for proposal in proposals:
+                store.save_proposal(proposal)
+
+        response = self._client().post(
+            "/api/admin/evolution/proposals/archive-batch",
+            headers=self._auth_headers(),
+            json={
+                "proposal_ids": [
+                    "p_batch_published",
+                    "p_batch_rejected",
+                    "p_batch_pending",
+                    "p_batch_archived",
+                    "p_batch_missing",
+                    "p_batch_published",
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["requested_count"], 5)
+        self.assertEqual(payload["archived_ids"], ["p_batch_published", "p_batch_rejected"])
+        self.assertEqual(payload["already_archived_ids"], ["p_batch_archived"])
+        self.assertEqual(
+            {(item["proposal_id"], item["reason"]) for item in payload["skipped"]},
+            {("p_batch_pending", "not_terminal"), ("p_batch_missing", "not_found")},
+        )
+        with admin_router._admin_app_config_context():
+            store = get_evolution_store()
+            self.assertIsNotNone(store.load_proposal("p_batch_published").archived_at)
+            self.assertIsNotNone(store.load_proposal("p_batch_rejected").archived_at)
+            self.assertIsNone(store.load_proposal("p_batch_pending").archived_at)
+        audit = self.evolution_root.joinpath("audit.jsonl").read_text(encoding="utf-8")
+        self.assertEqual(audit.count('"action": "proposal.archived"'), 2)
+
     def test_evolution_signal_and_worker_observability_api(self) -> None:
         raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
         raw["skill_evolution"]["enabled"] = True
@@ -1209,6 +1289,64 @@ tool_groups: []
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(status_after_delete.json()["signal_counts"].get("pending", 0), 0)
         self.assertIn('"action": "signal.deleted"', self.evolution_root.joinpath("audit.jsonl").read_text(encoding="utf-8"))
+
+    def test_evolution_observability_cleanup_preserves_active_state_and_history(self) -> None:
+        now = utc_now_iso()
+        with admin_router._admin_app_config_context():
+            store = get_evolution_store()
+            state = store.read_state()
+            state["observations"] = {"repeat-fingerprint": {"count": 2, "last_signal_at": now}}
+            store.write_state(state)
+            store.set_probation("active-skill", {"status": "probation", "revision": 3})
+            store.set_probation("alert-skill", {"status": "alert", "revision": 4})
+            store.set_probation("graduated-skill", {"status": "graduated", "revision": 5})
+            for signal in (
+                EvolutionSignal(
+                    id="s_cleanup_pending",
+                    status="pending",
+                    fingerprint="pending",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                EvolutionSignal(
+                    id="s_cleanup_done",
+                    status="proposal_created",
+                    fingerprint="done",
+                    proposal_id="p_preserved",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                EvolutionSignal(
+                    id="s_cleanup_processing",
+                    status="processing",
+                    fingerprint="processing",
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ):
+                store.save_signal(signal)
+
+        response = self._client().post(
+            "/api/admin/evolution/observability/cleanup",
+            headers=self._auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(set(payload["deleted_signal_ids"]), {"s_cleanup_pending", "s_cleanup_done"})
+        self.assertEqual(payload["skipped_signal_count"], 1)
+        self.assertEqual(payload["preserved_proposal_ids"], ["p_preserved"])
+        self.assertEqual(payload["deleted_probations"], ["graduated-skill"])
+        self.assertTrue(payload["observations_preserved"])
+        with admin_router._admin_app_config_context():
+            store = get_evolution_store()
+            self.assertEqual(store.load_signal("s_cleanup_processing").status, "processing")
+            self.assertEqual({item.id for item in store.list_signals()}, {"s_cleanup_processing"})
+            self.assertEqual(set(store.get_probations()), {"active-skill", "alert-skill"})
+            self.assertIn("repeat-fingerprint", store.read_state()["observations"])
+        audit = self.evolution_root.joinpath("audit.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"action": "signal.deleted"', audit)
+        self.assertIn('"action": "probation.cleaned"', audit)
 
     def test_processing_evolution_signal_cannot_be_deleted(self) -> None:
         now = utc_now_iso()

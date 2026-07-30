@@ -49,6 +49,8 @@ When served by the API process, the API base URL is inferred from the current or
 - `GET /api/admin/evolution/signals`: list sanitized automatic-discovery Signal summaries.
 - `GET /api/admin/evolution/signals/{signal_id}`: inspect one Signal and its bounded, sanitized tool errors.
 - `DELETE /api/admin/evolution/signals/{signal_id}`: cancel a queued Signal when necessary and delete its record.
+- `POST /api/admin/evolution/observability/cleanup`: delete cancellable Signals and completed probation records while preserving active monitoring and linked history.
+- `POST /api/admin/evolution/proposals/archive-batch`: archive an explicit set of terminal Proposals while preserving linked history.
 - `PATCH /api/admin/runtime`: write allowlisted runtime fields.
 - `POST /api/admin/mcp/{name}/enable`: enable an MCP server.
 - `POST /api/admin/mcp/{name}/disable`: disable an MCP server.

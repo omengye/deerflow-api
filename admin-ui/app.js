@@ -207,6 +207,8 @@
     proposalStatusFilter: document.getElementById("proposalStatusFilter"),
     proposalArchiveFilter: document.getElementById("proposalArchiveFilter"),
     refreshEvolutionButton: document.getElementById("refreshEvolutionButton"),
+    archiveEvolutionProposalsButton: document.getElementById("archiveEvolutionProposalsButton"),
+    cleanupEvolutionObservabilityButton: document.getElementById("cleanupEvolutionObservabilityButton"),
     evolutionActionMessage: document.getElementById("evolutionActionMessage"),
     evolutionProposalPanel: document.getElementById("evolutionProposalPanel"),
     evolutionProposalTitle: document.getElementById("evolutionProposalTitle"),
@@ -1040,6 +1042,51 @@
     return labels[status] || status || "未知";
   }
 
+  function archivableEvolutionProposals() {
+    const terminalStatuses = new Set(["published", "rejected", "failed", "stale"]);
+    return state.evolutionProposals.filter(
+      (proposal) => terminalStatuses.has(proposal.status) && !proposal.archived_at,
+    );
+  }
+
+  function evolutionCleanupCounts() {
+    const signalCounts = state.evolutionStatus?.signal_counts;
+    const counts = signalCounts && typeof signalCounts === "object"
+      ? signalCounts
+      : state.evolutionSignals.reduce((result, signal) => {
+          result[signal.status] = (result[signal.status] || 0) + 1;
+          return result;
+        }, {});
+    const deletableSignals = Object.entries(counts).reduce(
+      (total, [status, count]) => total + (status === "processing" ? 0 : Number(count || 0)),
+      0,
+    );
+    const completedProbations = Object.values(state.evolutionStatus?.probations || {}).filter(
+      (probation) => probation?.status === "graduated",
+    ).length;
+    return { deletableSignals, completedProbations, total: deletableSignals + completedProbations };
+  }
+
+  function updateEvolutionBulkActions() {
+    const proposalCount = archivableEvolutionProposals().length;
+    const archiveLabel = proposalCount ? `归档当前终态 (${proposalCount})` : "归档当前终态";
+    el.archiveEvolutionProposalsButton.dataset.idleText = archiveLabel;
+    if (!el.archiveEvolutionProposalsButton.classList.contains("is-busy")) {
+      el.archiveEvolutionProposalsButton.textContent = archiveLabel;
+    }
+    el.archiveEvolutionProposalsButton.disabled =
+      el.archiveEvolutionProposalsButton.classList.contains("is-busy") || proposalCount === 0;
+
+    const cleanup = evolutionCleanupCounts();
+    const cleanupLabel = cleanup.total ? `清理观察记录 (${cleanup.total})` : "清理观察记录";
+    el.cleanupEvolutionObservabilityButton.dataset.idleText = cleanupLabel;
+    if (!el.cleanupEvolutionObservabilityButton.classList.contains("is-busy")) {
+      el.cleanupEvolutionObservabilityButton.textContent = cleanupLabel;
+    }
+    el.cleanupEvolutionObservabilityButton.disabled =
+      el.cleanupEvolutionObservabilityButton.classList.contains("is-busy") || cleanup.total === 0;
+  }
+
   function renderEvolutionStatus() {
     if (!el.evolutionStatusSummary) return;
     const status = state.evolutionStatus || {};
@@ -1066,11 +1113,13 @@
         ? JSON.stringify(status.probations, null, 2)
         : "当前没有 probation 记录。";
     }
+    updateEvolutionBulkActions();
   }
 
   function renderEvolutionSignals() {
     if (!el.evolutionSignalsTableBody) return;
     const signals = state.evolutionSignals;
+    updateEvolutionBulkActions();
     if (!signals.length) {
       el.evolutionSignalsTableBody.innerHTML = `<tr><td colspan="8">当前没有自动发现 Signal。</td></tr>`;
       return;
@@ -1204,9 +1253,42 @@
     }
   }
 
+  async function cleanupEvolutionObservability() {
+    const counts = evolutionCleanupCounts();
+    if (!counts.total) return;
+    const confirmed = window.confirm(
+      `确认清理自动发现与发布观察记录？\n\n` +
+        `将删除 ${counts.deletableSignals} 条可删除 Signal，并清理 ${counts.completedProbations} 条已结束 Probation。\n` +
+        "正在处理的 Signal、活动 Probation、回归告警、关联 Proposal、Revision、审计记录、重复次数和冷却时间都会保留。",
+    );
+    if (!confirmed) return;
+
+    setBusy(el.cleanupEvolutionObservabilityButton, true, "清理中");
+    try {
+      const result = await request("/api/admin/evolution/observability/cleanup", { method: "POST" });
+      const deletedIds = new Set(result.deleted_signal_ids || []);
+      if (state.selectedEvolutionSignal && deletedIds.has(state.selectedEvolutionSignal.id)) {
+        closeEvolutionSignalDetail({ restoreFocus: false });
+      }
+      await Promise.all([loadEvolutionSignals(), loadEvolutionStatus()]);
+      const skippedNote = result.skipped_signal_count
+        ? `；跳过 ${result.skipped_signal_count} 条处理中 Signal`
+        : "";
+      showToast(
+        `已删除 ${result.deleted_signal_count || 0} 条 Signal，清理 ${result.deleted_probation_count || 0} 条已结束 Probation${skippedNote}。`,
+      );
+    } catch (error) {
+      showToast(`清理观察记录失败：${error.message}`);
+    } finally {
+      setBusy(el.cleanupEvolutionObservabilityButton, false);
+      updateEvolutionBulkActions();
+    }
+  }
+
   function renderEvolutionProposals() {
     if (!el.evolutionProposalsTableBody) return;
     const proposals = state.evolutionProposals;
+    updateEvolutionBulkActions();
     if (!proposals.length) {
       el.evolutionProposalsTableBody.innerHTML = `<tr><td colspan="8">当前没有符合条件的 Proposal。</td></tr>`;
       return;
@@ -1361,6 +1443,52 @@
       showToast(`${restore ? "恢复" : "归档"} Proposal 失败：${error.message}`);
     } finally {
       setBusy(button, false);
+    }
+  }
+
+  async function archiveEvolutionProposalsBatch() {
+    const proposals = archivableEvolutionProposals();
+    if (!proposals.length) return;
+    const statusCounts = proposals.reduce((counts, proposal) => {
+      const label = evolutionStatusLabel(proposal.status);
+      counts[label] = (counts[label] || 0) + 1;
+      return counts;
+    }, {});
+    const statusSummary = Object.entries(statusCounts)
+      .map(([status, count]) => `${status} ${count}`)
+      .join("、");
+    const confirmed = window.confirm(
+      `确认归档当前筛选结果中的 ${proposals.length} 条终态 Proposal？\n状态：${statusSummary}\n\n` +
+        "归档仅从默认列表隐藏记录，不会删除 Skill、Revision、Signal、Diff 或审计记录。",
+    );
+    if (!confirmed) return;
+
+    setBusy(el.archiveEvolutionProposalsButton, true, "归档中");
+    el.evolutionActionMessage.textContent = "正在批量归档 Proposal...";
+    try {
+      const result = await request("/api/admin/evolution/proposals/archive-batch", {
+        method: "POST",
+        body: { proposal_ids: proposals.map((proposal) => proposal.id) },
+      });
+      await Promise.all([loadEvolutionProposals(), loadEvolutionStatus()]);
+      if (state.selectedEvolutionProposal && (result.archived_ids || []).includes(state.selectedEvolutionProposal.id)) {
+        if (state.evolutionProposals.some((proposal) => proposal.id === state.selectedEvolutionProposal.id)) {
+          await openEvolutionProposal(state.selectedEvolutionProposal.id);
+        } else {
+          state.selectedEvolutionProposal = null;
+          el.evolutionProposalPanel.classList.add("hidden");
+        }
+      }
+      const skipped = Number(result.skipped_count || 0) + Number(result.already_archived_count || 0);
+      const skippedNote = skipped ? `，跳过 ${skipped} 条` : "";
+      el.evolutionActionMessage.textContent = `已归档 ${result.archived_count || 0} 条 Proposal${skippedNote}。`;
+      showToast(el.evolutionActionMessage.textContent);
+    } catch (error) {
+      el.evolutionActionMessage.textContent = `批量归档失败：${error.message}`;
+      showToast(el.evolutionActionMessage.textContent);
+    } finally {
+      setBusy(el.archiveEvolutionProposalsButton, false);
+      updateEvolutionBulkActions();
     }
   }
 
@@ -2670,6 +2798,8 @@
     });
     el.proposalStatusFilter.addEventListener("change", loadEvolutionProposals);
     el.proposalArchiveFilter.addEventListener("change", loadEvolutionProposals);
+    el.archiveEvolutionProposalsButton.addEventListener("click", archiveEvolutionProposalsBatch);
+    el.cleanupEvolutionObservabilityButton.addEventListener("click", cleanupEvolutionObservability);
     el.refreshEvolutionButton.addEventListener("click", async () => {
       setBusy(el.refreshEvolutionButton, true, "刷新中");
       try {

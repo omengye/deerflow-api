@@ -346,6 +346,25 @@ class FileEvolutionStore:
                 probations[name] = probation
             self.write_state(state)
 
+    def delete_probations_by_status(self, statuses: set[str]) -> dict[str, dict[str, Any]]:
+        """Delete probation records in the requested terminal statuses."""
+        if not statuses:
+            return {}
+        with self.lock:
+            state = self.read_state()
+            probations = state.setdefault("probations", {})
+            removed = {
+                name: dict(probation)
+                for name, probation in probations.items()
+                if isinstance(probation, dict) and str(probation.get("status")) in statuses
+            }
+            if removed:
+                state["probations"] = {
+                    name: probation for name, probation in probations.items() if name not in removed
+                }
+                self.write_state(state)
+            return removed
+
     def next_revision(self, name: str) -> int:
         root = self.revisions_dir / name
         versions = [int(path.name) for path in root.iterdir() if path.is_dir() and path.name.isdigit()] if root.exists() else []
