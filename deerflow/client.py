@@ -34,6 +34,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphRecursionError
+from langgraph.graph.state import CompiledStateGraph
 
 from deerflow.agents.lead_agent.agent import _build_middlewares
 from deerflow.agents.middlewares.subagent_limit_middleware import clamp_subagent_limit
@@ -188,7 +189,7 @@ class DeerFlowClient:
         self._recursion_limit = recursion_limit
 
         # Lazy agent — created on first call, recreated when config changes.
-        self._agent = None
+        self._agent: CompiledStateGraph[Any, Any, Any, Any] | None = None
         self._agent_config_key: tuple | None = None
         # Effective checkpointer used by the current agent (may differ from
         # self._checkpointer when get_checkpointer() was called as fallback).
@@ -762,7 +763,7 @@ class DeerFlowClient:
             checkpointer = get_checkpointer()
 
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
-        checkpoints = []
+        checkpoints: list[dict[str, Any]] = []
 
         if not isinstance(checkpointer, BaseCheckpointSaver):
             return {"thread_id": thread_id, "checkpoints": checkpoints}
@@ -787,7 +788,7 @@ class DeerFlowClient:
             )
 
         # Sort globally by timestamp to prevent partial ordering issues caused by different namespaces (e.g., subgraphs)
-        checkpoints.sort(key=lambda x: x["ts"] if x["ts"] else "")
+        checkpoints.sort(key=lambda item: str(item.get("ts") or ""))
 
         return {"thread_id": thread_id, "checkpoints": checkpoints}
 
@@ -1214,7 +1215,7 @@ class DeerFlowClient:
         updated = next((s for s in load_skills(enabled_only=False) if s.name == name), None)
         if updated is None:
             raise RuntimeError(f"Skill '{name}' disappeared after update")
-        result = {
+        result: dict[str, Any] = {
             "name": updated.name,
             "description": updated.description,
             "license": updated.license,

@@ -1,6 +1,7 @@
 import logging
 
 from langchain.chat_models import BaseChatModel
+from langchain_core.callbacks import BaseCallbackManager
 
 from deerflow.config import get_app_config
 from deerflow.reflection import resolve_class
@@ -198,7 +199,11 @@ def create_chat_model(
 
     callbacks = build_tracing_callbacks()
     if callbacks:
-        existing_callbacks = model_instance.callbacks or []
-        model_instance.callbacks = [*existing_callbacks, *callbacks]
+        existing_callbacks = model_instance.callbacks
+        if isinstance(existing_callbacks, BaseCallbackManager):
+            for callback in callbacks:
+                existing_callbacks.add_handler(callback)
+        else:
+            model_instance.callbacks = [*(existing_callbacks or []), *callbacks]
         logger.debug(f"Tracing attached to model '{name}' with providers={len(callbacks)}")
     return model_instance

@@ -1,0 +1,54 @@
+"""Tests for preserving existing model callbacks when tracing is enabled."""
+
+from unittest.mock import patch
+
+from langchain_core.callbacks import BaseCallbackHandler, CallbackManager
+
+from deerflow.config.app_config import AppConfig
+from deerflow.config.model_config import ModelConfig
+from deerflow.config.sandbox_config import SandboxConfig
+from deerflow.models import factory as factory_module
+
+
+class _FakeChatModel:
+    def __init__(self, **kwargs) -> None:
+        self.callbacks = kwargs.get("callbacks")
+
+
+def _create_model(existing_callbacks, tracing_callback: BaseCallbackHandler):  # noqa: ANN001
+    config = AppConfig(
+        sandbox=SandboxConfig(use="test"),
+        models=[
+            ModelConfig(
+                name="test-model",
+                use="tests.fake:FakeChatModel",
+                model="provider-model",
+            )
+        ],
+    )
+    with (
+        patch.object(factory_module, "get_app_config", return_value=config),
+        patch.object(factory_module, "resolve_class", return_value=_FakeChatModel),
+        patch.object(factory_module, "build_tracing_callbacks", return_value=[tracing_callback]),
+    ):
+        return factory_module.create_chat_model(name="test-model", callbacks=existing_callbacks)
+
+
+def test_factory_appends_tracing_callback_to_existing_list() -> None:
+    existing = BaseCallbackHandler()
+    tracing = BaseCallbackHandler()
+
+    model = _create_model([existing], tracing)
+
+    assert model.callbacks == [existing, tracing]
+
+
+def test_factory_adds_tracing_callback_to_existing_manager() -> None:
+    existing = BaseCallbackHandler()
+    tracing = BaseCallbackHandler()
+    manager = CallbackManager([existing])
+
+    model = _create_model(manager, tracing)
+
+    assert model.callbacks is manager
+    assert manager.handlers == [existing, tracing]

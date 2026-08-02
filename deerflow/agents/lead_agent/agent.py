@@ -1,7 +1,10 @@
 import logging
+from typing import Any, NotRequired, TypedDict, cast
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.summarization import ContextSize as SummarizationContextSize
+from langchain.chat_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
 
 from deerflow.agents.lead_agent.prompt import apply_prompt_template
@@ -26,6 +29,14 @@ from deerflow.config.summarization_config import get_summarization_config
 from deerflow.models import create_chat_model
 
 logger = logging.getLogger(__name__)
+
+
+class _SummarizationMiddlewareKwargs(TypedDict):
+    model: BaseChatModel
+    trigger: SummarizationContextSize | list[SummarizationContextSize] | None
+    keep: SummarizationContextSize
+    trim_tokens_to_summarize: NotRequired[int]
+    summary_prompt: NotRequired[str]
 
 
 def _get_runtime_config(config: RunnableConfig) -> dict:
@@ -72,15 +83,15 @@ def _create_summarization_middleware(run_model_name: str | None = None) -> DeerF
         return None
 
     # Prepare trigger parameter
-    trigger = None
+    trigger: SummarizationContextSize | list[SummarizationContextSize] | None = None
     if config.trigger is not None:
         if isinstance(config.trigger, list):
-            trigger = [t.to_tuple() for t in config.trigger]
+            trigger = [cast("SummarizationContextSize", item.to_tuple()) for item in config.trigger]
         else:
-            trigger = config.trigger.to_tuple()
+            trigger = cast("SummarizationContextSize", config.trigger.to_tuple())
 
     # Prepare keep parameter
-    keep = config.keep.to_tuple()
+    keep = cast("SummarizationContextSize", config.keep.to_tuple())
 
     app_config = get_app_config()
     default_model_name = app_config.get_default_model_name()
@@ -120,7 +131,7 @@ def _create_summarization_middleware(run_model_name: str | None = None) -> DeerF
     fallback_model_name = valid_run_model_name if valid_run_model_name and valid_run_model_name != effective_primary_model_name else None
 
     # Prepare kwargs
-    kwargs = {
+    kwargs: _SummarizationMiddlewareKwargs = {
         "model": model,
         "trigger": trigger,
         "keep": keep,
@@ -283,7 +294,13 @@ Being proactive with task management demonstrates thoroughness and ensures all r
 # ViewImageMiddleware should be before ClarificationMiddleware to inject image details before LLM
 # ToolErrorHandlingMiddleware should be before ClarificationMiddleware to convert tool exceptions to ToolMessages
 # ClarificationMiddleware should be last to intercept clarification requests after model calls
-def _build_middlewares(config: RunnableConfig, model_name: str | None, agent_name: str | None = None, custom_middlewares: list[AgentMiddleware] | None = None, recursion_limit: int | None = None):
+def _build_middlewares(
+    config: RunnableConfig,
+    model_name: str | None,
+    agent_name: str | None = None,
+    custom_middlewares: list[AgentMiddleware] | None = None,
+    recursion_limit: int | None = None,
+) -> list[AgentMiddleware[Any, Any, Any]]:
     """Build middleware chain based on runtime configuration.
 
     Args:
@@ -296,7 +313,7 @@ def _build_middlewares(config: RunnableConfig, model_name: str | None, agent_nam
     Returns:
         List of middleware instances.
     """
-    middlewares = build_lead_runtime_middlewares(lazy_init=True)
+    middlewares: list[AgentMiddleware[Any, Any, Any]] = list(build_lead_runtime_middlewares(lazy_init=True))
 
     # Add summarization middleware if enabled
     summarization_middleware = _create_summarization_middleware(run_model_name=model_name)

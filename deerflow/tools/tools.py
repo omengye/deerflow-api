@@ -1,6 +1,6 @@
 import logging
 
-from langchain.tools import BaseTool
+from langchain_core.tools import BaseTool, StructuredTool
 
 from deerflow.config import get_app_config
 from deerflow.reflection import resolve_variable
@@ -38,7 +38,7 @@ def _is_host_bash_tool(tool: object) -> bool:
 
 def _ensure_sync_invocable_tool(tool: BaseTool) -> BaseTool:
     """Attach a sync wrapper to async-only tools used by sync agent callers."""
-    if getattr(tool, "func", None) is None and getattr(tool, "coroutine", None) is not None:
+    if isinstance(tool, StructuredTool) and tool.func is None and tool.coroutine is not None:
         tool.func = make_sync_tool_wrapper(tool.coroutine, tool.name)
     return tool
 
