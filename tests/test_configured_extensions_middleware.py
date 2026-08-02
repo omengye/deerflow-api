@@ -113,7 +113,10 @@ def test_build_middlewares_appends_configured_middlewares_before_clarification()
     dummy = _DummyMiddleware()
     set_app_config(AppConfig(sandbox=SandboxConfig(use="test")))
     try:
-        with patch("deerflow.agents.lead_agent.agent.load_configured_middlewares", return_value=[dummy]):
+        with (
+            patch("deerflow.agents.lead_agent.agent._create_summarization_middleware", return_value=None),
+            patch("deerflow.agents.lead_agent.agent.load_configured_middlewares", return_value=[dummy]),
+        ):
             middlewares = _build_middlewares({}, model_name=None)
     finally:
         reset_app_config()

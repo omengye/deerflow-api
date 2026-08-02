@@ -100,9 +100,9 @@ def get_available_tools(
         builtin_tools.extend(SUBAGENT_TOOLS)
         logger.info("Including subagent tools (task)")
 
-    # If no model_name specified, use the first model (default)
+    # If no model_name is specified, use the configured default model.
     if model_name is None and config.models:
-        model_name = config.models[0].name
+        model_name = config.get_default_model_name()
 
     # Add view_image_tool only if the model supports vision
     model_config = config.get_model_config(model_name) if model_name else None

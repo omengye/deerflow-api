@@ -23,11 +23,15 @@ def _client() -> DeerFlowClient:
 
 
 def _app_config(*, supports_vision: bool):
+    first_model = SimpleNamespace(name="first-model", supports_vision=False)
     model = SimpleNamespace(name="vision-model", supports_vision=supports_vision)
+    by_name = {candidate.name: candidate for candidate in (first_model, model)}
     return SimpleNamespace(
-        models=[model],
+        models=[first_model, model],
+        default_model="vision-model",
         subagents=SimpleNamespace(enabled=True),
-        get_model_config=lambda name: model if name == "vision-model" else None,
+        get_model_config=by_name.get,
+        get_default_model_name=lambda: "vision-model",
     )
 
 
@@ -91,3 +95,30 @@ def test_deerflow_client_rebuilds_agent_when_supports_vision_changes() -> None:
         client._ensure_agent(config)
 
     assert create_agent.call_count == 2
+
+
+def test_deerflow_client_explicit_model_overrides_configured_default() -> None:
+    client = _client()
+    client._model_name = "first-model"
+    config = {
+        "configurable": {
+            "model_name": "first-model",
+            "thinking_enabled": True,
+            "subagent_enabled": False,
+            "is_plan_mode": False,
+            "max_concurrent_subagents": 3,
+        }
+    }
+
+    with (
+        patch("deerflow.client.get_app_config", return_value=_app_config(supports_vision=True)),
+        patch.object(DeerFlowClient, "_get_memory_signature", return_value=None),
+        patch("deerflow.client.create_chat_model", return_value=object()) as create_model,
+        patch.object(DeerFlowClient, "_get_tools", return_value=[]),
+        patch("deerflow.client._build_middlewares", return_value=[]),
+        patch("deerflow.client.apply_prompt_template", return_value="system"),
+        patch("deerflow.client.create_agent", return_value=object()),
+    ):
+        client._ensure_agent(config)
+
+    assert create_model.call_args.kwargs["name"] == "first-model"

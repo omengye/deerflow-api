@@ -77,7 +77,7 @@ def create_chat_model(
     """Create a chat model instance from the config.
 
     Args:
-        name: The name of the model to create. If None, the first model in the config will be used.
+        name: The name of the model to create. If None, the configured default model will be used.
         thinking_enabled: Enable thinking-mode settings declared in the model config.
         disable_keepalive: Inject an httpx.AsyncClient with keep-alive disabled
             for ChatOpenAI subclasses. Opt in for long-lived shared models on
@@ -92,7 +92,7 @@ def create_chat_model(
     """
     config = get_app_config()
     if name is None:
-        name = config.models[0].name
+        name = config.get_default_model_name()
     model_config = config.get_model_config(name)
     if model_config is None:
         raise ValueError(f"Model {name} not found in config") from None

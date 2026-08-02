@@ -1214,6 +1214,9 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             def get_model_config(self, name: str):
                 return SimpleNamespace(name=name) if name in {"default", "agent-model"} else None
 
+            def get_default_model_name(self) -> str:
+                return "default"
+
         with patch.object(lead_agent, "get_app_config", return_value=FakeAppConfig()):
             self.assertEqual(
                 lead_agent._resolve_model_name("missing-model", "agent-model"),

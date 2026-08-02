@@ -92,11 +92,13 @@ def _replacements(update: dict) -> list:
 
 
 def _app_config():
-    models = [SimpleNamespace(name="default-model"), SimpleNamespace(name="run-model"), SimpleNamespace(name="cheap-model")]
+    models = [SimpleNamespace(name="run-model"), SimpleNamespace(name="default-model"), SimpleNamespace(name="cheap-model")]
     by_name = {model.name: model for model in models}
     return SimpleNamespace(
         models=models,
+        default_model="default-model",
         get_model_config=by_name.get,
+        get_default_model_name=lambda: "default-model",
         skills=SimpleNamespace(container_path="/mnt/skills"),
     )
 
@@ -148,12 +150,12 @@ def test_summarization_ignores_unconfigured_run_model() -> None:
     """An unresolvable run model degrades to the default instead of being trusted."""
     created_names, captured = _build_middleware_kwargs(config_model_name=None, run_model_name="not-in-config")
 
-    assert created_names == [None]  # create_chat_model(None) -> models[0]
+    assert created_names == [None]  # create_chat_model(None) -> configured default
     assert captured["fallback_model_name"] is None
 
 
 def test_summarization_skips_fallback_when_run_model_is_the_default() -> None:
-    """Explicitly configuring models[0] while running it must not self-retry."""
+    """Explicitly configuring the default model while running it must not self-retry."""
     created_names, captured = _build_middleware_kwargs(config_model_name="default-model", run_model_name="default-model")
 
     assert created_names == ["default-model"]
@@ -178,11 +180,11 @@ def test_summarization_invalid_config_model_falls_back_to_run_model(caplog: pyte
 
 
 def test_summarization_invalid_config_model_without_run_model_falls_back_to_default(caplog: pytest.LogCaptureFixture) -> None:
-    """With no valid run model either, an invalid config.model_name must still land on models[0]."""
+    """With no valid run model either, an invalid config.model_name must use the configured default."""
     with caplog.at_level(logging.WARNING):
         created_names, captured = _build_middleware_kwargs(config_model_name="not-in-config", run_model_name=None)
 
-    assert created_names == [None]  # create_chat_model(None) -> models[0]
+    assert created_names == [None]  # create_chat_model(None) -> configured default
     assert captured["fallback_model_name"] is None
     assert any("not-in-config" in record.message and "default" in record.message for record in caplog.records)
 

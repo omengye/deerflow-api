@@ -76,6 +76,10 @@ class AppConfig(BaseModel):
     log_level: str = Field(default="info", description="Logging level for deerflow modules (debug/info/warning/error)")
     token_usage: TokenUsageConfig = Field(default_factory=TokenUsageConfig, description="Token usage tracking configuration")
     models: list[ModelConfig] = Field(default_factory=list, description="Available models")
+    default_model: str | None = Field(
+        default=None,
+        description="Default model name. Falls back to the first configured model when omitted or invalid.",
+    )
     sandbox: SandboxConfig = Field(description="Sandbox configuration")
     tools: list[ToolConfig] = Field(default_factory=list, description="Available tools")
     tool_groups: list[ToolGroupConfig] = Field(default_factory=list, description="Available tool groups")
@@ -277,6 +281,22 @@ class AppConfig(BaseModel):
             The model config if found, otherwise None.
         """
         return next((model for model in self.models if model.name == name), None)
+
+    def get_default_model_name(self) -> str:
+        """Resolve the configured default model with a backward-compatible fallback."""
+        if not self.models:
+            raise ValueError("No chat models are configured. Please configure at least one model in config.yaml.")
+
+        if self.default_model:
+            if self.get_model_config(self.default_model) is not None:
+                return self.default_model
+            logger.warning(
+                "Configured default_model '%s' was not found; falling back to the first configured model '%s'.",
+                self.default_model,
+                self.models[0].name,
+            )
+
+        return self.models[0].name
 
     def get_tool_config(self, name: str) -> ToolConfig | None:
         """Get the tool config by name.

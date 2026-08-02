@@ -40,9 +40,7 @@ def _get_runtime_config(config: RunnableConfig) -> dict:
 def _resolve_model_name(requested_model_name: str | None = None, fallback_model_name: str | None = None) -> str:
     """Resolve a runtime model name safely, falling back through agent/default config."""
     app_config = get_app_config()
-    default_model_name = app_config.models[0].name if app_config.models else None
-    if default_model_name is None:
-        raise ValueError("No chat models are configured. Please configure at least one model in config.yaml.")
+    default_model_name = app_config.get_default_model_name()
 
     if requested_model_name and app_config.get_model_config(requested_model_name):
         return requested_model_name
@@ -85,7 +83,7 @@ def _create_summarization_middleware(run_model_name: str | None = None) -> DeerF
     keep = config.keep.to_tuple()
 
     app_config = get_app_config()
-    default_model_name = app_config.models[0].name if app_config.models else None
+    default_model_name = app_config.get_default_model_name()
 
     # Resolve which model summarizes this agent's turns:
     #   1. An explicit config.model_name always wins, provided it names a
@@ -97,7 +95,7 @@ def _create_summarization_middleware(run_model_name: str | None = None) -> DeerF
     #   2. Otherwise follow the current run's model, provided it resolves to a
     #      configured model — `client.py`'s model_name may not have been
     #      validated yet, so don't trust it blindly.
-    #   3. Fall back to the default model (models[0]) if neither applies.
+    #   3. Fall back to the configured default model if neither applies.
     valid_run_model_name = run_model_name if run_model_name and app_config.get_model_config(run_model_name) else None
     if run_model_name and valid_run_model_name is None:
         logger.warning(f"Run model '{run_model_name}' not found in config; summarization falls back to the default model.")

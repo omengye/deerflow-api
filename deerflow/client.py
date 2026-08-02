@@ -292,7 +292,7 @@ class DeerFlowClient:
         cfg = config.get("configurable", {})
         app_config = get_app_config()
         requested_model_name = cfg.get("model_name")
-        model_name = requested_model_name or (app_config.models[0].name if app_config.models else None)
+        model_name = requested_model_name or app_config.get_default_model_name()
         model_config = app_config.get_model_config(model_name) if model_name else None
         memory_signature = self._get_memory_signature(self._agent_name)
         skill_catalog_version = self._get_skill_catalog_version()
