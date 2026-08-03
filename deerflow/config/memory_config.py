@@ -59,6 +59,23 @@ class MemoryConfig(BaseModel):
         le=8000,
         description="Maximum tokens to use for memory injection",
     )
+    retrieval_enabled: bool = Field(
+        default=True,
+        description="Use a local FTS5/BM25 index to inject query-relevant facts",
+    )
+    retrieval_top_k: int = Field(
+        default=12,
+        ge=1,
+        le=100,
+        description="Maximum number of relevant facts injected per model call",
+    )
+    retrieval_index_path: str = Field(
+        default="",
+        description=(
+            "Path to the SQLite FTS5 index. Empty uses "
+            "`{base_dir}/memory-fts5.sqlite3`; relative paths resolve against base_dir."
+        ),
+    )
 
 
 # Global configuration instance

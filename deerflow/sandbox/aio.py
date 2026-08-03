@@ -92,8 +92,19 @@ class AioSandbox(Sandbox):
             result = self._docker_exec(["/bin/sh", "-lc", command])
         return self._output_from_result(result)
 
-    def read_file(self, path: str) -> str:
-        result = self._docker_exec(["cat", path])
+    def read_file(
+        self,
+        path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> str:
+        if start_line is None and end_line is None:
+            argv = ["cat", path]
+        else:
+            start = max(start_line or 1, 1)
+            end = str(end_line) if end_line is not None else "$"
+            argv = ["sed", "-n", f"{start},{end}p", path]
+        result = self._docker_exec(argv)
         if result.returncode != 0:
             raise FileNotFoundError(path)
         return result.stdout
@@ -103,7 +114,7 @@ class AioSandbox(Sandbox):
 import os, sys, fnmatch
 root = os.path.realpath(sys.argv[1])
 max_depth = int(sys.argv[2])
-ignore = sys.argv[3].split("\0") if sys.argv[3] else []
+ignore = sys.argv[3].split("\x1f") if sys.argv[3] else []
 if not os.path.isdir(root):
     sys.exit(0)
 
@@ -145,9 +156,9 @@ print("\n".join(result))
 """
         from deerflow.sandbox.search import IGNORE_PATTERNS
 
-        result = self._docker_exec(["python3", "-", path, str(max_depth), "\0".join(IGNORE_PATTERNS)], input_data=script)
+        result = self._docker_exec(["python3", "-", path, str(max_depth), "\x1f".join(IGNORE_PATTERNS)], input_data=script)
         if result.returncode != 0:
-            result = self._docker_exec(["python", "-", path, str(max_depth), "\0".join(IGNORE_PATTERNS)], input_data=script)
+            result = self._docker_exec(["python", "-", path, str(max_depth), "\x1f".join(IGNORE_PATTERNS)], input_data=script)
         if result.returncode != 0 or not result.stdout:
             return []
         return [line for line in result.stdout.splitlines() if line]
@@ -182,7 +193,7 @@ root = os.path.realpath(sys.argv[1])
 pattern = sys.argv[2]
 include_dirs = sys.argv[3] == "1"
 max_results = int(sys.argv[4])
-ignore = sys.argv[5].split("\0") if sys.argv[5] else []
+ignore = sys.argv[5].split("\x1f") if sys.argv[5] else []
 if not os.path.exists(root):
     raise FileNotFoundError(root)
 if not os.path.isdir(root):
@@ -229,7 +240,7 @@ print("\n".join(out))
         from deerflow.sandbox.search import IGNORE_PATTERNS
 
         result = self._docker_exec(
-            ["python3", "-", path, pattern, "1" if include_dirs else "0", str(max_results), "\0".join(IGNORE_PATTERNS)],
+            ["python3", "-", path, pattern, "1" if include_dirs else "0", str(max_results), "\x1f".join(IGNORE_PATTERNS)],
             input_data=script,
         )
         if result.returncode != 0:
@@ -257,10 +268,11 @@ glob_pattern = sys.argv[3] or None
 literal = sys.argv[4] == "1"
 case_sensitive = sys.argv[5] == "1"
 max_results = int(sys.argv[6])
-ignore = sys.argv[7].split("\0") if sys.argv[7] else []
+ignore = sys.argv[7].split("\x1f") if sys.argv[7] else []
 if not os.path.exists(root):
     raise FileNotFoundError(root)
-if not os.path.isdir(root):
+root_is_file = os.path.isfile(root)
+if not root_is_file and not os.path.isdir(root):
     raise NotADirectoryError(root)
 
 def ignored(name):
@@ -274,40 +286,44 @@ flags = 0 if case_sensitive else re.IGNORECASE
 regex = re.compile(re.escape(source) if literal else source, flags)
 matches = []
 truncated = False
-for current, dirs, files in os.walk(root):
-    dirs[:] = [d for d in dirs if not ignored(d)]
-    rel_dir = os.path.relpath(current, root)
-    if rel_dir == ".":
-        rel_dir = ""
-    for name in files:
-        if ignored(name):
+def candidate_files():
+    if root_is_file:
+        yield root, os.path.basename(root)
+        return
+    for current, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not ignored(d)]
+        rel_dir = os.path.relpath(current, root)
+        if rel_dir == ".":
+            rel_dir = ""
+        for name in files:
+            if not ignored(name):
+                yield os.path.join(current, name), f"{rel_dir}/{name}" if rel_dir else name
+
+for full, rel in candidate_files():
+    if glob_pattern and not path_matches(glob_pattern, rel):
+        continue
+    try:
+        if (not root_is_file and os.path.islink(full)) or os.path.getsize(full) > 1000000:
             continue
-        full = os.path.join(current, name)
-        rel = f"{rel_dir}/{name}" if rel_dir else name
-        if glob_pattern and not path_matches(glob_pattern, rel):
-            continue
-        try:
-            if os.path.islink(full) or os.path.getsize(full) > 1000000:
+        with open(full, "rb") as sample:
+            if b"\0" in sample.read(8192):
                 continue
-            with open(full, "rb") as sample:
-                if b"\0" in sample.read(8192):
+        with open(full, encoding="utf-8", errors="replace") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if len(line) > 2000:
                     continue
-            with open(full, encoding="utf-8", errors="replace") as handle:
-                for line_number, line in enumerate(handle, 1):
-                    if len(line) > 2000:
-                        continue
-                    if regex.search(line):
-                        line = line.rstrip("\r\n")
-                        if len(line) > 200:
-                            line = line[:197] + "..."
-                        matches.append({"path": os.path.realpath(full), "line_number": line_number, "line": line})
-                        if len(matches) >= max_results:
-                            truncated = True
-                            raise StopIteration
-        except StopIteration:
-            break
-        except OSError:
-            continue
+                if regex.search(line):
+                    line = line.rstrip("\r\n")
+                    if len(line) > 200:
+                        line = line[:197] + "..."
+                    matches.append({"path": os.path.realpath(full), "line_number": line_number, "line": line})
+                    if len(matches) >= max_results:
+                        truncated = True
+                        raise StopIteration
+    except StopIteration:
+        break
+    except OSError:
+        continue
     if truncated:
         break
 print(json.dumps({"truncated": truncated, "matches": matches}))
@@ -324,7 +340,7 @@ print(json.dumps({"truncated": truncated, "matches": matches}))
                 "1" if literal else "0",
                 "1" if case_sensitive else "0",
                 str(max_results),
-                "\0".join(IGNORE_PATTERNS),
+                "\x1f".join(IGNORE_PATTERNS),
             ],
             input_data=script,
         )

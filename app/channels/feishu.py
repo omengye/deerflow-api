@@ -38,7 +38,7 @@ _MAX_FEISHU_FILE_BYTES = 30 * 1024 * 1024
 _FEISHU_IMAGE_EXTENSIONS = frozenset(
     {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".ico", ".tiff", ".heic"}
 )
-_VIEW_IMAGE_SUPPORTED_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+_VIEW_IMAGE_SUPPORTED_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
 
 
 @dataclass(frozen=True)
@@ -80,6 +80,8 @@ def _detect_supported_image_extension(data: bytes) -> str | None:
         return ".png"
     if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return ".webp"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
     return None
 
 
@@ -1129,7 +1131,7 @@ class FeishuChannel:
                 filename = normalize_filename(_filename_for_incoming_resource(resource, response_filename, data))
                 tmp_name = claim_unique_filename(filename, seen_names)
                 tmp_path = Path(tmpdir) / tmp_name
-                tmp_path.write_bytes(data)
+                await asyncio.to_thread(tmp_path.write_bytes, data)
                 tmp_paths.append(tmp_path)
 
             manager = get_client_manager()
@@ -1172,11 +1174,15 @@ class FeishuChannel:
         from deerflow.config.paths import get_paths
 
         sent = 0
-        paths = get_paths()
+        paths = await asyncio.to_thread(get_paths)
         for artifact in artifacts:
             try:
-                artifact_path = paths.resolve_virtual_path(thread_id, artifact)
-                if not artifact_path.is_file():
+                def resolve_file() -> Path | None:
+                    candidate = paths.resolve_virtual_path(thread_id, artifact)
+                    return candidate if candidate.is_file() else None
+
+                artifact_path = await asyncio.to_thread(resolve_file)
+                if artifact_path is None:
                     logger.warning("Skipping non-file Feishu artifact: %s", artifact)
                     continue
                 await self._send_artifact(chat_id, artifact_path)
@@ -1191,7 +1197,7 @@ class FeishuChannel:
         return sent
 
     async def _send_artifact(self, chat_id: str, artifact_path: Path) -> None:
-        size = artifact_path.stat().st_size
+        size = await asyncio.to_thread(lambda: artifact_path.stat().st_size)
         if _is_feishu_image(artifact_path) and size <= _MAX_FEISHU_IMAGE_BYTES:
             image_key = await self._upload_image(artifact_path)
             await self._send_resource_message(chat_id, "image", "image_key", image_key)
@@ -1205,8 +1211,7 @@ class FeishuChannel:
         file_key = await self._upload_file(artifact_path)
         await self._send_resource_message(chat_id, "file", "file_key", file_key)
 
-    async def _upload_image(self, path: Path) -> str:
-        """Upload an image to Feishu and return its image_key."""
+    def _upload_image_sync(self, path: Path):
         from lark_oapi.api.im.v1 import CreateImageRequest, CreateImageRequestBody
 
         with path.open("rb") as file:
@@ -1220,7 +1225,11 @@ class FeishuChannel:
                 )
                 .build()
             )
-            resp = await asyncio.to_thread(self._lark_client.im.v1.image.create, req)
+            return self._lark_client.im.v1.image.create(req)
+
+    async def _upload_image(self, path: Path) -> str:
+        """Upload an image to Feishu and return its image_key."""
+        resp = await asyncio.to_thread(self._upload_image_sync, path)
         if not resp.success():
             raise RuntimeError(f"Feishu image upload failed: code={resp.code} msg={resp.msg}")
         image_key = getattr(resp.data, "image_key", "") if resp.data else ""
@@ -1228,8 +1237,7 @@ class FeishuChannel:
             raise RuntimeError("Feishu image upload did not return image_key")
         return image_key
 
-    async def _upload_file(self, path: Path) -> str:
-        """Upload a file to Feishu and return its file_key."""
+    def _upload_file_sync(self, path: Path):
         from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
 
         with path.open("rb") as file:
@@ -1244,7 +1252,11 @@ class FeishuChannel:
                 )
                 .build()
             )
-            resp = await asyncio.to_thread(self._lark_client.im.v1.file.create, req)
+            return self._lark_client.im.v1.file.create(req)
+
+    async def _upload_file(self, path: Path) -> str:
+        """Upload a file to Feishu and return its file_key."""
+        resp = await asyncio.to_thread(self._upload_file_sync, path)
         if not resp.success():
             raise RuntimeError(f"Feishu file upload failed: code={resp.code} msg={resp.msg}")
         file_key = getattr(resp.data, "file_key", "") if resp.data else ""

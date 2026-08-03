@@ -1,7 +1,11 @@
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 from langchain_core.messages import AIMessage
 
 from deerflow.agents.middlewares.llm_error_handling_middleware import LLMErrorHandlingMiddleware
+from deerflow.agents.middlewares import llm_error_handling_middleware as llm_middleware_module
 
 
 class FakeProviderError(Exception):
@@ -206,3 +210,146 @@ def test_terminal_upstream_failure_emits_machine_readable_event(monkeypatch):
             "message": "The configured LLM provider is temporarily unavailable after multiple retries. Please wait a moment and continue the conversation.",
         }
     ]
+
+
+def _llm_test_config(*, limit: int, timeout: float = 1.0):
+    return SimpleNamespace(
+        circuit_breaker=SimpleNamespace(failure_threshold=5, recovery_timeout_sec=60),
+        llm_call=SimpleNamespace(
+            max_concurrent_calls=limit,
+            queue_timeout_seconds=timeout,
+            retry_max_attempts=3,
+            retry_base_delay_ms=0,
+            retry_cap_delay_ms=0,
+            burst_retry_base_delay_ms=0,
+        ),
+    )
+
+
+@pytest.fixture
+def reset_process_limiter():
+    llm_middleware_module._reset_process_limiter_for_tests()
+    try:
+        yield
+    finally:
+        llm_middleware_module._reset_process_limiter_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_process_wide_limiter_bounds_async_model_calls(monkeypatch, reset_process_limiter):
+    monkeypatch.setattr(llm_middleware_module, "get_app_config", lambda: _llm_test_config(limit=2))
+    middleware = LLMErrorHandlingMiddleware()
+    in_flight = 0
+    peak = 0
+    counter_lock = asyncio.Lock()
+
+    async def handler(_request):
+        nonlocal in_flight, peak
+        async with counter_lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        await asyncio.sleep(0.02)
+        async with counter_lock:
+            in_flight -= 1
+        return AIMessage(content="ok")
+
+    results = await asyncio.gather(
+        *(middleware.awrap_model_call(None, handler) for _ in range(8))
+    )
+
+    assert peak == 2
+    assert all(result.content == "ok" for result in results)
+    assert llm_middleware_module._PROCESS_LIMITER.in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_limiter_queue_timeout_returns_visible_failure(monkeypatch, reset_process_limiter):
+    monkeypatch.setattr(
+        llm_middleware_module,
+        "get_app_config",
+        lambda: _llm_test_config(limit=1, timeout=0.02),
+    )
+    middleware = LLMErrorHandlingMiddleware()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_handler(_request):
+        entered.set()
+        await release.wait()
+        return AIMessage(content="first")
+
+    first = asyncio.create_task(middleware.awrap_model_call(None, blocking_handler))
+    await entered.wait()
+    second = await middleware.awrap_model_call(None, blocking_handler)
+    release.set()
+    await first
+
+    assert "maximum number of model calls" in second.content
+    assert llm_middleware_module._PROCESS_LIMITER.in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_does_not_leak_process_wide_permit(reset_process_limiter):
+    limiter = llm_middleware_module._ProcessWideLimiter(1)
+    await limiter.acquire_async()
+    waiter = asyncio.create_task(limiter.acquire_async())
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    limiter.release()
+
+    assert limiter.in_flight == 0
+    assert limiter.queued == 0
+
+
+@pytest.mark.asyncio
+async def test_nested_model_call_reuses_same_task_slot(monkeypatch, reset_process_limiter):
+    monkeypatch.setattr(
+        llm_middleware_module,
+        "get_app_config",
+        lambda: _llm_test_config(limit=1, timeout=0.05),
+    )
+    middleware = LLMErrorHandlingMiddleware()
+
+    async def handler(_request):
+        async with llm_middleware_module.llm_call_slot_async():
+            return AIMessage(content="nested")
+
+    response = await middleware.awrap_model_call(None, handler)
+
+    assert response.content == "nested"
+    assert llm_middleware_module._PROCESS_LIMITER.in_flight == 0
+
+
+def test_retry_after_is_bounded_by_configured_cap(monkeypatch, reset_process_limiter):
+    monkeypatch.setattr(llm_middleware_module, "get_app_config", lambda: _llm_test_config(limit=0))
+    middleware = LLMErrorHandlingMiddleware()
+    error = RuntimeError("busy")
+    error.response = SimpleNamespace(headers={"retry-after": "3600"})
+
+    assert middleware._build_retry_delay_ms(1, error) == middleware.retry_cap_delay_ms
+
+
+def test_burst_rate_429_has_tight_retry_budget(monkeypatch, reset_process_limiter):
+    monkeypatch.setattr(llm_middleware_module, "get_app_config", lambda: _llm_test_config(limit=0))
+    middleware = LLMErrorHandlingMiddleware()
+    calls = 0
+
+    class BurstRateError(Exception):
+        status_code = 429
+        code = "limit_burst_rate"
+
+        def __str__(self):
+            return "limit_burst_rate: request rate increased too quickly"
+
+    def handler(_request):
+        nonlocal calls
+        calls += 1
+        raise BurstRateError()
+
+    response = middleware.wrap_model_call(None, handler)
+
+    assert calls == 2
+    assert "temporarily throttling requests" in response.content
+    assert middleware._circuit_failure_count == 0

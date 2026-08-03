@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator, Iterable
 import asyncio
 from concurrent.futures import Future
 import json
+import threading
 from types import SimpleNamespace
 from typing import Any, override
 import unittest
@@ -203,6 +204,29 @@ def _proposal(*, status: str = "pending_review", proposal_id: str = "p_test") ->
 
 
 class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_attachment_upload_helpers_run_off_event_loop(self) -> None:
+        channel = FeishuChannel(app_id="app", app_secret="secret")
+        loop_thread = threading.get_ident()
+        worker_threads: list[int] = []
+
+        def image_upload(_path):
+            worker_threads.append(threading.get_ident())
+            return SimpleNamespace(success=lambda: True, data=SimpleNamespace(image_key="image-key"))
+
+        def file_upload(_path):
+            worker_threads.append(threading.get_ident())
+            return SimpleNamespace(success=lambda: True, data=SimpleNamespace(file_key="file-key"))
+
+        with (
+            patch.object(channel, "_upload_image_sync", side_effect=image_upload),
+            patch.object(channel, "_upload_file_sync", side_effect=file_upload),
+        ):
+            self.assertEqual(await channel._upload_image(SimpleNamespace()), "image-key")
+            self.assertEqual(await channel._upload_file(SimpleNamespace()), "file-key")
+
+        self.assertEqual(len(worker_threads), 2)
+        self.assertTrue(all(thread_id != loop_thread for thread_id in worker_threads))
+
     async def test_render_run_to_chat_consumes_stream_bridge_events(self) -> None:
         stream_bridge = MemoryStreamBridge(queue_maxsize=32)
         await stream_bridge.publish("run-1", "metadata", {"run_id": "run-1", "thread_id": "thread-1"})

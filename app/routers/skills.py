@@ -1,4 +1,5 @@
 """Skill management endpoints."""
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
@@ -45,7 +46,7 @@ async def enable_skill(skill_name: str):
     client = manager.get_client()
 
     try:
-        client.update_skill(skill_name, enabled=True)
+        await asyncio.to_thread(client.update_skill, skill_name, enabled=True)
         return {"success": True, "message": f"Skill '{skill_name}' enabled"}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -61,7 +62,7 @@ async def disable_skill(skill_name: str):
     client = manager.get_client()
 
     try:
-        client.update_skill(skill_name, enabled=False)
+        await asyncio.to_thread(client.update_skill, skill_name, enabled=False)
         return {"success": True, "message": f"Skill '{skill_name}' disabled"}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

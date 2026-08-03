@@ -178,10 +178,13 @@ class SkillCandidateGenerator:
                 thinking_enabled=False,
                 disable_keepalive=True,
             )
-            response = await model.ainvoke(
-                [{"role": "system", "content": rubric}, {"role": "user", "content": prompt}],
-                config={"run_name": "skill_evolution_generator"},
-            )
+            from deerflow.agents.middlewares.llm_error_handling_middleware import llm_call_slot_async
+
+            async with llm_call_slot_async():
+                response = await model.ainvoke(
+                    [{"role": "system", "content": rubric}, {"role": "user", "content": prompt}],
+                    config={"run_name": "skill_evolution_generator"},
+                )
             parsed = extract_json_object(str(getattr(response, "content", "") or ""))
             if parsed is None:
                 raise ValueError("Candidate generator returned malformed JSON.")

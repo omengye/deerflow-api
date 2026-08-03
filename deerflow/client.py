@@ -42,7 +42,14 @@ from deerflow.agents.lead_agent.prompt import apply_prompt_template
 from deerflow.agents.thread_state import AgentContext, ThreadState
 from deerflow.config.agents_config import AGENT_NAME_PATTERN
 from deerflow.config.app_config import get_app_config, reload_app_config
-from deerflow.config.extensions_config import ExtensionsConfig, SkillStateConfig, get_extensions_config, reload_extensions_config
+from deerflow.config.extensions_config import (
+    ExtensionsConfig,
+    get_extensions_config,
+    get_extensions_config_lock,
+    load_extensions_config_data,
+    reload_extensions_config,
+    write_extensions_config_data,
+)
 from deerflow.config.paths import get_paths
 from deerflow.models import create_chat_model
 from deerflow.skills.installer import install_skill_from_archive
@@ -1114,18 +1121,14 @@ class DeerFlowClient:
         if config_path is None:
             raise FileNotFoundError("Cannot locate extensions_config.json. Set DEER_FLOW_EXTENSIONS_CONFIG_PATH or ensure it exists in the project root.")
 
-        current_config = get_extensions_config()
+        with get_extensions_config_lock():
+            config_data = load_extensions_config_data(config_path)
+            config_data["mcpServers"] = mcp_servers
+            write_extensions_config_data(config_path, config_data)
 
-        config_data = {
-            "mcpServers": mcp_servers,
-            "skills": {name: {"enabled": skill.enabled} for name, skill in current_config.skills.items()},
-        }
-
-        self._atomic_write_json(config_path, config_data)
-
-        self._agent = None
-        self._agent_config_key = None
-        reloaded = reload_extensions_config()
+            self._agent = None
+            self._agent_config_key = None
+            reloaded = reload_extensions_config()
         try:
             from deerflow.mcp.cache import reset_mcp_tools_cache
 
@@ -1185,19 +1188,20 @@ class DeerFlowClient:
         if config_path is None:
             raise FileNotFoundError("Cannot locate extensions_config.json. Set DEER_FLOW_EXTENSIONS_CONFIG_PATH or ensure it exists in the project root.")
 
-        extensions_config = get_extensions_config()
-        extensions_config.skills[name] = SkillStateConfig(enabled=enabled)
+        with get_extensions_config_lock():
+            config_data = load_extensions_config_data(config_path)
+            raw_skills = config_data.setdefault("skills", {})
+            if not isinstance(raw_skills, dict):
+                raise ValueError("extensions skills must be a JSON object")
+            raw_skill = raw_skills.get(name)
+            skill_data = dict(raw_skill) if isinstance(raw_skill, dict) else {}
+            skill_data["enabled"] = enabled
+            raw_skills[name] = skill_data
+            write_extensions_config_data(config_path, config_data)
 
-        config_data = {
-            "mcpServers": {n: s.model_dump() for n, s in extensions_config.mcp_servers.items()},
-            "skills": {n: {"enabled": sc.enabled} for n, sc in extensions_config.skills.items()},
-        }
-
-        self._atomic_write_json(config_path, config_data)
-
-        self._agent = None
-        self._agent_config_key = None
-        reload_extensions_config()
+            self._agent = None
+            self._agent_config_key = None
+            reload_extensions_config()
         try:
             from deerflow.agents.lead_agent.prompt import clear_skills_system_prompt_cache
             from deerflow.skills.evolution import get_evolution_store

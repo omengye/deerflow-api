@@ -27,6 +27,8 @@ api:
   # a no-argument constructor — appended to the lead agent's middleware chain
   # after the built-in middlewares and before ClarificationMiddleware.
   # Example: "middlewares": ["my_package.middlewares:MyAuditMiddleware"]
+  # MCP entries in that file accept "tool_name_prefix": true (default).
+  # Set it false only when the server already exposes globally unique names.
   extensions_config_path: null
   cors_allow_origins:
     - http://localhost:3000
@@ -96,6 +98,9 @@ models:
   # skipped/warned-and-degraded at run time) for models that don't declare
   # support; (2) the actual on/off switch is `thinking_enabled` (top-level
   # runtime setting, or a per-agent override under `subagents:`).
+  # `deerflow.models.vllm_provider:VllmChatModel` also accepts
+  # `cumulative_stream_usage: true` when its vLLM endpoint reports cumulative
+  # token snapshots on every streaming chunk.
   - name: qwen3.6-plus
     display_name: Qwen 3.6 Plus
     use: langchain_openai:ChatOpenAI
@@ -232,6 +237,21 @@ memory:
   debounce_seconds: 30
   injection_enabled: true
   max_injection_tokens: 2000
+  # Query-relevant fact retrieval backed by a rebuildable SQLite FTS5 index.
+  retrieval_enabled: true
+  retrieval_top_k: 12
+  # retrieval_index_path: memory-fts5.sqlite3
+
+# Process-wide model-call shaping. The cap is shared by lead agents,
+# subagents, summarization, title generation, and memory extraction.
+llm_call:
+  max_concurrent_calls: 8
+  queue_timeout_seconds: 60
+  retry_max_attempts: 3
+  retry_base_delay_ms: 1000
+  retry_cap_delay_ms: 8000
+  # Burst/slope 429s receive only one retry using this longer base.
+  burst_retry_base_delay_ms: 5000
 
 subagents:
   enabled: true

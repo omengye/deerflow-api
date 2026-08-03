@@ -122,3 +122,19 @@ def test_view_image_tool_persists_metadata_without_base64(tmp_path: Path) -> Non
     assert command.update["viewed_images"] == {
         IMAGE_PATH: {"mime_type": "image/png"},
     }
+
+
+def test_view_image_tool_accepts_gif87a_and_gif89a(tmp_path: Path) -> None:
+    for index, header in enumerate((b"GIF87a", b"GIF89a"), start=1):
+        filename = f"animation-{index}.gif"
+        virtual_path = f"/mnt/user-data/uploads/{filename}"
+        tmp_path.joinpath(filename).write_bytes(header + b"minimal-gif-payload")
+        runtime = SimpleNamespace(state={"thread_data": {"uploads_path": str(tmp_path)}})
+
+        command = view_image_tool.func(
+            runtime=runtime,
+            image_path=virtual_path,
+            tool_call_id=f"call-gif-{index}",
+        )
+
+        assert command.update["viewed_images"] == {virtual_path: {"mime_type": "image/gif"}}

@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import threading
 from datetime import datetime
@@ -567,6 +568,24 @@ def _get_memory_context(agent_name: str | None = None) -> str:
             return ""
 
         memory_data = get_memory_data(agent_name)
+        # Query-relevant facts are injected transiently by MemoryMiddleware.
+        # Keep stable profile/history summaries in the base prompt, but avoid
+        # duplicating every fact in every model call when retrieval is enabled.
+        if config.retrieval_enabled:
+            memory_data = {**memory_data, "facts": []}
+        # Escape stored text before token budgeting so a malicious tag cannot
+        # close the prompt boundary and entity expansion cannot exceed the
+        # configured injection budget after formatting.
+        def escape_prompt_value(value):
+            if isinstance(value, str):
+                return html.escape(value, quote=False)
+            if isinstance(value, dict):
+                return {key: escape_prompt_value(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [escape_prompt_value(item) for item in value]
+            return value
+
+        memory_data = escape_prompt_value(memory_data)
         memory_content = format_memory_for_injection(memory_data, max_tokens=config.max_injection_tokens)
 
         if not memory_content.strip():

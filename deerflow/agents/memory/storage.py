@@ -1,10 +1,12 @@
 """Memory storage providers."""
 
 import abc
+import copy
 import json
 import logging
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -58,6 +60,23 @@ class MemoryStorage(abc.ABC):
         """Save memory data for the given agent."""
         pass
 
+    def mutate(
+        self,
+        mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
+        agent_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Apply a read-modify-write operation.
+
+        Custom providers may override this with a transactional/CAS operation.
+        The default preserves compatibility but cannot promise cross-process
+        atomicity.
+        """
+        current = copy.deepcopy(self.reload(agent_name))
+        updated = mutator(current)
+        if updated is None or not self.save(updated, agent_name):
+            return None
+        return updated
+
 
 class FileMemoryStorage(MemoryStorage):
     """File-based memory storage provider."""
@@ -69,6 +88,9 @@ class FileMemoryStorage(MemoryStorage):
         self._memory_cache: dict[str | None, tuple[dict[str, Any], float | None]] = {}
         # Guards all reads and writes to _memory_cache across concurrent callers.
         self._cache_lock = threading.Lock()
+        # Covers the complete read-modify-write critical section. RLock permits
+        # mutate() to call the private save helper without deadlocking.
+        self._mutation_lock = threading.RLock()
 
     def _validate_agent_name(self, agent_name: str) -> None:
         """Validate that the agent name is safe to use in filesystem paths.
@@ -143,8 +165,8 @@ class FileMemoryStorage(MemoryStorage):
             self._memory_cache[agent_name] = (memory_data, mtime)
         return memory_data
 
-    def save(self, memory_data: dict[str, Any], agent_name: str | None = None) -> bool:
-        """Save memory data to file and update cache."""
+    def _save_unlocked(self, memory_data: dict[str, Any], agent_name: str | None = None) -> bool:
+        """Save memory data while ``_mutation_lock`` is already held."""
         file_path = self._get_memory_file_path(agent_name)
 
         try:
@@ -167,11 +189,37 @@ class FileMemoryStorage(MemoryStorage):
 
             with self._cache_lock:
                 self._memory_cache[agent_name] = (memory_data, mtime)
+            try:
+                from deerflow.agents.memory.retrieval import rebuild_memory_index
+
+                rebuild_memory_index(memory_data, agent_name)
+            except Exception:
+                # The JSON document is authoritative. Index failure is a
+                # recoverable performance degradation and must not fail save.
+                logger.warning("Failed to update memory retrieval index", exc_info=True)
             logger.info("Memory saved to %s", file_path)
             return True
         except OSError as e:
             logger.error("Failed to save memory file: %s", e)
             return False
+
+    def save(self, memory_data: dict[str, Any], agent_name: str | None = None) -> bool:
+        """Save memory data to file and update cache."""
+        with self._mutation_lock:
+            return self._save_unlocked(memory_data, agent_name)
+
+    def mutate(
+        self,
+        mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
+        agent_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically apply one in-process read-modify-write operation."""
+        with self._mutation_lock:
+            current = copy.deepcopy(self._load_memory_from_file(agent_name))
+            updated = mutator(current)
+            if updated is None or not self._save_unlocked(updated, agent_name):
+                return None
+            return updated
 
 
 _storage_instance: MemoryStorage | None = None

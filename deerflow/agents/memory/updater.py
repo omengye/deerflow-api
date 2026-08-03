@@ -9,7 +9,7 @@ import logging
 import math
 import re
 import uuid
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from deerflow.agents.memory.prompt import (
@@ -48,6 +48,25 @@ def get_memory_data(agent_name: str | None = None) -> dict[str, Any]:
     return get_memory_storage().load(agent_name)
 
 
+def _mutate_memory(
+    mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
+    agent_name: str | None = None,
+) -> dict[str, Any] | None:
+    """Run a storage-provider read-modify-write operation."""
+    storage = get_memory_storage()
+    mutate = getattr(storage, "mutate", None)
+    if callable(mutate):
+        return mutate(mutator, agent_name)
+    # Backward compatibility for duck-typed/custom providers written before
+    # MemoryStorage.mutate was introduced. Such providers should implement it
+    # to obtain transactional guarantees.
+    current = copy.deepcopy(storage.reload(agent_name))
+    updated = mutator(current)
+    if updated is None or not storage.save(updated, agent_name):
+        return None
+    return updated
+
+
 def reload_memory_data(agent_name: str | None = None) -> dict[str, Any]:
     """Reload memory data via storage provider."""
     return get_memory_storage().reload(agent_name)
@@ -66,18 +85,20 @@ def import_memory_data(memory_data: dict[str, Any], agent_name: str | None = Non
     Raises:
         OSError: If persisting the imported memory fails.
     """
-    storage = get_memory_storage()
-    if not storage.save(memory_data, agent_name):
+    imported = copy.deepcopy(memory_data)
+    result = _mutate_memory(lambda _current: copy.deepcopy(imported), agent_name)
+    if result is None:
         raise OSError("Failed to save imported memory data")
-    return storage.load(agent_name)
+    return get_memory_storage().load(agent_name)
 
 
 def clear_memory_data(agent_name: str | None = None) -> dict[str, Any]:
     """Clear all stored memory data and persist an empty structure."""
     cleared_memory = create_empty_memory()
-    if not _save_memory_to_file(cleared_memory, agent_name):
+    result = _mutate_memory(lambda _current: copy.deepcopy(cleared_memory), agent_name)
+    if result is None:
         raise OSError("Failed to save cleared memory data")
-    return cleared_memory
+    return result
 
 
 def _validate_confidence(confidence: float) -> float:
@@ -85,6 +106,78 @@ def _validate_confidence(confidence: float) -> float:
     if not math.isfinite(confidence) or confidence < 0 or confidence > 1:
         raise ValueError("confidence")
     return confidence
+
+
+_FACT_CLASSIFICATION_FIELDS = ("scope", "durability", "authority")
+_TASK_LOCAL_CONTENT_RE = re.compile(
+    r"(?:\b(?:this|current)\s+(?:task|thread|project|repository|repo|pr|commit|file|workspace)\b|"
+    r"\b(?:for|in)\s+this\s+(?:task|thread|project|repository|repo|pr)\b|"
+    r"(?:当前|本次|这次|这个)(?:任务|线程|项目|仓库|文件|提交|PR|工作区))",
+    re.IGNORECASE,
+)
+_TRANSACTIONAL_CONTENT_RE = re.compile(
+    r"(?:\b(?:authori[sz]e[sd]?|allow(?:ed)?|permit(?:ted)?)\b.{0,40}"
+    r"\b(?:edit|delete|remove|push|publish|deploy|close|merge|force[- ]?push)\b|"
+    r"(?:授权|允许|准许|同意).{0,20}(?:编辑|修改|删除|移除|推送|发布|部署|关闭|合并|强推))",
+    re.IGNORECASE,
+)
+_EPHEMERAL_PATH_RE = re.compile(
+    r"(?:/mnt/(?:user-data|data)/|(?:[A-Za-z]:[\\/])|(?:^|\s)/(?:tmp|var/tmp)/|"
+    r"\b[0-9a-f]{7,40}\b)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_gate_label(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def _content_scope_gate_reason(content: Any) -> str | None:
+    """Reject strong task-local or transactional content even if mislabeled."""
+    if not isinstance(content, str) or not content.strip():
+        return "missing"
+    if _TRANSACTIONAL_CONTENT_RE.search(content):
+        return "authority"
+    if _TASK_LOCAL_CONTENT_RE.search(content) or _EPHEMERAL_PATH_RE.search(content):
+        return "scope"
+    return None
+
+
+def _fact_scope_gate_reason(fact: dict[str, Any]) -> str | None:
+    if any(_normalize_gate_label(fact.get(field)) is None for field in _FACT_CLASSIFICATION_FIELDS):
+        return "missing"
+    if _normalize_gate_label(fact.get("scope")) != "user":
+        return "scope"
+    if _normalize_gate_label(fact.get("durability")) != "durable":
+        return "durability"
+    if _normalize_gate_label(fact.get("authority")) != "descriptive":
+        return "authority"
+    return _content_scope_gate_reason(fact.get("content"))
+
+
+def _summary_scope_gate_reason(section_data: dict[str, Any]) -> str | None:
+    scope = _normalize_gate_label(section_data.get("scope"))
+    authority = _normalize_gate_label(section_data.get("authority"))
+    if scope is None or authority is None:
+        return "missing"
+    if scope != "user":
+        return "scope"
+    if authority != "descriptive":
+        return "authority"
+    return _content_scope_gate_reason(section_data.get("summary"))
+
+
+def _removal_scope_gate_reason(removal: dict[str, Any]) -> str | None:
+    scope = _normalize_gate_label(removal.get("scope"))
+    reason = removal.get("reason")
+    if scope is None or not isinstance(reason, str) or not reason.strip():
+        return "missing"
+    if scope != "user":
+        return "scope"
+    return _content_scope_gate_reason(reason)
 
 
 def create_memory_fact(
@@ -100,42 +193,45 @@ def create_memory_fact(
 
     normalized_category = category.strip() or "context"
     validated_confidence = _validate_confidence(confidence)
-    now = utc_now_iso_z()
-    memory_data = get_memory_data(agent_name)
-    updated_memory = dict(memory_data)
-    facts = list(memory_data.get("facts", []))
-    facts.append(
-        {
-            "id": f"fact_{uuid.uuid4().hex[:8]}",
-            "content": normalized_content,
-            "category": normalized_category,
-            "confidence": validated_confidence,
-            "createdAt": now,
-            "source": "manual",
-        }
-    )
-    updated_memory["facts"] = facts
+    content_key = _fact_content_key(normalized_content)
 
-    if not _save_memory_to_file(updated_memory, agent_name):
+    def mutate(memory_data: dict[str, Any]) -> dict[str, Any]:
+        facts = list(memory_data.get("facts", []))
+        existing_keys = {_fact_content_key(fact.get("content")) for fact in facts if isinstance(fact, dict)}
+        if content_key in existing_keys:
+            raise ValueError("duplicate content")
+        facts.append(
+            {
+                "id": f"fact_{uuid.uuid4().hex[:8]}",
+                "content": normalized_content,
+                "category": normalized_category,
+                "confidence": validated_confidence,
+                "createdAt": utc_now_iso_z(),
+                "source": "manual",
+            }
+        )
+        memory_data["facts"] = facts
+        return memory_data
+
+    updated_memory = _mutate_memory(mutate, agent_name)
+    if updated_memory is None:
         raise OSError("Failed to save memory data after creating fact")
-
     return updated_memory
 
 
 def delete_memory_fact(fact_id: str, agent_name: str | None = None) -> dict[str, Any]:
     """Delete a fact by its id and persist the updated memory data."""
-    memory_data = get_memory_data(agent_name)
-    facts = memory_data.get("facts", [])
-    updated_facts = [fact for fact in facts if fact.get("id") != fact_id]
-    if len(updated_facts) == len(facts):
-        raise KeyError(fact_id)
+    def mutate(memory_data: dict[str, Any]) -> dict[str, Any]:
+        facts = memory_data.get("facts", [])
+        updated_facts = [fact for fact in facts if fact.get("id") != fact_id]
+        if len(updated_facts) == len(facts):
+            raise KeyError(fact_id)
+        memory_data["facts"] = updated_facts
+        return memory_data
 
-    updated_memory = dict(memory_data)
-    updated_memory["facts"] = updated_facts
-
-    if not _save_memory_to_file(updated_memory, agent_name):
+    updated_memory = _mutate_memory(mutate, agent_name)
+    if updated_memory is None:
         raise OSError(f"Failed to save memory data after deleting fact '{fact_id}'")
-
     return updated_memory
 
 
@@ -147,36 +243,45 @@ def update_memory_fact(
     agent_name: str | None = None,
 ) -> dict[str, Any]:
     """Update an existing fact and persist the updated memory data."""
-    memory_data = get_memory_data(agent_name)
-    updated_memory = dict(memory_data)
-    updated_facts: list[dict[str, Any]] = []
-    found = False
+    def mutate(memory_data: dict[str, Any]) -> dict[str, Any]:
+        updated_facts: list[dict[str, Any]] = []
+        found = False
+        replacement_key: str | None = None
+        if content is not None:
+            normalized_content = content.strip()
+            if not normalized_content:
+                raise ValueError("content")
+            replacement_key = _fact_content_key(normalized_content)
+            duplicate = any(
+                fact.get("id") != fact_id and _fact_content_key(fact.get("content")) == replacement_key
+                for fact in memory_data.get("facts", [])
+                if isinstance(fact, dict)
+            )
+            if duplicate:
+                raise ValueError("duplicate content")
 
-    for fact in memory_data.get("facts", []):
-        if fact.get("id") == fact_id:
-            found = True
-            updated_fact = dict(fact)
-            if content is not None:
-                normalized_content = content.strip()
-                if not normalized_content:
-                    raise ValueError("content")
-                updated_fact["content"] = normalized_content
-            if category is not None:
-                updated_fact["category"] = category.strip() or "context"
-            if confidence is not None:
-                updated_fact["confidence"] = _validate_confidence(confidence)
-            updated_facts.append(updated_fact)
-        else:
-            updated_facts.append(fact)
+        for fact in memory_data.get("facts", []):
+            if fact.get("id") == fact_id:
+                found = True
+                updated_fact = dict(fact)
+                if content is not None:
+                    updated_fact["content"] = content.strip()
+                if category is not None:
+                    updated_fact["category"] = category.strip() or "context"
+                if confidence is not None:
+                    updated_fact["confidence"] = _validate_confidence(confidence)
+                updated_facts.append(updated_fact)
+            else:
+                updated_facts.append(fact)
 
-    if not found:
-        raise KeyError(fact_id)
+        if not found:
+            raise KeyError(fact_id)
+        memory_data["facts"] = updated_facts
+        return memory_data
 
-    updated_memory["facts"] = updated_facts
-
-    if not _save_memory_to_file(updated_memory, agent_name):
+    updated_memory = _mutate_memory(mutate, agent_name)
+    if updated_memory is None:
         raise OSError(f"Failed to save memory data after updating fact '{fact_id}'")
-
     return updated_memory
 
 
@@ -293,7 +398,7 @@ def _fact_content_key(content: Any) -> str | None:
     stripped = content.strip()
     if not stripped:
         return None
-    return stripped.casefold()
+    return " ".join(stripped.casefold().split())
 
 
 def _parse_json_with_repair(text: str) -> dict[str, Any]:
@@ -403,15 +508,15 @@ class MemoryUpdater:
             response_text = "\n".join(lines[1:-1] if last_line == "```" else lines[1:]).strip()
 
         update_data = _parse_json_with_repair(response_text)
-        # Reload after the LLM call so we apply the generated patch to the
-        # freshest memory state. The model may have spent seconds generating;
-        # meanwhile manual edits or another worker may have persisted changes.
-        latest_memory = get_memory_storage().reload(agent_name)
-        # Deep-copy before in-place mutation so a subsequent save() failure
-        # cannot corrupt the still-cached original object reference.
-        updated_memory = self._apply_updates(copy.deepcopy(latest_memory), update_data, thread_id)
-        updated_memory = _strip_upload_mentions_from_memory(updated_memory)
-        return get_memory_storage().save(updated_memory, agent_name)
+
+        def mutate(latest_memory: dict[str, Any]) -> dict[str, Any]:
+            updated_memory = self._apply_updates(latest_memory, update_data, thread_id)
+            return _strip_upload_mentions_from_memory(updated_memory)
+
+        # Apply the LLM patch to a fresh snapshot inside the provider's complete
+        # read-modify-write critical section. The model may have spent seconds
+        # generating while manual edits or another worker persisted changes.
+        return _mutate_memory(mutate, agent_name) is not None
 
     async def aupdate_memory(
         self,
@@ -436,7 +541,10 @@ class MemoryUpdater:
 
             current_memory, prompt = prepared
             model = self._get_model()
-            response = await model.ainvoke(prompt, config={"run_name": "memory_agent"})
+            from deerflow.agents.middlewares.llm_error_handling_middleware import llm_call_slot_async
+
+            async with llm_call_slot_async():
+                response = await model.ainvoke(prompt, config={"run_name": "memory_agent"})
             return await asyncio.to_thread(
                 self._finalize_update,
                 response_content=response.content,
@@ -504,12 +612,24 @@ class MemoryUpdater:
         """
         config = get_memory_config()
         now = utc_now_iso_z()
+        gate_rejections: dict[str, int] = {}
+
+        def reject(reason: str) -> None:
+            gate_rejections[reason] = gate_rejections.get(reason, 0) + 1
 
         # Update user sections
         user_updates = update_data.get("user", {})
+        if not isinstance(user_updates, dict):
+            user_updates = {}
         for section in ["workContext", "personalContext", "topOfMind"]:
             section_data = user_updates.get(section, {})
+            if not isinstance(section_data, dict):
+                continue
             if section_data.get("shouldUpdate") and section_data.get("summary"):
+                rejection_reason = _summary_scope_gate_reason(section_data)
+                if rejection_reason is not None:
+                    reject(f"summary_{rejection_reason}")
+                    continue
                 current_memory["user"][section] = {
                     "summary": section_data["summary"],
                     "updatedAt": now,
@@ -517,49 +637,95 @@ class MemoryUpdater:
 
         # Update history sections
         history_updates = update_data.get("history", {})
+        if not isinstance(history_updates, dict):
+            history_updates = {}
         for section in ["recentMonths", "earlierContext", "longTermBackground"]:
             section_data = history_updates.get(section, {})
+            if not isinstance(section_data, dict):
+                continue
             if section_data.get("shouldUpdate") and section_data.get("summary"):
+                rejection_reason = _summary_scope_gate_reason(section_data)
+                if rejection_reason is not None:
+                    reject(f"summary_{rejection_reason}")
+                    continue
                 current_memory["history"][section] = {
                     "summary": section_data["summary"],
                     "updatedAt": now,
                 }
 
         # Remove facts
-        facts_to_remove = set(update_data.get("factsToRemove", []))
+        facts_to_remove: set[str] = set()
+        raw_removals = update_data.get("factsToRemove", [])
+        if isinstance(raw_removals, list):
+            for removal in raw_removals:
+                # Legacy string removals deliberately fail closed because they
+                # carry no user-level scope or contradiction reason.
+                if not isinstance(removal, dict):
+                    reject("removal_missing")
+                    continue
+                fact_id = removal.get("id")
+                rejection_reason = _removal_scope_gate_reason(removal)
+                if not isinstance(fact_id, str) or not fact_id.strip():
+                    rejection_reason = rejection_reason or "missing"
+                if rejection_reason is not None:
+                    reject(f"removal_{rejection_reason}")
+                    continue
+                facts_to_remove.add(fact_id.strip())
         if facts_to_remove:
             current_memory["facts"] = [f for f in current_memory.get("facts", []) if f.get("id") not in facts_to_remove]
 
         # Add new facts
+        current_memory.setdefault("facts", [])
         existing_fact_keys = {fact_key for fact_key in (_fact_content_key(fact.get("content")) for fact in current_memory.get("facts", [])) if fact_key is not None}
         new_facts = update_data.get("newFacts", [])
+        if not isinstance(new_facts, list):
+            new_facts = []
         for fact in new_facts:
+            if not isinstance(fact, dict):
+                reject("fact_missing")
+                continue
+            rejection_reason = _fact_scope_gate_reason(fact)
+            if rejection_reason is not None:
+                reject(f"fact_{rejection_reason}")
+                continue
             confidence = fact.get("confidence", 0.5)
-            if confidence >= config.fact_confidence_threshold:
-                raw_content = fact.get("content", "")
-                if not isinstance(raw_content, str):
-                    continue
-                normalized_content = raw_content.strip()
-                fact_key = _fact_content_key(normalized_content)
-                if fact_key is not None and fact_key in existing_fact_keys:
-                    continue
+            if isinstance(confidence, bool):
+                reject("fact_confidence")
+                continue
+            try:
+                confidence = float(confidence)
+            except (TypeError, ValueError):
+                reject("fact_confidence")
+                continue
+            if not math.isfinite(confidence) or confidence < config.fact_confidence_threshold:
+                continue
+            raw_content = fact.get("content", "")
+            if not isinstance(raw_content, str) or not raw_content.strip():
+                reject("fact_missing")
+                continue
+            normalized_content = raw_content.strip()
+            fact_key = _fact_content_key(normalized_content)
+            if fact_key is not None and fact_key in existing_fact_keys:
+                continue
 
-                fact_entry = {
-                    "id": f"fact_{uuid.uuid4().hex[:8]}",
-                    "content": normalized_content,
-                    "category": fact.get("category", "context"),
-                    "confidence": confidence,
-                    "createdAt": now,
-                    "source": thread_id or "unknown",
-                }
-                source_error = fact.get("sourceError")
-                if isinstance(source_error, str):
-                    normalized_source_error = source_error.strip()
-                    if normalized_source_error:
-                        fact_entry["sourceError"] = normalized_source_error
-                current_memory["facts"].append(fact_entry)
-                if fact_key is not None:
-                    existing_fact_keys.add(fact_key)
+            category = fact.get("category", "context")
+            normalized_category = category.strip() if isinstance(category, str) and category.strip() else "context"
+            fact_entry = {
+                "id": f"fact_{uuid.uuid4().hex[:8]}",
+                "content": normalized_content,
+                "category": normalized_category,
+                "confidence": confidence,
+                "createdAt": now,
+                "source": thread_id or "unknown",
+            }
+            source_error = fact.get("sourceError")
+            if isinstance(source_error, str):
+                normalized_source_error = source_error.strip()
+                if normalized_source_error:
+                    fact_entry["sourceError"] = normalized_source_error
+            current_memory["facts"].append(fact_entry)
+            if fact_key is not None:
+                existing_fact_keys.add(fact_key)
 
         # Enforce max facts limit
         if len(current_memory["facts"]) > config.max_facts:
@@ -570,6 +736,8 @@ class MemoryUpdater:
                 reverse=True,
             )[: config.max_facts]
 
+        if gate_rejections:
+            logger.info("Rejected out-of-scope memory updates: %s", gate_rejections)
         return current_memory
 
 

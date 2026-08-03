@@ -2,9 +2,10 @@
 
 import json
 import logging
+import re
 from collections.abc import Callable
 from hashlib import sha256
-from typing import override
+from typing import Any, override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
@@ -14,6 +15,8 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
 logger = logging.getLogger(__name__)
+
+_XML_TAG_RE = re.compile(r"</?[A-Za-z_][\w:.-]*(?:\s[^<>]*?)?\s*/?>")
 
 
 class ClarificationMiddlewareState(AgentState):
@@ -55,6 +58,47 @@ class ClarificationMiddleware(AgentMiddleware[ClarificationMiddlewareState]):
         """
         return any("\u4e00" <= char <= "\u9fff" for char in text)
 
+    @staticmethod
+    def _flatten_dict_option_values(value: dict[str, Any]) -> list[str | int | float]:
+        """Flatten scalar leaves from XML-to-dict payloads in source order."""
+        flattened: list[str | int | float] = []
+
+        def collect(nested: Any) -> None:
+            if isinstance(nested, dict):
+                for item in nested.values():
+                    collect(item)
+            elif isinstance(nested, list):
+                for item in nested:
+                    collect(item)
+            elif isinstance(nested, str | int | float):
+                flattened.append(nested)
+
+        collect(value)
+        return flattened
+
+    def _normalize_options(self, options: Any) -> list[str]:
+        if isinstance(options, str):
+            try:
+                options = json.loads(options)
+            except (json.JSONDecodeError, TypeError):
+                options = [options]
+        if options is None:
+            return []
+        if isinstance(options, dict):
+            options = self._flatten_dict_option_values(options)
+        elif not isinstance(options, list):
+            options = [options]
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for option in options:
+            text = _XML_TAG_RE.sub("", str(option)).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        return normalized
+
     def _format_clarification_message(self, args: dict) -> str:
         """Format the clarification arguments into a user-friendly message.
 
@@ -69,19 +113,7 @@ class ClarificationMiddleware(AgentMiddleware[ClarificationMiddlewareState]):
         context = args.get("context")
         options = args.get("options", [])
 
-        # Some models (e.g. Qwen3-Max) serialize array parameters as JSON strings
-        # instead of native arrays. Deserialize and normalize so `options`
-        # is always a list for the rendering logic below.
-        if isinstance(options, str):
-            try:
-                options = json.loads(options)
-            except (json.JSONDecodeError, TypeError):
-                options = [options]
-
-        if options is None:
-            options = []
-        elif not isinstance(options, list):
-            options = [options]
+        options = self._normalize_options(options)
 
         # Type-specific icons
         type_icons = {

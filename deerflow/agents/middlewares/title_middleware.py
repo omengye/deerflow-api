@@ -128,7 +128,10 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
                 model = create_chat_model(name=config.model_name, thinking_enabled=False, disable_keepalive=True)
             else:
                 model = create_chat_model(thinking_enabled=False, disable_keepalive=True)
-            response = await model.ainvoke(prompt, config={"run_name": "title_agent"})
+            from deerflow.agents.middlewares.llm_error_handling_middleware import llm_call_slot_async
+
+            async with llm_call_slot_async():
+                response = await model.ainvoke(prompt, config={"run_name": "title_agent"})
             title = self._parse_title(response.content)
             if title:
                 return {"title": title}

@@ -1388,12 +1388,12 @@ def grep_tool(
     case_sensitive: bool = False,
     max_results: int = _DEFAULT_GREP_MAX_RESULTS,
 ) -> str:
-    """Search for matching lines inside text files under a root directory.
+    """Search for matching lines inside a text file or files under a root directory.
 
     Args:
         description: Explain why you are searching file contents in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
         pattern: The string or regex pattern to search for.
-        path: The **absolute** root directory to search under.
+        path: The **absolute** file or root directory to search.
         glob: Optional glob filter for candidate files, for example `**/*.py`.
         literal: Whether to treat `pattern` as a plain string. Default is False.
         case_sensitive: Whether matching is case-sensitive. Default is False.
@@ -1460,11 +1460,18 @@ def read_file_tool(
     Args:
         description: Explain why you are reading this file in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
         path: The **absolute** path to the file to read.
-        start_line: Optional starting line number (1-indexed, inclusive). Use with end_line to read a specific range.
-        end_line: Optional ending line number (1-indexed, inclusive). Use with start_line to read a specific range.
+        start_line: Optional starting line number (1-indexed, inclusive). Omit to start at the first line.
+        end_line: Optional ending line number (1-indexed, inclusive). Omit to read through the last line.
     """
     requested_path = path
     try:
+        if start_line is not None and start_line < 1:
+            return "(start_line must be >= 1)"
+        effective_start = start_line or 1
+        if end_line is not None and end_line < 1:
+            return "(end_line must be >= 1)"
+        if end_line is not None and effective_start > end_line:
+            return "(start_line > end_line — no lines in range)"
         sandbox = ensure_sandbox_initialized(runtime)
         ensure_thread_directories_exist(runtime)
         if is_local_sandbox(runtime):
@@ -1478,11 +1485,12 @@ def read_file_tool(
             elif not _is_custom_mount_path(path):
                 path = _resolve_and_validate_user_data_path(path, thread_data)
             # Custom mount paths are resolved by LocalSandbox._resolve_path()
-        content = sandbox.read_file(path)
+        if start_line is not None or end_line is not None:
+            content = sandbox.read_file(path, start_line=start_line, end_line=end_line)
+        else:
+            content = sandbox.read_file(path)
         if not content:
             return "(empty)"
-        if start_line is not None and end_line is not None:
-            content = "\n".join(content.splitlines()[start_line - 1 : end_line])
         try:
             from deerflow.config.app_config import get_app_config
 

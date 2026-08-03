@@ -7,7 +7,10 @@ import logging
 import random
 import threading
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from email.utils import parsedate_to_datetime
 from typing import Any, override
 
@@ -77,6 +80,248 @@ _CONTENT_POLICY_PATTERNS = (
     "内容审核",
 )
 
+_BURST_RATE_PATTERNS = (
+    "limit_burst_rate",
+    "burst rate",
+    "burst-rate",
+    "request rate increased too quickly",
+    "slope limit",
+)
+
+
+class LLMConcurrencyTimeoutError(TimeoutError):
+    """Raised when a model call cannot obtain the process-wide slot in time."""
+
+
+class _AsyncWaiter:
+    __slots__ = ("loop", "event", "granted")
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, event: asyncio.Event) -> None:
+        self.loop = loop
+        self.event = event
+        self.granted = False
+
+
+class _ProcessWideLimiter:
+    """Cancellation-safe limiter shared by sync calls and multiple event loops."""
+
+    def __init__(self, limit: int) -> None:
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._in_flight = 0
+        self._limit = max(0, limit)
+        self._async_waiters: deque[_AsyncWaiter] = deque()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def in_flight(self) -> int:
+        with self._lock:
+            return self._in_flight
+
+    @property
+    def queued(self) -> int:
+        with self._lock:
+            return len(self._async_waiters)
+
+    def acquire_sync(self, timeout_seconds: float | None = None) -> bool:
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        with self._cond:
+            while not self._try_acquire_locked():
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._cond.wait(timeout=remaining)
+            return True
+
+    def release(self) -> None:
+        with self._cond:
+            while self._async_waiters:
+                waiter = self._async_waiters.popleft()
+                waiter.granted = True
+                if self._wake_locked(waiter):
+                    return
+            if self._in_flight > 0:
+                self._in_flight -= 1
+            self._cond.notify()
+
+    async def acquire_async(self) -> None:
+        loop = asyncio.get_running_loop()
+        waiter = _AsyncWaiter(loop=loop, event=asyncio.Event())
+        with self._cond:
+            if self._try_acquire_locked():
+                return
+            self._async_waiters.append(waiter)
+        try:
+            await waiter.event.wait()
+        except asyncio.CancelledError:
+            with self._cond:
+                if waiter.granted:
+                    self._handoff_granted_permit_locked()
+                else:
+                    try:
+                        self._async_waiters.remove(waiter)
+                    except ValueError:
+                        # A concurrent release dequeued it and reserved the
+                        # permit immediately before cancellation was observed.
+                        if waiter.granted:
+                            self._handoff_granted_permit_locked()
+            raise
+
+    def _try_acquire_locked(self) -> bool:
+        if self._in_flight < self._limit:
+            self._in_flight += 1
+            return True
+        return False
+
+    def _handoff_granted_permit_locked(self) -> None:
+        while self._async_waiters:
+            waiter = self._async_waiters.popleft()
+            waiter.granted = True
+            if self._wake_locked(waiter):
+                return
+        if self._in_flight > 0:
+            self._in_flight -= 1
+        self._cond.notify()
+
+    @staticmethod
+    def _wake_locked(waiter: _AsyncWaiter) -> bool:
+        try:
+            waiter.loop.call_soon_threadsafe(waiter.event.set)
+            return True
+        except RuntimeError:
+            return False
+
+
+_LIMITER_LOCK = threading.Lock()
+_PROCESS_LIMITER: _ProcessWideLimiter | None = None
+_CAP_RESOLVED = False
+_LLM_SLOT_OWNER: ContextVar[tuple[str, int] | None] = ContextVar("llm_slot_owner", default=None)
+_LLM_SLOT_DEPTH: ContextVar[int] = ContextVar("llm_slot_depth", default=0)
+
+
+def _apply_configured_cap(limit: int) -> None:
+    global _CAP_RESOLVED, _PROCESS_LIMITER
+    if _CAP_RESOLVED:
+        return
+    with _LIMITER_LOCK:
+        if _CAP_RESOLVED:
+            return
+        _CAP_RESOLVED = True
+        if limit > 0:
+            _PROCESS_LIMITER = _ProcessWideLimiter(limit)
+
+
+def _ensure_process_limiter() -> _ProcessWideLimiter | None:
+    if not _CAP_RESOLVED:
+        try:
+            _apply_configured_cap(get_app_config().llm_call.max_concurrent_calls)
+        except (FileNotFoundError, RuntimeError, AttributeError):
+            _apply_configured_cap(0)
+    return _PROCESS_LIMITER
+
+
+def _reset_process_limiter_for_tests() -> None:
+    global _CAP_RESOLVED, _PROCESS_LIMITER
+    with _LIMITER_LOCK:
+        _PROCESS_LIMITER = None
+        _CAP_RESOLVED = False
+
+
+@contextmanager
+def llm_call_slot_sync(timeout_seconds: float | None = None):
+    """Acquire the shared LLM slot for a direct synchronous model call."""
+    owner = ("thread", threading.get_ident())
+    if _LLM_SLOT_OWNER.get() == owner:
+        depth_token = _LLM_SLOT_DEPTH.set(_LLM_SLOT_DEPTH.get() + 1)
+        try:
+            yield
+        finally:
+            _LLM_SLOT_DEPTH.reset(depth_token)
+        return
+
+    limiter = _ensure_process_limiter()
+    if limiter is None:
+        yield
+        return
+    if timeout_seconds is None:
+        timeout_seconds = get_app_config().llm_call.queue_timeout_seconds
+    started = time.monotonic()
+    if not limiter.acquire_sync(timeout_seconds):
+        raise LLMConcurrencyTimeoutError(
+            f"Timed out after {timeout_seconds}s waiting for an LLM concurrency slot"
+        )
+    waited = time.monotonic() - started
+    if waited >= 0.1:
+        logger.info(
+            "LLM call acquired process-wide slot after %.3fs (in_flight=%d, limit=%d)",
+            waited,
+            limiter.in_flight,
+            limiter.limit,
+        )
+    owner_token = _LLM_SLOT_OWNER.set(owner)
+    depth_token = _LLM_SLOT_DEPTH.set(1)
+    try:
+        yield
+    finally:
+        _LLM_SLOT_DEPTH.reset(depth_token)
+        _LLM_SLOT_OWNER.reset(owner_token)
+        limiter.release()
+
+
+@asynccontextmanager
+async def llm_call_slot_async(timeout_seconds: float | None = None):
+    """Acquire the shared LLM slot without binding it to one event loop."""
+    task = asyncio.current_task()
+    owner = ("task", id(task))
+    if _LLM_SLOT_OWNER.get() == owner:
+        depth_token = _LLM_SLOT_DEPTH.set(_LLM_SLOT_DEPTH.get() + 1)
+        try:
+            yield
+        finally:
+            _LLM_SLOT_DEPTH.reset(depth_token)
+        return
+
+    limiter = _ensure_process_limiter()
+    if limiter is None:
+        yield
+        return
+    if timeout_seconds is None:
+        timeout_seconds = get_app_config().llm_call.queue_timeout_seconds
+    started = time.monotonic()
+    acquired = False
+    owner_token = None
+    depth_token = None
+    try:
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await limiter.acquire_async()
+                acquired = True
+        except TimeoutError as exc:
+            raise LLMConcurrencyTimeoutError(
+                f"Timed out after {timeout_seconds}s waiting for an LLM concurrency slot"
+            ) from exc
+        waited = time.monotonic() - started
+        if waited >= 0.1:
+            logger.info(
+                "LLM call acquired process-wide slot after %.3fs (in_flight=%d, limit=%d)",
+                waited,
+                limiter.in_flight,
+                limiter.limit,
+            )
+        owner_token = _LLM_SLOT_OWNER.set(owner)
+        depth_token = _LLM_SLOT_DEPTH.set(1)
+        yield
+    finally:
+        if depth_token is not None:
+            _LLM_SLOT_DEPTH.reset(depth_token)
+        if owner_token is not None:
+            _LLM_SLOT_OWNER.reset(owner_token)
+        if acquired:
+            limiter.release()
+
 
 class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
     """Retry transient LLM errors and surface graceful assistant messages."""
@@ -84,6 +329,8 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
     retry_max_attempts: int = 3
     retry_base_delay_ms: int = 1000
     retry_cap_delay_ms: int = 8000
+    burst_retry_base_delay_ms: int = 5000
+    concurrency_queue_timeout_seconds: float = 60.0
 
     circuit_failure_threshold: int = 5
     circuit_recovery_timeout_sec: int = 60
@@ -96,6 +343,12 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
             app_config = get_app_config()
             self.circuit_failure_threshold = app_config.circuit_breaker.failure_threshold
             self.circuit_recovery_timeout_sec = app_config.circuit_breaker.recovery_timeout_sec
+            self.retry_max_attempts = app_config.llm_call.retry_max_attempts
+            self.retry_base_delay_ms = app_config.llm_call.retry_base_delay_ms
+            self.retry_cap_delay_ms = app_config.llm_call.retry_cap_delay_ms
+            self.burst_retry_base_delay_ms = app_config.llm_call.burst_retry_base_delay_ms
+            self.concurrency_queue_timeout_seconds = app_config.llm_call.queue_timeout_seconds
+            _apply_configured_cap(app_config.llm_call.max_concurrent_calls)
         except (FileNotFoundError, RuntimeError):
             # Gracefully fall back to class defaults in test environments
             pass
@@ -159,11 +412,19 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                         self.circuit_recovery_timeout_sec,
                     )
 
+    def _release_half_open_probe(self) -> None:
+        with self._circuit_lock:
+            if self._circuit_state == "half_open":
+                self._circuit_probe_in_flight = False
+
     def _classify_error(self, exc: BaseException) -> tuple[bool, str]:
         detail = _extract_error_detail(exc)
         lowered = detail.lower()
         error_code = _extract_error_code(exc)
         status_code = _extract_status_code(exc)
+
+        if isinstance(exc, LLMConcurrencyTimeoutError):
+            return False, "concurrency_limit"
 
         if _matches_any(lowered, _QUOTA_PATTERNS) or _matches_any(str(error_code).lower(), _QUOTA_PATTERNS):
             return False, "quota"
@@ -171,6 +432,11 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
             return False, "auth"
         if _matches_any(lowered, _CONTENT_POLICY_PATTERNS) or _matches_any(str(error_code).lower(), _CONTENT_POLICY_PATTERNS):
             return False, "content_policy"
+        if status_code == 429 and (
+            _matches_any(lowered, _BURST_RATE_PATTERNS)
+            or _matches_any(str(error_code).lower(), _BURST_RATE_PATTERNS)
+        ):
+            return True, "burst_rate"
 
         exc_name = exc.__class__.__name__
         if exc_name in {
@@ -188,11 +454,31 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
 
         return False, "generic"
 
-    def _build_retry_delay_ms(self, attempt: int, exc: BaseException) -> int:
+    def _max_attempts_for(self, reason: str) -> int:
+        return min(self.retry_max_attempts, 2) if reason == "burst_rate" else self.retry_max_attempts
+
+    def _bounded_model_call_sync(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        with llm_call_slot_sync(self.concurrency_queue_timeout_seconds):
+            return handler(request)
+
+    async def _bounded_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        async with llm_call_slot_async(self.concurrency_queue_timeout_seconds):
+            return await handler(request)
+
+    def _build_retry_delay_ms(self, attempt: int, exc: BaseException, reason: str = "transient") -> int:
         retry_after = _extract_retry_after_ms(exc)
         if retry_after is not None:
-            return retry_after
-        backoff = self.retry_base_delay_ms * (2 ** max(0, attempt - 1))
+            return min(retry_after, self.retry_cap_delay_ms)
+        base_delay = self.burst_retry_base_delay_ms if reason == "burst_rate" else self.retry_base_delay_ms
+        backoff = base_delay * (2 ** max(0, attempt - 1))
         capped_backoff = min(backoff, self.retry_cap_delay_ms)
         # Full jitter (AWS-recommended): sample uniformly from [0, capped_backoff] so
         # concurrent callers hit by the same burst-rate 429 (e.g. provider "slope"
@@ -201,8 +487,11 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
 
     def _build_retry_message(self, attempt: int, wait_ms: int, reason: str) -> str:
         seconds = max(1, round(wait_ms / 1000))
-        reason_text = "provider is busy" if reason == "busy" else "provider request failed temporarily"
-        return f"LLM request retry {attempt}/{self.retry_max_attempts}: {reason_text}. Retrying in {seconds}s."
+        reason_text = {
+            "busy": "provider is busy",
+            "burst_rate": "provider is throttling request burst rate",
+        }.get(reason, "provider request failed temporarily")
+        return f"LLM request retry {attempt}/{self._max_attempts_for(reason)}: {reason_text}. Retrying in {seconds}s."
 
     def _build_circuit_breaker_message(self) -> str:
         return "The configured LLM provider is currently unavailable due to continuous failures. Circuit breaker is engaged to protect the system. Please wait a moment before trying again."
@@ -215,6 +504,10 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
             return "The configured LLM provider rejected the request because authentication or access is invalid. Please check the provider credentials and try again."
         if reason == "content_policy":
             return "The configured LLM provider rejected this request because the input was flagged by its content safety policy. Please revise the message and try again."
+        if reason == "burst_rate":
+            return "The configured LLM provider is temporarily throttling requests because the request rate increased too quickly. Please wait a moment and try again."
+        if reason == "concurrency_limit":
+            return "The server is handling the configured maximum number of model calls. The request timed out waiting for capacity; please try again shortly."
         if reason in {"busy", "transient"}:
             return "The configured LLM provider is temporarily unavailable after multiple retries. Please wait a moment and continue the conversation."
         return f"LLM request failed: {detail}"
@@ -228,7 +521,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                 {
                     "type": "llm_retry",
                     "attempt": attempt,
-                    "max_attempts": self.retry_max_attempts,
+                    "max_attempts": self._max_attempts_for(reason),
                     "wait_ms": wait_ms,
                     "reason": reason,
                     "message": self._build_retry_message(attempt, wait_ms, reason),
@@ -267,7 +560,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         attempt = 1
         while True:
             try:
-                response = handler(request)
+                response = self._bounded_model_call_sync(request, handler)
                 self._record_success()
                 return response
             except GraphBubbleUp:
@@ -284,14 +577,16 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                         attempt,
                         _extract_error_detail(exc),
                     )
+                    self._release_half_open_probe()
                     self._emit_failure_event(exc, reason, retriable=False)
                     return AIMessage(content=self._build_user_message(exc, reason))
-                if retriable and attempt < self.retry_max_attempts:
-                    wait_ms = self._build_retry_delay_ms(attempt, exc)
+                max_attempts = self._max_attempts_for(reason)
+                if retriable and attempt < max_attempts:
+                    wait_ms = self._build_retry_delay_ms(attempt, exc, reason)
                     logger.warning(
                         "Transient LLM error on attempt %d/%d; retrying in %dms: %s",
                         attempt,
-                        self.retry_max_attempts,
+                        max_attempts,
                         wait_ms,
                         _extract_error_detail(exc),
                     )
@@ -305,8 +600,10 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                     _extract_error_detail(exc),
                     exc_info=exc,
                 )
-                if retriable:
+                if retriable and reason != "burst_rate":
                     self._record_failure()
+                else:
+                    self._release_half_open_probe()
                 self._emit_failure_event(exc, reason, retriable=retriable)
                 return AIMessage(content=self._build_user_message(exc, reason))
 
@@ -323,7 +620,7 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         attempt = 1
         while True:
             try:
-                response = await handler(request)
+                response = await self._bounded_model_call(request, handler)
                 self._record_success()
                 return response
             except GraphBubbleUp:
@@ -343,14 +640,16 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                         attempt,
                         _extract_error_detail(exc),
                     )
+                    self._release_half_open_probe()
                     self._emit_failure_event(exc, reason, retriable=False)
                     return AIMessage(content=self._build_user_message(exc, reason))
-                if retriable and attempt < self.retry_max_attempts:
-                    wait_ms = self._build_retry_delay_ms(attempt, exc)
+                max_attempts = self._max_attempts_for(reason)
+                if retriable and attempt < max_attempts:
+                    wait_ms = self._build_retry_delay_ms(attempt, exc, reason)
                     logger.warning(
                         "Transient LLM error on attempt %d/%d; retrying in %dms: %s",
                         attempt,
-                        self.retry_max_attempts,
+                        max_attempts,
                         wait_ms,
                         _extract_error_detail(exc),
                     )
@@ -364,8 +663,10 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                     _extract_error_detail(exc),
                     exc_info=exc,
                 )
-                if retriable:
+                if retriable and reason != "burst_rate":
                     self._record_failure()
+                else:
+                    self._release_half_open_probe()
                 self._emit_failure_event(exc, reason, retriable=retriable)
                 return AIMessage(content=self._build_user_message(exc, reason))
 

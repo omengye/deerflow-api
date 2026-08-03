@@ -63,8 +63,8 @@ class AdminApiTests(unittest.TestCase):
     "local": {
       "enabled": true,
       "type": "stdio",
-      "command": "python",
-      "args": ["--version"],
+      "command": "npx",
+      "args": ["@example/mcp-server"],
       "env": {
         "SECRET_TOKEN": "literal-secret"
       }

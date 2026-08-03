@@ -64,6 +64,26 @@ class CircuitBreakerConfig(BaseModel):
     recovery_timeout_sec: int = Field(default=60, description="Time in seconds before attempting to recover the circuit")
 
 
+class LlmCallConfig(BaseModel):
+    """Process-wide LLM concurrency and retry shaping."""
+
+    max_concurrent_calls: int = Field(
+        default=8,
+        ge=0,
+        description="Process-wide in-flight LLM call cap; 0 disables the limiter",
+    )
+    queue_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        le=600,
+        description="Maximum time a model call waits for a concurrency slot",
+    )
+    retry_max_attempts: int = Field(default=3, ge=1, le=10)
+    retry_base_delay_ms: int = Field(default=1000, ge=0, le=60000)
+    retry_cap_delay_ms: int = Field(default=8000, ge=0, le=300000)
+    burst_retry_base_delay_ms: int = Field(default=5000, ge=0, le=300000)
+
+
 def _default_config_candidates() -> tuple[Path, ...]:
     """Return deterministic config.yaml locations without relying on cwd."""
     project_root = find_project_root(Path(__file__))
@@ -95,6 +115,7 @@ class AppConfig(BaseModel):
     subagents: SubagentsAppConfig = Field(default_factory=SubagentsAppConfig, description="Subagent runtime configuration")
     guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig, description="Guardrail middleware configuration")
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig, description="LLM circuit breaker configuration")
+    llm_call: LlmCallConfig = Field(default_factory=LlmCallConfig, description="LLM concurrency and retry shaping")
     model_config = ConfigDict(extra="allow", frozen=False)
     checkpointer: CheckpointerConfig | None = Field(default=None, description="Checkpointer configuration")
     stream_bridge: StreamBridgeConfig | None = Field(default=None, description="Stream bridge configuration")

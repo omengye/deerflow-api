@@ -2,12 +2,56 @@
 
 import json
 import os
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from deerflow.config.project_root import find_project_root
+
+
+_extensions_config_lock = threading.RLock()
+
+
+def get_extensions_config_lock() -> threading.RLock:
+    """Return the process-wide lock protecting extensions-config RMW operations."""
+    return _extensions_config_lock
+
+
+def load_extensions_config_data(path: Path) -> dict[str, Any]:
+    """Load the raw extensions JSON without resolving environment placeholders."""
+    with _extensions_config_lock:
+        try:
+            with path.open(encoding="utf-8") as config_file:
+                data = json.load(config_file)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Extensions config file at {path} is not valid JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"Extensions config file at {path} must contain a JSON object")
+        return data
+
+
+def write_extensions_config_data(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write raw extensions JSON under the shared process lock."""
+    with _extensions_config_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".tmp",
+            delete=False,
+            dir=str(path.parent),
+        ) as tmp_file:
+            json.dump(data, tmp_file, indent=2, ensure_ascii=False)
+            tmp_file.write("\n")
+            tmp_path = Path(tmp_file.name)
+        try:
+            tmp_path.replace(path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
 
 class McpOAuthConfig(BaseModel):
@@ -45,6 +89,10 @@ class McpServerConfig(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict, description="HTTP headers to send (for sse or http type)")
     oauth: McpOAuthConfig | None = Field(default=None, description="OAuth configuration (for sse or http type)")
     description: str = Field(default="", description="Human-readable description of what this MCP server provides")
+    tool_name_prefix: bool = Field(
+        default=True,
+        description="Whether to prefix discovered tool names with the MCP server name to avoid collisions",
+    )
     model_config = ConfigDict(extra="allow")
 
 

@@ -310,6 +310,10 @@ def _assemble_from_features(
 
     chain.append(LoopDetectionMiddleware())
 
+    from deerflow.agents.middlewares.finish_reason_middleware import build_finish_reason_middlewares
+
+    chain.extend(build_finish_reason_middlewares())
+
     # --- [13] Clarification (always last among built-ins) ---
     chain.append(ClarificationMiddleware())
     from deerflow.tools.builtins import ask_clarification_tool

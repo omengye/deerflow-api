@@ -31,12 +31,22 @@ Instructions:
 
 Before extracting facts, perform a structured reflection on the conversation:
 1. Error/Retry Detection: Did the agent encounter errors, require retries, or produce incorrect results?
-   If yes, record the root cause and correct approach as a high-confidence fact with category "correction".
+   Record the correction only when it is a durable user-level working pattern, not a fix for the current task.
 2. User Correction Detection: Did the user correct the agent's direction, understanding, or output?
-   If yes, record the correct interpretation or approach as a high-confidence fact with category "correction".
+   Distinguish a reusable user-level correction from a correction to the current task's files or facts.
    Include what went wrong in "sourceError" only when category is "correction" and the mistake is explicit in the conversation.
 3. Project Constraint Discovery: Were any project-specific constraints discovered during the conversation?
-   If yes, record them as facts with the most appropriate category and confidence.
+   If yes, classify them as project-scoped and do not promote them to long-term user memory.
+
+Scope and Safety Classification:
+- scope="user": safe and useful in an unrelated future task, project, repository, or thread.
+- scope="thread": limited to this conversation or one-off request.
+- scope="project": meaningful only inside a particular project or repository.
+- durability="durable": expected to remain true across future conversations.
+- durability="temporary": current, short-lived, or one-off information.
+- authority="transactional": an instruction, permission, or authorization to edit, delete, push, publish, close, deploy, or take another action. Transactional content must never enter long-term memory.
+- authority="descriptive": describes the user without granting authority for an action.
+- When uncertain, classify as thread/project or temporary. Never guess user+durable.
 
 {correction_hint}
 
@@ -64,6 +74,9 @@ Memory Section Guidelines:
   Include: Core expertise, longstanding interests, fundamental working style
 
 **Facts Extraction**:
+- Every new fact MUST include scope, durability, and authority. These labels are evaluated by a deterministic write gate and are not persisted.
+- Only scope="user", durability="durable", authority="descriptive" facts are eligible for storage.
+- Do not create facts for current-task objectives, acceptance criteria, workspace state, exact files/commits/errors, project-only constraints, or one-time action permissions.
 - Extract specific, quantifiable details (e.g., "16k+ GitHub stars", "200+ datasets")
 - Include proper nouns (company names, project names, technology names)
 - Preserve technical terminology and version numbers
@@ -96,19 +109,21 @@ Memory Section Guidelines:
 Output Format (JSON):
 {{
   "user": {{
-    "workContext": {{ "summary": "...", "shouldUpdate": true/false }},
-    "personalContext": {{ "summary": "...", "shouldUpdate": true/false }},
-    "topOfMind": {{ "summary": "...", "shouldUpdate": true/false }}
+    "workContext": {{ "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }},
+    "personalContext": {{ "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }},
+    "topOfMind": {{ "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }}
   }},
   "history": {{
-    "recentMonths": {{ "summary": "...", "shouldUpdate": true/false }},
-    "earlierContext": {{ "summary": "...", "shouldUpdate": true/false }},
-    "longTermBackground": {{ "summary": "...", "shouldUpdate": true/false }}
+    "recentMonths": {{ "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }},
+    "earlierContext": {{ "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }},
+    "longTermBackground": {{ "summary": "...", "shouldUpdate": true/false, "scope": "user|thread|project", "authority": "descriptive|transactional" }}
   }},
   "newFacts": [
-    {{ "content": "...", "category": "preference|knowledge|context|behavior|goal|correction", "confidence": 0.0-1.0 }}
+    {{ "content": "...", "category": "preference|knowledge|context|behavior|goal|correction", "confidence": 0.0-1.0, "scope": "user|thread|project", "durability": "durable|temporary", "authority": "descriptive|transactional" }}
   ],
-  "factsToRemove": ["fact_id_1", "fact_id_2"]
+  "factsToRemove": [
+    {{ "id": "fact_id_1", "scope": "user|thread|project", "reason": "explicit user-level contradiction or retraction" }}
+  ]
 }}
 
 Important Rules:
@@ -118,7 +133,9 @@ Important Rules:
 - Only add facts that are clearly stated (0.9+) or strongly implied (0.7+)
 - Use category "correction" for explicit agent mistakes or user corrections; assign confidence >= 0.95 when the correction is explicit
 - Include "sourceError" only for explicit correction facts when the prior mistake or wrong approach is clearly stated; omit it otherwise
-- Remove facts that are contradicted by new information
+- Remove an existing fact only when the user explicitly contradicts or retracts it at user scope. A thread/project-local exception does not contradict a user-level fact.
+- factsToRemove entries MUST include scope and reason.
+- Every summary with shouldUpdate=true MUST include scope and authority. The entire summary must be safe to inject into an unrelated future thread.
 - When updating topOfMind, integrate new focus areas while removing completed/abandoned ones
   Keep 3-5 concurrent focus themes that are still active and relevant
 - For history sections, integrate new information chronologically into appropriate time period

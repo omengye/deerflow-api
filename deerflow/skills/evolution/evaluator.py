@@ -107,10 +107,13 @@ class AutoPatchEvaluator:
                 thinking_enabled=False,
                 disable_keepalive=True,
             )
-            response = await model.ainvoke(
-                [{"role": "system", "content": rubric}, {"role": "user", "content": prompt}],
-                config={"run_name": "skill_evolution_evaluator"},
-            )
+            from deerflow.agents.middlewares.llm_error_handling_middleware import llm_call_slot_async
+
+            async with llm_call_slot_async():
+                response = await model.ainvoke(
+                    [{"role": "system", "content": rubric}, {"role": "user", "content": prompt}],
+                    config={"run_name": "skill_evolution_evaluator"},
+                )
             parsed = extract_json_object(str(getattr(response, "content", "") or "")) or {}
             decision = str(parsed.get("decision") or "").lower()
             if decision not in {"allow", "review"}:

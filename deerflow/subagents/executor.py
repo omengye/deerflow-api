@@ -221,6 +221,9 @@ class SubagentExecutor:
 
             middlewares.append(DeferredToolFilterMiddleware())
         middlewares.append(LoopDetectionMiddleware(stream_callback=stream_callback))
+        from deerflow.agents.middlewares.finish_reason_middleware import build_finish_reason_middlewares
+
+        middlewares.extend(build_finish_reason_middlewares())
 
         # recursion_limit counts graph super-steps, not turns. One tool-calling
         # turn costs ``count_steps_per_turn`` super-steps — model + tools + one
@@ -242,22 +245,10 @@ class SubagentExecutor:
         )
         return agent, model
 
-    async def _load_skill_messages(self) -> list[SystemMessage]:
-        """Load skill content as conversation items based on config.skills.
-
-        Aligned with Codex's pattern: each subagent loads its own skills
-        per-session and injects them as conversation items (developer messages),
-        not as system prompt text. The config.skills whitelist controls which
-        skills are loaded:
-        - None: load all enabled skills
-        - []: no skills
-        - ["skill-a", "skill-b"]: only these skills
-
-        Returns:
-            List of SystemMessages containing skill content.
-        """
+    async def _load_skills(self) -> list[Any]:
+        """Load only enabled skill metadata; bodies remain lazy until read_file."""
         if self.config.skills is not None and len(self.config.skills) == 0:
-            logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} skills=[] — skipping skill loading")
+            logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} skills=[] — skipping skill discovery")
             return []
 
         try:
@@ -281,22 +272,7 @@ class SubagentExecutor:
         else:
             skills = all_skills
 
-        if not skills:
-            return []
-
-        # Read each skill's SKILL.md content and create conversation items
-        messages = []
-        for skill in skills:
-            try:
-                content = await asyncio.to_thread(skill.skill_file.read_text, encoding="utf-8")
-                content = content.strip()
-                if content:
-                    messages.append(SystemMessage(content=f'<skill name="{skill.name}">\n{content}\n</skill>'))
-                    logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} loaded skill: {skill.name}")
-            except Exception:
-                logger.debug(f"[trace={self.trace_id}] Failed to read skill {skill.name}", exc_info=True)
-
-        return messages
+        return skills
 
     async def _build_initial_state(self, task: str) -> dict[str, Any]:
         """Build the initial state for agent execution.
@@ -307,15 +283,23 @@ class SubagentExecutor:
         Returns:
             Initial state dictionary.
         """
-        # Load skills as conversation items (Codex pattern)
-        skill_messages = await self._load_skill_messages()
+        # Expose only the skill catalog. The subagent reads a matching SKILL.md
+        # through read_file when needed, avoiding eager prompt growth and stale
+        # authority from unrelated skills.
+        skills = await self._load_skills()
+        skill_names = {skill.name for skill in skills}
+        skill_section = ""
+        if skill_names:
+            from deerflow.agents.lead_agent.prompt import get_skills_prompt_section
+
+            skill_section = await asyncio.to_thread(get_skills_prompt_section, skill_names)
         from deerflow.tools.builtins.tool_search import get_deferred_tools_prompt_section
 
         deferred_section = get_deferred_tools_prompt_section(self.deferred_registry)
 
         messages: list = []
-        # Skill content injected as developer/system messages before the task
-        messages.extend(skill_messages)
+        if skill_section:
+            messages.append(SystemMessage(content=skill_section))
         if deferred_section:
             messages.append(SystemMessage(content=deferred_section))
         # Then the actual task

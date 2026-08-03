@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import json
 import os
@@ -29,7 +30,12 @@ from app.proposal_review import (
     reject_skill_proposal,
 )
 from deerflow.config.app_config import AppConfig
-from deerflow.config.extensions_config import ExtensionsConfig
+from deerflow.config.extensions_config import (
+    ExtensionsConfig,
+    get_extensions_config_lock,
+    load_extensions_config_data,
+    write_extensions_config_data,
+)
 from deerflow.config.memory_config import MemoryConfig
 from deerflow.config.model_config import ModelConfig
 from deerflow.config.subagents_config import SubagentsAppConfig
@@ -267,6 +273,7 @@ _KNOWN_TOP_LEVEL_CONFIG_KEYS = {
     "summarization",
     "tracing",
     "circuit_breaker",
+    "llm_call",
     "checkpointer",
 }
 
@@ -359,50 +366,37 @@ def _resolve_extensions_config_path(*, create: bool = False) -> Path | None:
 
 
 def _load_extensions_data(*, create: bool = False) -> tuple[Path | None, dict[str, Any]]:
-    path = _resolve_extensions_config_path(create=create)
-    if path is None:
-        return None, {"mcpServers": {}, "skills": {}}
-    if not path.exists():
-        if not create:
-            return path, {"mcpServers": {}, "skills": {}}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text('{"mcpServers": {}, "skills": {}}\n', encoding="utf-8")
-    try:
-        data = json.loads(path.read_text(encoding="utf-8") or "{}")
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail=f"Extensions config is not valid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=500, detail="Extensions config must be a JSON object")
-    data.setdefault("mcpServers", {})
-    data.setdefault("skills", {})
-    if not isinstance(data["mcpServers"], dict):
-        raise HTTPException(status_code=500, detail="extensions mcpServers must be an object")
-    if not isinstance(data["skills"], dict):
-        raise HTTPException(status_code=500, detail="extensions skills must be an object")
-    return path, data
+    with get_extensions_config_lock():
+        path = _resolve_extensions_config_path(create=create)
+        if path is None:
+            return None, {"mcpServers": {}, "skills": {}}
+        if not path.exists():
+            if not create:
+                return path, {"mcpServers": {}, "skills": {}}
+            write_extensions_config_data(path, {"mcpServers": {}, "skills": {}})
+        try:
+            data = load_extensions_config_data(path)
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        data.setdefault("mcpServers", {})
+        data.setdefault("skills", {})
+        if not isinstance(data["mcpServers"], dict):
+            raise HTTPException(status_code=500, detail="extensions mcpServers must be an object")
+        if not isinstance(data["skills"], dict):
+            raise HTTPException(status_code=500, detail="extensions skills must be an object")
+        return path, data
 
 
 def _write_extensions_data(path: Path | None, data: dict[str, Any]) -> None:
-    if path is None:
-        path = _resolve_extensions_config_path(create=True)
-    if path is None:
-        raise HTTPException(status_code=500, detail="Unable to resolve extensions config path")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        suffix=".tmp",
-        delete=False,
-        dir=str(path.parent),
-    ) as tmp_file:
-        json.dump(data, tmp_file, indent=2, ensure_ascii=False)
-        tmp_file.write("\n")
-        tmp_path = Path(tmp_file.name)
-    try:
-        tmp_path.replace(path)
-    except OSError as exc:
-        tmp_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"Failed to write extensions config: {exc}") from exc
+    with get_extensions_config_lock():
+        if path is None:
+            path = _resolve_extensions_config_path(create=True)
+        if path is None:
+            raise HTTPException(status_code=500, detail="Unable to resolve extensions config path")
+        try:
+            write_extensions_config_data(path, data)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to write extensions config: {exc}") from exc
 
 
 def _validate_config_data(data: dict[str, Any], *, source_path: Path) -> None:
@@ -563,10 +557,14 @@ def _custom_skill_response(name: str, *, include_content: bool = False) -> dict[
 
 
 def _set_skill_enabled(name: str, enabled: bool) -> None:
-    path, data = _load_extensions_data(create=True)
-    skills = data.setdefault("skills", {})
-    skills[name] = {"enabled": enabled}
-    _write_extensions_data(path, data)
+    with get_extensions_config_lock():
+        path, data = _load_extensions_data(create=True)
+        skills = data.setdefault("skills", {})
+        raw_skill = skills.get(name)
+        skill_data = dict(raw_skill) if isinstance(raw_skill, dict) else {}
+        skill_data["enabled"] = enabled
+        skills[name] = skill_data
+        _write_extensions_data(path, data)
     try:
         get_evolution_store().bump_catalog(
             actor="admin",
@@ -2090,7 +2088,7 @@ async def upsert_admin_custom_skill(name: str, req: AdminSkillUpsertRequest = Bo
                 ),
             )
             if req.enabled is not None:
-                _set_skill_enabled(name, req.enabled)
+                await asyncio.to_thread(_set_skill_enabled, name, req.enabled)
             reload_result = await _refresh_after_skill_change(reload=req.reload)
             payload = _custom_skill_response(name, include_content=True)
             payload["success"] = True
@@ -2353,27 +2351,31 @@ async def disable_admin_mcp_server(name: str):
 
 
 async def _set_admin_mcp_enabled(name: str, enabled: bool) -> dict[str, Any]:
-    path, data, servers = _mcp_servers_from_extensions(create=True)
-    if name not in servers:
-        raise HTTPException(status_code=404, detail=f"MCP server '{name}' not found")
-    server = servers[name]
-    if not isinstance(server, dict):
-        raise HTTPException(status_code=500, detail=f"MCP server '{name}' config must be an object")
-    server["enabled"] = enabled
-    _write_mcp_servers(path, data, servers)
-    manager = get_client_manager()
-    reload_result = manager.reload_runtime_config(
-        include_extensions=True,
-        reset_clients=True,
-        extensions_config_path=str(path) if path else None,
-    )
-    return {
-        "success": True,
-        "name": name,
-        "enabled": enabled,
-        "server": _redact_value("mcp_server", server),
-        "reload": reload_result,
-    }
+    def update_and_reload() -> dict[str, Any]:
+        with get_extensions_config_lock():
+            path, data, servers = _mcp_servers_from_extensions(create=True)
+            if name not in servers:
+                raise HTTPException(status_code=404, detail=f"MCP server '{name}' not found")
+            server = servers[name]
+            if not isinstance(server, dict):
+                raise HTTPException(status_code=500, detail=f"MCP server '{name}' config must be an object")
+            server["enabled"] = enabled
+            _write_mcp_servers(path, data, servers)
+        manager = get_client_manager()
+        reload_result = manager.reload_runtime_config(
+            include_extensions=True,
+            reset_clients=True,
+            extensions_config_path=str(path) if path else None,
+        )
+        return {
+            "success": True,
+            "name": name,
+            "enabled": enabled,
+            "server": _redact_value("mcp_server", server),
+            "reload": reload_result,
+        }
+
+    return await asyncio.to_thread(update_and_reload)
 
 
 @router.post("/mcp/{name}/test")

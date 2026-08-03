@@ -42,6 +42,9 @@ def test_finalize_update_applies_llm_patch_to_latest_memory(monkeypatch) -> None
                     "content": "LLM generated fact",
                     "category": "context",
                     "confidence": 0.9,
+                    "scope": "user",
+                    "durability": "durable",
+                    "authority": "descriptive",
                 }
             ],
             "factsToRemove": [],

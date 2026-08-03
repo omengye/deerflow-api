@@ -364,6 +364,12 @@ def _build_middlewares(
     # LoopDetectionMiddleware — detect and break repetitive tool call loops
     middlewares.append(LoopDetectionMiddleware())
 
+    # LangChain executes after_model hooks in reverse middleware order, so the
+    # safety repair sees raw provider output before loop detection does.
+    from deerflow.agents.middlewares.finish_reason_middleware import build_finish_reason_middlewares
+
+    middlewares.extend(build_finish_reason_middlewares())
+
     # Inject custom middlewares before ClarificationMiddleware
     if custom_middlewares:
         middlewares.extend(custom_middlewares)

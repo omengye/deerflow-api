@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -104,6 +105,7 @@ def _make_session_pool_tool(
     server_name: str,
     connection: dict[str, Any],
     tool_interceptors: list[Any] | None = None,
+    tool_name_prefix: bool = True,
 ) -> BaseTool:
     """Wrap an MCP tool so it reuses a persistent session from the pool.
 
@@ -114,10 +116,11 @@ def _make_session_pool_tool(
     The configured ``tool_interceptors`` (OAuth, custom) are preserved and
     applied on every call before invoking the pooled session.
     """
-    # Strip the server-name prefix to recover the original MCP tool name.
+    # Strip only a prefix added by the adapter. An unprefixed server may expose
+    # a tool whose original name itself begins with ``<server_name>_``.
     original_name = tool.name
     prefix = f"{server_name}_"
-    if original_name.startswith(prefix):
+    if tool_name_prefix and original_name.startswith(prefix):
         original_name = original_name[len(prefix) :]
 
     pool = get_session_pool()
@@ -162,7 +165,11 @@ def _make_session_pool_tool(
         args_schema=tool.args_schema,
         coroutine=call_with_persistent_session,
         response_format="content_and_artifact",
-        metadata=tool.metadata,
+        metadata={
+            **(tool.metadata or {}),
+            "mcp_server": server_name,
+            "mcp_original_tool_name": original_name,
+        },
     )
 
 
@@ -177,6 +184,7 @@ async def get_mcp_tools() -> list[BaseTool]:
     """
     try:
         from langchain_mcp_adapters.client import MultiServerMCPClient
+        from langchain_mcp_adapters.tools import load_mcp_tools
     except ImportError:
         logger.warning("langchain-mcp-adapters not installed. Install it to enable MCP tools: pip install langchain-mcp-adapters")
         return []
@@ -200,7 +208,7 @@ async def get_mcp_tools() -> list[BaseTool]:
         for server_name, auth_header in initial_oauth_headers.items():
             if server_name not in servers_config:
                 continue
-            if servers_config[server_name].get("transport") in ("sse", "http"):
+            if servers_config[server_name].get("transport") in ("sse", "http", "streamable_http"):
                 existing_headers = dict(servers_config[server_name].get("headers", {}))
                 existing_headers["Authorization"] = auth_header
                 servers_config[server_name]["headers"] = existing_headers
@@ -233,23 +241,61 @@ async def get_mcp_tools() -> list[BaseTool]:
 
         client = MultiServerMCPClient(servers_config, tool_interceptors=tool_interceptors, tool_name_prefix=True)
 
-        # Discover tools through temporary sessions; persistent-session wrapping
-        # is applied below.
-        tools = await client.get_tools()
+        async def load_server_tools(server_name: str) -> list[BaseTool]:
+            """Discover one server independently and retain its exact provenance."""
+            try:
+                server_config = extensions_config.mcp_servers.get(server_name)
+                tool_name_prefix = server_config.tool_name_prefix if server_config is not None else True
+                if tool_name_prefix:
+                    return await client.get_tools(server_name=server_name)
+                return await load_mcp_tools(
+                    None,
+                    connection=servers_config[server_name],
+                    callbacks=getattr(client, "callbacks", None),
+                    server_name=server_name,
+                    tool_interceptors=getattr(client, "tool_interceptors", tool_interceptors),
+                    tool_name_prefix=False,
+                )
+            except Exception as exc:
+                logger.warning("Skipping MCP server '%s' after tool discovery failed: %s", server_name, exc, exc_info=True)
+                return []
+
+        server_names = list(servers_config)
+        tools_by_server = await asyncio.gather(*(load_server_tools(name) for name in server_names))
+        tools = [tool for server_tools in tools_by_server for tool in server_tools]
         logger.info(f"Successfully loaded {len(tools)} tool(s) from MCP servers")
 
-        wrapped_tools: list[BaseTool] = []
-        for tool in tools:
-            tool_server: str | None = None
-            for name in servers_config:
-                if tool.name.startswith(f"{name}_"):
-                    tool_server = name
-                    break
+        # A visible tool name must identify exactly one producer. This is mainly
+        # relevant when a server disables prefixing; exclude every ambiguous
+        # name instead of making routing depend on configuration order.
+        tool_sources: dict[str, list[str]] = {}
+        for source_name, server_tools in zip(server_names, tools_by_server, strict=True):
+            for tool in server_tools:
+                tool_sources.setdefault(tool.name, []).append(source_name)
+        conflicting_names = {name for name, sources in tool_sources.items() if len(sources) > 1}
+        for name in sorted(conflicting_names):
+            logger.error(
+                "Dropping ambiguous MCP tool '%s' exposed by servers: %s",
+                name,
+                ", ".join(tool_sources[name]),
+            )
 
-            if tool_server is not None:
-                wrapped_tools.append(_make_session_pool_tool(tool, tool_server, servers_config[tool_server], tool_interceptors))
-            else:
-                wrapped_tools.append(tool)
+        wrapped_tools: list[BaseTool] = []
+        for source_name, server_tools in zip(server_names, tools_by_server, strict=True):
+            server_config = extensions_config.mcp_servers.get(source_name)
+            tool_name_prefix = server_config.tool_name_prefix if server_config is not None else True
+            for tool in server_tools:
+                if tool.name in conflicting_names:
+                    continue
+                wrapped_tools.append(
+                    _make_session_pool_tool(
+                        tool,
+                        source_name,
+                        servers_config[source_name],
+                        tool_interceptors,
+                        tool_name_prefix=tool_name_prefix,
+                    )
+                )
 
         # Patch tools to support sync invocation, as deerflow client streams synchronously
         for tool in wrapped_tools:

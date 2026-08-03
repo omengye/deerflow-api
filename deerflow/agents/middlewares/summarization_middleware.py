@@ -411,10 +411,13 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         llm = model if model is not None else self.model
 
         try:
-            response = llm.invoke(
-                self.summary_prompt.format(messages=formatted_messages).rstrip(),
-                config={"metadata": {"lc_source": "summarization"}},
-            )
+            from deerflow.agents.middlewares.llm_error_handling_middleware import llm_call_slot_sync
+
+            with llm_call_slot_sync():
+                response = llm.invoke(
+                    self.summary_prompt.format(messages=formatted_messages).rstrip(),
+                    config={"metadata": {"lc_source": "summarization"}},
+                )
             return response.text.strip()
         except Exception as exc:
             logger.warning("Summarization model invocation failed: %s", exc)
@@ -435,10 +438,13 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         llm = model if model is not None else self.model
 
         try:
-            response = await llm.ainvoke(
-                self.summary_prompt.format(messages=formatted_messages).rstrip(),
-                config={"metadata": {"lc_source": "summarization"}},
-            )
+            from deerflow.agents.middlewares.llm_error_handling_middleware import llm_call_slot_async
+
+            async with llm_call_slot_async():
+                response = await llm.ainvoke(
+                    self.summary_prompt.format(messages=formatted_messages).rstrip(),
+                    config={"metadata": {"lc_source": "summarization"}},
+                )
             return response.text.strip()
         except Exception as exc:
             logger.warning("Summarization model invocation failed: %s", exc)

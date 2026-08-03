@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 # Command classification rules
 # ---------------------------------------------------------------------------
 
+# Executables whose output is dangerous when the substitution itself occupies
+# command position. Word boundaries avoid lookalikes such as ``shellcheck``.
+_RISKY_SUBSTITUTION_EXECUTABLES = r"(?:curl|wget|bash|sh|python[\d.]*|ruby|perl|base64)\b"
+_RISKY_SUBSTITUTION = rf"(?:[$<]\(\s*|`\s*){_RISKY_SUBSTITUTION_EXECUTABLES}"
+_CODE_STRING_INTERPRETERS = r"(?:(?:ba|da|k|z)?sh|python[\d.]*|perl|ruby|node|php)"
+_LEADING_FLAGS = r"(?:(?:--?[\w-]+(?:=\S+)?)\s+){0,4}"
+_CODE_EXECUTION_FLAG = r"-[A-Za-z]*[cepr][A-Za-z]*"
+
 # Each pattern is compiled once at import time.
 _HIGH_RISK_PATTERNS: list[re.Pattern[str]] = [
     # --- original rules (retained) ---
@@ -31,8 +39,10 @@ _HIGH_RISK_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r">+\s*/etc/"),
     # --- pipe to sh/bash (generalised, replaces old curl|sh rule) ---
     re.compile(r"\|\s*(ba)?sh\b"),
-    # --- command substitution (targeted – only dangerous executables) ---
-    re.compile(r"[`$]\(?\s*(curl|wget|bash|sh|python|ruby|perl|base64)"),
+    # --- contexts that execute substitution output regardless of position ---
+    re.compile(rf"\b(eval|source)\s+[\"']?{_RISKY_SUBSTITUTION}"),
+    re.compile(rf"\b{_CODE_STRING_INTERPRETERS}\s+{_LEADING_FLAGS}{_CODE_EXECUTION_FLAG}\s+[\"']?{_RISKY_SUBSTITUTION}"),
+    re.compile(rf"\b{_CODE_STRING_INTERPRETERS}\s+{_LEADING_FLAGS}<<<\s*[\"']?{_RISKY_SUBSTITUTION}"),
     # --- base64 decode piped to execution ---
     re.compile(r"base64\s+.*-d.*\|"),
     # --- overwrite system binaries ---
@@ -48,6 +58,15 @@ _HIGH_RISK_PATTERNS: list[re.Pattern[str]] = [
     # --- fork bomb ---
     re.compile(r"\S+\(\)\s*\{[^}]*\|\s*\S+\s*&"),  # :(){ :|:& };:
     re.compile(r"while\s+true.*&\s*done"),  # while true; do bash & done
+]
+
+# A substitution is dangerous in command position but is ordinary output
+# capture in value/argument position (``code=$(curl ...)`` or ``echo $(curl ...)``).
+_SHELL_ASSIGNMENT = r"\w+=(?:[^\s\"']+|'[^']*'|\"[^\"]*\"|)"
+_COMMAND_POSITION_PREFIX = rf"(?:(?:env|command|builtin|exec|nohup|time|sudo|doas)\s+|{_SHELL_ASSIGNMENT}\s+){{0,8}}"
+_HIGH_RISK_COMMAND_POSITION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(rf"^{_COMMAND_POSITION_PREFIX}[\"']?\$\(\s*{_RISKY_SUBSTITUTION_EXECUTABLES}"),
+    re.compile(rf"^{_COMMAND_POSITION_PREFIX}[\"']?`\s*{_RISKY_SUBSTITUTION_EXECUTABLES}"),
 ]
 
 _MEDIUM_RISK_PATTERNS: list[re.Pattern[str]] = [
@@ -72,6 +91,10 @@ _SAFE_DEV_TCP_PROBE_PATTERN = re.compile(
     r"(?:\s*(?:&&|\|\|)\s*echo\s+['\"]?[^;&|<>`$()]*['\"]?)*$"
 )
 _ALLOWED_DEV_TCP_PROBE_PORTS = {19825}
+
+# A conservative heredoc recognizer used only to avoid promoting body lines to
+# shell command positions. ``<<<`` and arithmetic ``<<`` are excluded below.
+_HEREDOC_HEADER = re.compile(r"(?<!<)<<(?!<)-?[ \t]*(?:\\?([A-Za-z_][\w.-]*)|'([^'\n]*)'|\"([^\"\n]*)\")")
 
 
 def _strip_full_line_comments(command: str) -> str:
@@ -105,7 +128,23 @@ def _is_safe_dev_tcp_probe(command: str) -> bool:
     return _SAFE_DEV_TCP_PROBE_PATTERN.fullmatch(normalized) is not None
 
 
-def _split_compound_command(command: str) -> list[str]:
+def _consume_heredoc_bodies(command: str, pos: int, delimiters: list[str]) -> int:
+    """Return the position after heredoc bodies opened on the header line."""
+    for delimiter in delimiters:
+        while pos < len(command):
+            newline = command.find("\n", pos)
+            if newline == -1:
+                return len(command)
+            line = command[pos:newline]
+            pos = newline + 1
+            if line.strip() == delimiter:
+                break
+        else:
+            return len(command)
+    return pos
+
+
+def _split_compound_command(command: str, *, split_pipes: bool = False) -> list[str]:
     """Split a compound command into sub-commands (quote-aware).
 
     Scans the raw command string so unquoted shell control operators are
@@ -117,8 +156,10 @@ def _split_compound_command(command: str) -> list[str]:
     """
     parts: list[str] = []
     current: list[str] = []
+    pending_heredocs: list[str] = []
     in_single_quote = False
     in_double_quote = False
+    arithmetic_depth = 0
     escaping = False
     index = 0
 
@@ -150,12 +191,49 @@ def _split_compound_command(command: str) -> list[str]:
             continue
 
         if not in_single_quote and not in_double_quote:
+            if char == "(" and command.startswith("((", index):
+                arithmetic_depth += 1
+                current.append("((")
+                index += 2
+                continue
+            if arithmetic_depth and char == ")" and command.startswith("))", index):
+                arithmetic_depth -= 1
+                current.append("))")
+                index += 2
+                continue
+            if char == "<" and not arithmetic_depth:
+                heredoc = _HEREDOC_HEADER.match(command, index)
+                if heredoc:
+                    pending_heredocs.append(next(group for group in heredoc.groups() if group is not None))
+                    current.append(heredoc.group(0))
+                    index = heredoc.end()
+                    continue
+            if char == "\n":
+                if pending_heredocs:
+                    body_end = _consume_heredoc_bodies(command, index + 1, pending_heredocs)
+                    pending_heredocs = []
+                    current.append(command[index:body_end])
+                    index = body_end
+                else:
+                    index += 1
+                part = "".join(current).strip()
+                if part:
+                    parts.append(part)
+                current = []
+                continue
             if command.startswith("&&", index) or command.startswith("||", index):
                 part = "".join(current).strip()
                 if part:
                     parts.append(part)
                 current = []
                 index += 2
+                continue
+            if split_pipes and char == "|":
+                part = "".join(current).strip()
+                if part:
+                    parts.append(part)
+                current = []
+                index += 1
                 continue
             if char == ";":
                 part = "".join(current).strip()
@@ -178,6 +256,12 @@ def _split_compound_command(command: str) -> list[str]:
     return parts if parts else [command]
 
 
+def _matches_high_risk(candidate: str) -> bool:
+    if any(pattern.search(candidate) for pattern in _HIGH_RISK_PATTERNS):
+        return True
+    return any(pattern.match(candidate) for pattern in _HIGH_RISK_COMMAND_POSITION_PATTERNS)
+
+
 def _classify_single_command(command: str) -> str:
     """Classify a single (non-compound) command. Return 'block', 'warn', or 'pass'."""
     normalized = " ".join(command.split())
@@ -185,19 +269,18 @@ def _classify_single_command(command: str) -> str:
     if _is_safe_dev_tcp_probe(command):
         return "warn"
 
-    for pattern in _HIGH_RISK_PATTERNS:
-        if pattern.search(normalized):
-            return "block"
+    if _matches_high_risk(normalized):
+        return "block"
 
     # Also try shlex-parsed tokens for high-risk detection
     try:
         tokens = shlex.split(command)
         joined = " ".join(tokens)
-        for pattern in _HIGH_RISK_PATTERNS:
-            if pattern.search(joined):
-                return "block"
+        if _matches_high_risk(joined):
+            return "block"
     except ValueError:
-        # shlex.split fails on unclosed quotes — treat as suspicious
+        # Unbalanced quoting is not safe to reinterpret. Properly terminated
+        # heredocs remain parseable enough for the raw scanner above.
         return "block"
 
     for pattern in _MEDIUM_RISK_PATTERNS:
@@ -227,7 +310,7 @@ def _classify_command(command: str) -> str:
             return "block"
 
     # Pass 2: per-sub-command classification
-    sub_commands = _split_compound_command(command)
+    sub_commands = _split_compound_command(command, split_pipes=True)
     worst = "pass"
     for sub in sub_commands:
         verdict = _classify_single_command(sub)

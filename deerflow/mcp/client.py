@@ -29,12 +29,12 @@ def build_server_params(server_name: str, config: McpServerConfig) -> dict[str, 
         # Add environment variables if present
         if config.env:
             params["env"] = config.env
-    elif transport_type in ("sse", "http"):
+    elif transport_type in ("sse", "http", "streamable_http", "websocket"):
         if not config.url:
             raise ValueError(f"MCP server '{server_name}' with {transport_type} transport requires 'url' field")
         params["url"] = config.url
-        # Add headers if present
-        if config.headers:
+        # WebSocket connections in langchain-mcp-adapters do not accept headers.
+        if config.headers and transport_type != "websocket":
             params["headers"] = config.headers
     else:
         raise ValueError(f"MCP server '{server_name}' has unsupported transport type: {transport_type}")
