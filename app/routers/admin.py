@@ -86,7 +86,7 @@ _SECRET_KEY_NAMES = {
     "refresh_token",
     "app_secret",
 }
-_SECRET_KEY_PARTS = ("api_key", "secret", "token", "password", "authorization")
+_SECRET_KEY_PARTS = ("api_key", "secret", "password", "authorization")
 
 
 class AdminModelsUpdateRequest(BaseModel):
@@ -444,7 +444,11 @@ def _is_secret_key(key: str | None) -> bool:
     if not key:
         return False
     normalized = key.lower().replace("-", "_")
-    return normalized in _SECRET_KEY_NAMES or any(part in normalized for part in _SECRET_KEY_PARTS)
+    if normalized in _SECRET_KEY_NAMES or any(part in normalized for part in _SECRET_KEY_PARTS):
+        return True
+    # Match credential fields such as access_token without treating token-count
+    # settings such as max_tokens or max_input_tokens as secrets.
+    return "token" in normalized.split("_")
 
 
 def _redacted_secret(value: Any) -> Any:

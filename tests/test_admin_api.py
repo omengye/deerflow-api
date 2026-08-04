@@ -178,6 +178,34 @@ tool_groups: []
         self.assertTrue(payload["models"][0]["api_key"]["redacted"])
         self.assertTrue(payload["api"]["api_keys"]["redacted"])
 
+    def test_admin_config_does_not_redact_model_token_limits(self) -> None:
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        raw["models"][0].update(
+            {
+                "max_tokens": 8192,
+                "profile": {
+                    "max_input_tokens": 1_000_000,
+                    "max_output_tokens": 65_536,
+                    "access_token": "profile-secret",
+                },
+            }
+        )
+        self.config_path.write_text(
+            yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        reset_app_config()
+        client = self._client()
+
+        response = client.get("/api/admin/config", headers=self._auth_headers())
+
+        self.assertEqual(response.status_code, 200)
+        model = response.json()["models"][0]
+        self.assertEqual(model["max_tokens"], 8192)
+        self.assertEqual(model["profile"]["max_input_tokens"], 1_000_000)
+        self.assertEqual(model["profile"]["max_output_tokens"], 65_536)
+        self.assertTrue(model["profile"]["access_token"]["redacted"])
+
     def test_admin_config_summary_reports_acp_timeout(self) -> None:
         """The ACP overview must surface timeout_seconds.
 
