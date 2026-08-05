@@ -8,7 +8,7 @@
 cd deerflow-api
 
 # 1. 安装依赖（uv 管理）
-uv sync
+uv sync --frozen --inexact
 
 # 2. 编辑 config.yaml，填入你的 API Key
 # 默认使用 DashScope（通义千问），替换 YOUR_DASHSCOPE_API_KEY
@@ -53,6 +53,20 @@ tracing:
 ```
 
 仍建议保留在环境变量中的只有进程级或系统级凭据/变量，例如 `CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`、`ANTHROPIC_AUTH_TOKEN`、`HOME`、`SystemRoot` 等。
+
+## Checkpoint 与长期记忆
+
+本分支已同步字节 DeerFlow 近期的 checkpoint / memory 优化思路：checkpoint 支持 `full`、`delta` 双模式和可配置快照频率；delta 历史可使用进程内 LRU 或 Redis 缓存。模式与快照频率都是进程级冻结配置，修改后必须重启所有共享同一 checkpoint 数据库的进程。`full -> delta` 可直接读取；`delta -> full` 会 fail-closed，避免把 delta sentinel 误当成空状态。
+
+长期记忆通过 `MemoryManager` 接口选择后端。默认 `deermem` 兼容原有 JSON + FTS5 行为；`mem0` 使用 HTTP API，API Key 只从 `backend_config.api_key_env` 指定的环境变量读取。mem0 不会自动迁移 DeerMem 数据。
+
+记忆支持 `middleware` 自动召回和 `tool` 按需召回两种模式；tool 模式会注册 `memory_search`，运行时 `user_id`、`agent_name`、`thread_id` 会分别映射到 mem0 的用户、Agent 和 run 作用域。
+
+启用 API 鉴权后，可在 `/management/` 的“长期记忆”区域编辑完整 Memory 配置，先执行校验/后端测试，再“保存并应用”。mem0 的实际 API Key 不会写入或回显到管理页面，必须预先放入服务进程环境变量；页面只保存环境变量名。切换 DeerMem、mem0 或自定义后端不会自动迁移已有数据。
+
+Linux 生产部署时，运行用户必须对 `config.yaml` 和 DeerMem 数据所在目录有写权限，以便创建 `.config.yaml.lock`、`.memory.json.lock` 及同目录原子临时文件。单机多 worker 必须共享相同的配置、数据和锁文件目录；由于热重载只作用于接收管理请求的进程，多 worker 部署在保存后仍应滚动重启全部 worker。上线前请备份 `config.yaml` 和 DeerMem 数据文件，并用 `/health/ready` 与管理页“测试后端”复核。
+
+完整配置、迁移规则和故障策略见 [Checkpoint 与记忆优化说明](docs/checkpoint-memory-optimizations.md)，可直接复制的 YAML 见 [config.example.yaml](config.example.yaml)。
 
 ## ACP Agent 对接（Codex / Claude Code）
 

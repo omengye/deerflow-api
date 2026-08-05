@@ -43,6 +43,12 @@
     titleConfig: null,
     subagentsConfig: null,
     memoryConfig: null,
+    memoryRevision: null,
+    memoryRuntime: null,
+    memoryCredentials: null,
+    memoryBackendDrafts: {},
+    memoryManagerKind: "deermem",
+    memoryCustomManagerClass: "",
     summarizationConfig: null,
     configHealth: null,
     scheduledTasks: [],
@@ -158,8 +164,17 @@
     agentSystemSummary: document.getElementById("agentSystemSummary"),
     memoryEditForm: document.getElementById("memoryEditForm"),
     saveMemoryButton: document.getElementById("saveMemoryButton"),
+    validateMemoryButton: document.getElementById("validateMemoryButton"),
+    testMemoryButton: document.getElementById("testMemoryButton"),
+    memoryStatusSummary: document.getElementById("memoryStatusSummary"),
+    memoryWarning: document.getElementById("memoryWarning"),
     memoryEnabled: document.getElementById("memoryEnabled"),
+    memoryManagerType: document.getElementById("memoryManagerType"),
+    memoryMode: document.getElementById("memoryMode"),
+    memoryModeHelp: document.getElementById("memoryModeHelp"),
     memoryInjectionEnabled: document.getElementById("memoryInjectionEnabled"),
+    memoryShutdownFlush: document.getElementById("memoryShutdownFlush"),
+    memoryDeerMemSection: document.getElementById("memoryDeerMemSection"),
     memoryModelName: document.getElementById("memoryModelName"),
     memoryDebounce: document.getElementById("memoryDebounce"),
     memoryMaxFacts: document.getElementById("memoryMaxFacts"),
@@ -167,6 +182,26 @@
     memoryMaxInjectionTokens: document.getElementById("memoryMaxInjectionTokens"),
     memoryStoragePath: document.getElementById("memoryStoragePath"),
     memoryStorageClass: document.getElementById("memoryStorageClass"),
+    memoryRetrievalEnabled: document.getElementById("memoryRetrievalEnabled"),
+    memoryRetrievalTopK: document.getElementById("memoryRetrievalTopK"),
+    memoryRetrievalIndexPath: document.getElementById("memoryRetrievalIndexPath"),
+    memoryMem0Section: document.getElementById("memoryMem0Section"),
+    memoryMem0ApiKeyEnv: document.getElementById("memoryMem0ApiKeyEnv"),
+    memoryMem0BaseUrl: document.getElementById("memoryMem0BaseUrl"),
+    memoryMem0AllowHttp: document.getElementById("memoryMem0AllowHttp"),
+    memoryMem0DefaultUser: document.getElementById("memoryMem0DefaultUser"),
+    memoryMem0TopK: document.getElementById("memoryMem0TopK"),
+    memoryMem0ScoreThreshold: document.getElementById("memoryMem0ScoreThreshold"),
+    memoryMem0MaxChars: document.getElementById("memoryMem0MaxChars"),
+    memoryMem0Timeout: document.getElementById("memoryMem0Timeout"),
+    memoryMem0StartupPolicy: document.getElementById("memoryMem0StartupPolicy"),
+    memoryMem0ReadPolicy: document.getElementById("memoryMem0ReadPolicy"),
+    memoryMem0WritePolicy: document.getElementById("memoryMem0WritePolicy"),
+    memoryMem0CredentialStatus: document.getElementById("memoryMem0CredentialStatus"),
+    memoryCustomSection: document.getElementById("memoryCustomSection"),
+    memoryCustomManagerClass: document.getElementById("memoryCustomManagerClass"),
+    memoryCustomBackendConfig: document.getElementById("memoryCustomBackendConfig"),
+    memoryConfigPreview: document.getElementById("memoryConfigPreview"),
     memoryMessage: document.getElementById("memoryMessage"),
     summarizationEditForm: document.getElementById("summarizationEditForm"),
     saveSummarizationButton: document.getElementById("saveSummarizationButton"),
@@ -330,6 +365,25 @@
       .replace(/"/g, "&quot;");
   }
 
+  function structuredCloneSafe(value) {
+    if (value === undefined) return undefined;
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function formatApiDetail(detail, fallback = "请求失败") {
+    if (typeof detail === "string" && detail) return detail;
+    if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+      const errors = Array.isArray(detail.errors)
+        ? detail.errors.map((item) => `${item.path || "配置"}: ${item.message || "无效"}`).join("；")
+        : "";
+      return [detail.message || detail.code, errors].filter(Boolean).join("；") || JSON.stringify(detail);
+    }
+    if (Array.isArray(detail)) {
+      return detail.map((item) => item.msg || item.message || JSON.stringify(item)).join("；");
+    }
+    return fallback;
+  }
+
   function authHeaders() {
     const headers = {};
     if (state.token) {
@@ -374,7 +428,7 @@
 
       if (!response.ok && !options.allowHttpError) {
         const detail = payload && payload.detail ? payload.detail : response.statusText;
-        const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+        const error = new Error(formatApiDetail(detail, response.statusText));
         error.status = response.status;
         error.payload = payload;
         throw error;
@@ -519,7 +573,22 @@
 
   async function loadMemoryConfig() {
     const data = await request("/api/admin/memory");
-    state.memoryConfig = data?.config && typeof data.config === "object" ? data.config : {};
+    const canonical = data?.canonical_config && typeof data.canonical_config === "object"
+      ? data.canonical_config
+      : data?.config && typeof data.config === "object"
+        ? data.config
+        : {};
+    state.memoryConfig = canonical;
+    state.memoryRevision = data?.revision || null;
+    state.memoryRuntime = data?.runtime || null;
+    state.memoryCredentials = data?.credentials || null;
+    const managerClass = String(canonical.manager_class || "deermem");
+    const managerKind = ["deermem", "mem0"].includes(managerClass) ? managerClass : "custom";
+    state.memoryManagerKind = managerKind;
+    state.memoryCustomManagerClass = managerKind === "custom" ? managerClass : "";
+    state.memoryBackendDrafts = {
+      [managerKind]: structuredCloneSafe(canonical.backend_config || {}),
+    };
     renderMemoryConfig();
     return data;
   }
@@ -657,7 +726,7 @@
   function refreshAgentModelSelectors() {
     const fields = [
       [el.titleModelName, state.titleConfig?.model_name],
-      [el.memoryModelName, state.memoryConfig?.model_name],
+      [el.memoryModelName, state.memoryConfig?.backend_config?.model_name ?? state.memoryConfig?.model_name],
       [el.summarizationModelName, state.summarizationConfig?.model_name],
     ];
     fields.forEach(([field, configured]) => {
@@ -692,15 +761,241 @@
   function renderMemoryConfig() {
     const config = state.memoryConfig;
     if (!config || !el.memoryEditForm) return;
+    const managerClass = String(config.manager_class || "deermem");
+    const managerKind = ["deermem", "mem0"].includes(managerClass) ? managerClass : "custom";
+    const legacyBackend = {
+      storage_path: config.storage_path,
+      storage_class: config.storage_class,
+      debounce_seconds: config.debounce_seconds,
+      model_name: config.model_name,
+      max_facts: config.max_facts,
+      fact_confidence_threshold: config.fact_confidence_threshold,
+      max_injection_tokens: config.max_injection_tokens,
+      retrieval_enabled: config.retrieval_enabled,
+      retrieval_top_k: config.retrieval_top_k,
+      retrieval_index_path: config.retrieval_index_path,
+    };
+    const backend = config.backend_config && typeof config.backend_config === "object"
+      ? config.backend_config
+      : Object.fromEntries(Object.entries(legacyBackend).filter(([, value]) => value !== undefined));
+    state.memoryManagerKind = managerKind;
+    state.memoryBackendDrafts[managerKind] = structuredCloneSafe(backend);
+    if (managerKind === "custom") state.memoryCustomManagerClass = managerClass;
+
     el.memoryEnabled.checked = Boolean(config.enabled);
+    el.memoryManagerType.value = managerKind;
+    el.memoryMode.value = config.mode || "middleware";
     el.memoryInjectionEnabled.checked = Boolean(config.injection_enabled);
-    el.memoryModelName.innerHTML = modelOptions(config.model_name || "");
-    el.memoryDebounce.value = config.debounce_seconds ?? 30;
-    el.memoryMaxFacts.value = config.max_facts ?? 100;
-    el.memoryConfidence.value = config.fact_confidence_threshold ?? 0.7;
-    el.memoryMaxInjectionTokens.value = config.max_injection_tokens ?? 2000;
-    el.memoryStoragePath.value = config.storage_path || "";
-    el.memoryStorageClass.value = config.storage_class || "";
+    el.memoryShutdownFlush.value = config.shutdown_flush_timeout_seconds ?? 30;
+    el.memoryCustomManagerClass.value = state.memoryCustomManagerClass;
+    renderMemoryBackendDraft(managerKind);
+    updateMemorySectionVisibility();
+    renderMemoryStatus();
+    updateMemoryPreview();
+  }
+
+  function memoryBackendDefaults(kind) {
+    if (kind === "mem0") {
+      return {
+        api_key_env: "MEM0_API_KEY",
+        base_url: "https://api.mem0.ai",
+        allow_insecure_http: false,
+        default_user_id: "deerflow",
+        top_k: 8,
+        score_threshold: 0.1,
+        max_injection_chars: 12000,
+        timeout_seconds: 10,
+        startup_policy: "fail_fast",
+        failure_policy: { read: "fail_open", write: "log_and_drop" },
+      };
+    }
+    if (kind === "deermem") {
+      return {
+        storage_path: "",
+        storage_class: "deerflow.agents.memory.storage.FileMemoryStorage",
+        debounce_seconds: 30,
+        model_name: null,
+        max_facts: 100,
+        fact_confidence_threshold: 0.7,
+        max_injection_tokens: 2000,
+        retrieval_enabled: true,
+        retrieval_top_k: 12,
+        retrieval_index_path: "",
+      };
+    }
+    return {};
+  }
+
+  function renderMemoryBackendDraft(kind) {
+    const draft = {
+      ...memoryBackendDefaults(kind),
+      ...(state.memoryBackendDrafts[kind] || {}),
+    };
+    if (kind === "deermem") {
+      el.memoryModelName.innerHTML = modelOptions(draft.model_name || "");
+      el.memoryDebounce.value = draft.debounce_seconds ?? 30;
+      el.memoryMaxFacts.value = draft.max_facts ?? 100;
+      el.memoryConfidence.value = draft.fact_confidence_threshold ?? 0.7;
+      el.memoryMaxInjectionTokens.value = draft.max_injection_tokens ?? 2000;
+      el.memoryStoragePath.value = draft.storage_path || "";
+      el.memoryStorageClass.value = draft.storage_class || "deerflow.agents.memory.storage.FileMemoryStorage";
+      el.memoryRetrievalEnabled.checked = draft.retrieval_enabled !== false;
+      el.memoryRetrievalTopK.value = draft.retrieval_top_k ?? 12;
+      el.memoryRetrievalIndexPath.value = draft.retrieval_index_path || "";
+    } else if (kind === "mem0") {
+      const failurePolicy = draft.failure_policy || {};
+      el.memoryMem0ApiKeyEnv.value = draft.api_key_env || "MEM0_API_KEY";
+      el.memoryMem0BaseUrl.value = draft.base_url || "https://api.mem0.ai";
+      el.memoryMem0AllowHttp.checked = Boolean(draft.allow_insecure_http);
+      el.memoryMem0DefaultUser.value = draft.default_user_id || "deerflow";
+      el.memoryMem0TopK.value = draft.top_k ?? 8;
+      el.memoryMem0ScoreThreshold.value = draft.score_threshold ?? 0.1;
+      el.memoryMem0MaxChars.value = draft.max_injection_chars ?? 12000;
+      el.memoryMem0Timeout.value = draft.timeout_seconds ?? 10;
+      el.memoryMem0StartupPolicy.value = draft.startup_policy || "fail_fast";
+      el.memoryMem0ReadPolicy.value = failurePolicy.read || "fail_open";
+      el.memoryMem0WritePolicy.value = failurePolicy.write || "log_and_drop";
+    } else {
+      el.memoryCustomManagerClass.value = state.memoryCustomManagerClass || "";
+      el.memoryCustomBackendConfig.value = JSON.stringify(draft, null, 2);
+    }
+  }
+
+  function setMemorySectionActive(section, active) {
+    section.classList.toggle("hidden", !active);
+    section.querySelectorAll("input, select, textarea").forEach((field) => {
+      field.disabled = !active;
+    });
+  }
+
+  function updateMemorySectionVisibility() {
+    const kind = el.memoryManagerType.value;
+    setMemorySectionActive(el.memoryDeerMemSection, kind === "deermem");
+    setMemorySectionActive(el.memoryMem0Section, kind === "mem0");
+    setMemorySectionActive(el.memoryCustomSection, kind === "custom");
+    el.memoryCustomManagerClass.required = kind === "custom";
+    const toolMode = el.memoryMode.value === "tool";
+    el.memoryInjectionEnabled.disabled = toolMode;
+    if (kind === "deermem" && toolMode) {
+      // DeerMem's memory_search implementation is backed by FTS5; disabling
+      // retrieval would make tool mode silently return no results.
+      el.memoryRetrievalEnabled.checked = true;
+    }
+    el.memoryRetrievalEnabled.disabled = kind !== "deermem" || toolMode;
+    el.memoryModeHelp.textContent = toolMode
+      ? "tool 模式不会自动注入记忆，Agent 将通过 memory_search 按需检索；DeerMem 会强制启用 FTS5，后台记忆写入仍保持启用。"
+      : "middleware 模式会在每次模型调用前召回相关记忆。";
+    const httpWarning = kind === "mem0" && el.memoryMem0AllowHttp.checked;
+    const backendChanged = state.memoryConfig && (
+      kind === "custom"
+        ? el.memoryCustomManagerClass.value.trim() !== state.memoryConfig.manager_class
+        : kind !== state.memoryConfig.manager_class
+    );
+    const warnings = [];
+    if (backendChanged) warnings.push("切换后端不会自动迁移已有记忆；保存时会先排空旧后端待写入队列。");
+    if (httpWarning) warnings.push("当前允许明文 HTTP，请确认服务只位于可信内网。生产环境优先使用 HTTPS。");
+    el.memoryWarning.textContent = warnings.join(" ");
+    el.memoryWarning.classList.toggle("hidden", warnings.length === 0);
+  }
+
+  function numericFieldValue(field, fallback) {
+    const value = Number(field.value);
+    return Number.isFinite(value) ? value : fallback;
+  }
+
+  function captureMemoryBackendDraft(kind, { reportError = false } = {}) {
+    if (kind === "deermem") {
+      state.memoryBackendDrafts.deermem = {
+        ...(state.memoryBackendDrafts.deermem || {}),
+        storage_path: el.memoryStoragePath.value.trim(),
+        storage_class: el.memoryStorageClass.value.trim(),
+        debounce_seconds: numericFieldValue(el.memoryDebounce, 30),
+        model_name: el.memoryModelName.value || null,
+        max_facts: numericFieldValue(el.memoryMaxFacts, 100),
+        fact_confidence_threshold: numericFieldValue(el.memoryConfidence, 0.7),
+        max_injection_tokens: numericFieldValue(el.memoryMaxInjectionTokens, 2000),
+        retrieval_enabled: el.memoryRetrievalEnabled.checked,
+        retrieval_top_k: numericFieldValue(el.memoryRetrievalTopK, 12),
+        retrieval_index_path: el.memoryRetrievalIndexPath.value.trim(),
+      };
+      return true;
+    }
+    if (kind === "mem0") {
+      state.memoryBackendDrafts.mem0 = {
+        api_key_env: el.memoryMem0ApiKeyEnv.value.trim(),
+        base_url: el.memoryMem0BaseUrl.value.trim(),
+        allow_insecure_http: el.memoryMem0AllowHttp.checked,
+        default_user_id: el.memoryMem0DefaultUser.value.trim(),
+        top_k: numericFieldValue(el.memoryMem0TopK, 8),
+        score_threshold: numericFieldValue(el.memoryMem0ScoreThreshold, 0.1),
+        max_injection_chars: numericFieldValue(el.memoryMem0MaxChars, 12000),
+        timeout_seconds: numericFieldValue(el.memoryMem0Timeout, 10),
+        startup_policy: el.memoryMem0StartupPolicy.value,
+        failure_policy: {
+          read: el.memoryMem0ReadPolicy.value,
+          write: el.memoryMem0WritePolicy.value,
+        },
+      };
+      return true;
+    }
+    try {
+      const raw = el.memoryCustomBackendConfig.value.trim();
+      const parsed = raw ? JSON.parse(raw) : {};
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("backend_config 必须是 JSON 对象");
+      }
+      state.memoryBackendDrafts.custom = parsed;
+      state.memoryCustomManagerClass = el.memoryCustomManagerClass.value.trim();
+      return true;
+    } catch (error) {
+      if (reportError) el.memoryMessage.textContent = `自定义 backend_config 无效：${error.message}`;
+      return false;
+    }
+  }
+
+  function collectMemoryCandidate({ reportError = false } = {}) {
+    const kind = el.memoryManagerType.value;
+    if (!captureMemoryBackendDraft(kind, { reportError })) return null;
+    const managerClass = kind === "custom" ? el.memoryCustomManagerClass.value.trim() : kind;
+    if (!managerClass) {
+      if (reportError) el.memoryMessage.textContent = "自定义 Manager 类路径不能为空。";
+      return null;
+    }
+    return {
+      enabled: el.memoryEnabled.checked,
+      manager_class: managerClass,
+      mode: el.memoryMode.value,
+      injection_enabled: el.memoryInjectionEnabled.checked,
+      shutdown_flush_timeout_seconds: numericFieldValue(el.memoryShutdownFlush, 30),
+      backend_config: structuredCloneSafe(state.memoryBackendDrafts[kind] || memoryBackendDefaults(kind)),
+    };
+  }
+
+  function updateMemoryPreview() {
+    const candidate = collectMemoryCandidate();
+    el.memoryConfigPreview.textContent = candidate
+      ? JSON.stringify(candidate, null, 2)
+      : "当前自定义 backend_config 不是有效的 JSON 对象。";
+  }
+
+  function renderMemoryStatus() {
+    const config = state.memoryConfig || {};
+    const manager = config.manager_class || "deermem";
+    const pending = state.memoryRuntime?.pending_writes;
+    const processing = state.memoryRuntime?.processing;
+    el.memoryStatusSummary.innerHTML = [
+      badge(config.enabled ? "已启用" : "已停用", config.enabled ? "ok" : "neutral"),
+      `<span><strong>后端</strong> ${escapeHtml(manager)}</span>`,
+      `<span><strong>模式</strong> ${escapeHtml(config.mode || "middleware")}</span>`,
+      `<span><strong>待写入</strong> ${pending ?? "--"}${processing ? "（处理中）" : ""}</span>`,
+    ].join("");
+    if (state.memoryCredentials?.api_key_env) {
+      el.memoryMem0CredentialStatus.textContent = state.memoryCredentials.env_present
+        ? `服务端已检测到环境变量 ${state.memoryCredentials.api_key_env}。`
+        : `服务端未检测到环境变量 ${state.memoryCredentials.api_key_env}；测试和启用 mem0 将失败。`;
+    } else {
+      el.memoryMem0CredentialStatus.textContent = "页面只配置环境变量名称，不会读取或保存 API Key 值。";
+    }
   }
 
   function renderSummarizationConfig() {
@@ -735,7 +1030,7 @@
       ["状态", statusLabels[health.status] || health.status],
       ["配置可解析", health.valid ? "是" : "否"],
       ["配置版本", `${health.current_version} / ${health.latest_version}`],
-      ["文件可写", health.writable ? "是" : "否"],
+      ["原子写权限", health.writable ? "文件和目录均可写" : "不足"],
       ["缺失模块", health.missing_sections?.length ? health.missing_sections.join(", ") : "无"],
       ["未知模块", health.unknown_sections?.length ? health.unknown_sections.join(", ") : "无"],
       ["明文凭据", `${health.literal_secrets?.count || 0} 项`],
@@ -2025,44 +2320,128 @@
     }
   }
 
-  async function saveMemoryConfig() {
+  function validatedMemoryCandidate() {
     el.memoryMessage.textContent = "";
     if (!el.memoryEditForm.checkValidity()) {
       el.memoryEditForm.reportValidity();
       el.memoryMessage.textContent = "请修正超出允许范围的 Memory 配置。";
-      return;
+      return null;
     }
-    const storageClass = el.memoryStorageClass.value.trim();
-    if (!storageClass) {
-      el.memoryMessage.textContent = "storage_class 不能为空。";
-      el.memoryStorageClass.focus();
-      return;
-    }
-    const config = {
-      enabled: el.memoryEnabled.checked,
-      injection_enabled: el.memoryInjectionEnabled.checked,
-      model_name: el.memoryModelName.value || null,
-      debounce_seconds: Number(el.memoryDebounce.value || 30),
-      max_facts: Number(el.memoryMaxFacts.value || 100),
-      fact_confidence_threshold: Number(el.memoryConfidence.value || 0.7),
-      max_injection_tokens: Number(el.memoryMaxInjectionTokens.value || 2000),
-      storage_path: el.memoryStoragePath.value.trim(),
-      storage_class: storageClass,
-    };
-    setBusy(el.saveMemoryButton, true, "保存中");
+    return collectMemoryCandidate({ reportError: true });
+  }
+
+  async function validateMemoryConfig() {
+    const config = validatedMemoryCandidate();
+    if (!config) return;
+    setBusy(el.validateMemoryButton, true, "校验中");
     try {
-      const data = await request("/api/admin/memory", {
-        method: "PUT",
-        body: { config, reload: true },
+      const data = await request("/api/admin/memory/validate", {
+        method: "POST",
+        body: { config },
         timeoutMs: 20000,
       });
-      state.memoryConfig = data.config;
+      const warningLabels = {
+        injection_ignored_in_tool_mode: "tool 模式会保留但忽略自动注入开关。",
+        memory_backend_migration_not_automatic: "切换后端不会自动迁移已有记忆数据。",
+      };
+      const warnings = Array.isArray(data?.warnings)
+        ? data.warnings.map((item) => warningLabels[item.code] || item.message).join(" ")
+        : "";
+      el.memoryMessage.textContent = warnings ? `配置有效。${warnings}` : "配置有效，可以保存。";
+      showToast("Memory 配置校验通过。");
+    } catch (error) {
+      el.memoryMessage.textContent = `校验失败：${error.message}`;
+    } finally {
+      setBusy(el.validateMemoryButton, false);
+    }
+  }
+
+  async function testMemoryConfig() {
+    const config = validatedMemoryCandidate();
+    if (!config) return;
+    setBusy(el.testMemoryButton, true, "测试中");
+    try {
+      const data = await request("/api/admin/memory/test", {
+        method: "POST",
+        body: { config },
+        // Server-side custom probes are capped at 130s.  Leave transport
+        // overhead so the UI receives the structured timeout response.
+        timeoutMs: 150000,
+      });
+      const env = data?.credentials?.api_key_env;
+      const credential = env ? `；环境变量 ${env} ${data.credentials.env_present ? "已配置" : "未配置"}` : "";
+      el.memoryMessage.textContent = `后端测试通过${credential}。`;
+      showToast("Memory 后端测试通过。");
+    } catch (error) {
+      const detail = error.payload?.detail;
+      if (detail?.code === "memory_probe_failed" && config.manager_class === "mem0") {
+        el.memoryMessage.textContent = `后端测试失败：服务端未配置 ${config.backend_config.api_key_env}，或 mem0 服务连接失败。详情：${detail.message}`;
+      } else {
+        el.memoryMessage.textContent = `后端测试失败：${error.message}`;
+      }
+    } finally {
+      setBusy(el.testMemoryButton, false);
+    }
+  }
+
+  async function saveMemoryConfig() {
+    const config = validatedMemoryCandidate();
+    if (!config) return;
+    if (!state.memoryRevision) {
+      el.memoryMessage.textContent = "缺少配置 revision，请刷新页面后重试。";
+      return;
+    }
+    const managerChanged = config.manager_class !== state.memoryConfig?.manager_class;
+    const insecureHttp = config.manager_class === "mem0" && Boolean(config.backend_config?.allow_insecure_http);
+    if (managerChanged) {
+      const confirmed = window.confirm(
+        `确认将 Memory 后端从 ${state.memoryConfig?.manager_class || "未配置"} 切换到 ${config.manager_class}？\n\n系统不会自动迁移已有记忆数据。`,
+      );
+      if (!confirmed) return;
+    }
+    if (insecureHttp && !window.confirm("当前 mem0 配置允许明文 HTTP。确认该地址只位于可信内网并继续保存？")) {
+      return;
+    }
+
+    setBusy(el.saveMemoryButton, true, "保存中");
+    try {
+      const oldFlushSeconds = Number(state.memoryConfig?.shutdown_flush_timeout_seconds || 30);
+      const newFlushSeconds = Number(config.shutdown_flush_timeout_seconds || 30);
+      const drainSeconds = Math.max(oldFlushSeconds, newFlushSeconds, 0);
+      const data = await request("/api/admin/memory", {
+        method: "PATCH",
+        body: {
+          expected_revision: state.memoryRevision,
+          changes: config,
+          // This form submits the complete backend object.  Replace semantics
+          // are required so removing a custom JSON key actually removes it;
+          // redaction sentinels are restored by the API before replacement.
+          backend_config_mode: "replace",
+          probe: true,
+          reload: true,
+        },
+        // Probe (130s cap) and old-backend drain are sequential.  The drain
+        // uses the currently active timeout, which can differ from the draft.
+        timeoutMs: 160000 + drainSeconds * 1000,
+      });
+      state.memoryConfig = data.canonical_config || data.config;
+      state.memoryRevision = data.revision;
+      state.memoryRuntime = data.runtime || null;
+      state.memoryCredentials = data.credentials || null;
+      const kind = ["deermem", "mem0"].includes(state.memoryConfig.manager_class)
+        ? state.memoryConfig.manager_class
+        : "custom";
+      state.memoryBackendDrafts[kind] = structuredCloneSafe(state.memoryConfig.backend_config || {});
       renderMemoryConfig();
       const active = data.reload?.active_threads ? `；当前活动线程 ${data.reload.active_threads} 个保持原状态` : "";
-      el.memoryMessage.textContent = `Memory 配置已保存${active}。`;
+      el.memoryMessage.textContent = `Memory 配置已保存并通过后端探测${active}。`;
       await loadConfigHealth();
       showToast("Memory 配置已保存。");
     } catch (error) {
+      if (error.status === 409) {
+        el.memoryMessage.textContent = "保存冲突：配置已被其他管理员或进程修改。请刷新后核对再保存。";
+        return;
+      }
       el.memoryMessage.textContent = `保存失败：${error.message}`;
     } finally {
       setBusy(el.saveMemoryButton, false);
@@ -2848,6 +3227,27 @@
     el.saveTitleButton.addEventListener("click", saveTitleConfig);
     el.saveSubagentsButton.addEventListener("click", saveSubagentsConfig);
     el.saveMemoryButton.addEventListener("click", saveMemoryConfig);
+    el.validateMemoryButton.addEventListener("click", validateMemoryConfig);
+    el.testMemoryButton.addEventListener("click", testMemoryConfig);
+    el.memoryManagerType.addEventListener("change", () => {
+      const previous = state.memoryManagerKind;
+      if (!captureMemoryBackendDraft(previous, { reportError: true })) {
+        el.memoryManagerType.value = previous;
+        return;
+      }
+      state.memoryManagerKind = el.memoryManagerType.value;
+      renderMemoryBackendDraft(state.memoryManagerKind);
+      updateMemorySectionVisibility();
+      updateMemoryPreview();
+    });
+    el.memoryMode.addEventListener("change", () => {
+      updateMemorySectionVisibility();
+      updateMemoryPreview();
+    });
+    el.memoryMem0AllowHttp.addEventListener("change", updateMemorySectionVisibility);
+    el.memoryCustomManagerClass.addEventListener("input", updateMemorySectionVisibility);
+    el.memoryEditForm.addEventListener("input", updateMemoryPreview);
+    el.memoryEditForm.addEventListener("change", updateMemoryPreview);
     el.saveSummarizationButton.addEventListener("click", saveSummarizationConfig);
     el.refreshConfigHealthButton.addEventListener("click", refreshConfigHealth);
     el.refreshScheduledTasksButton.addEventListener("click", refreshScheduledTasks);

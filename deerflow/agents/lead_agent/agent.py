@@ -21,7 +21,11 @@ from deerflow.agents.middlewares.todo_middleware import TodoMiddleware
 from deerflow.agents.middlewares.token_usage_middleware import TokenUsageMiddleware
 from deerflow.agents.middlewares.tool_error_handling_middleware import build_lead_runtime_middlewares
 from deerflow.agents.middlewares.view_image_middleware import ViewImageMiddleware
-from deerflow.agents.thread_state import AgentContext, ThreadState
+from deerflow.agents.thread_state import (
+    AgentContext,
+    get_thread_state_schema,
+    normalize_middleware_state_schemas,
+)
 from deerflow.config.agents_config import load_agent_config, validate_agent_name
 from deerflow.config.app_config import get_app_config
 from deerflow.config.memory_config import get_memory_config
@@ -412,6 +416,18 @@ def make_lead_agent(config: RunnableConfig):
     model_name = _resolve_model_name(requested_model_name, agent_model_name)
 
     app_config = get_app_config()
+    checkpointer_config = getattr(app_config, "checkpointer", None)
+    checkpoint_mode = getattr(checkpointer_config, "channel_mode", "full")
+    checkpoint_frequency = getattr(
+        getattr(checkpointer_config, "delta", None), "snapshot_frequency", 10
+    )
+    from deerflow.runtime.checkpoint_mode import (
+        freeze_checkpoint_channel_mode,
+        freeze_checkpoint_snapshot_frequency,
+    )
+
+    freeze_checkpoint_channel_mode(checkpoint_mode)
+    freeze_checkpoint_snapshot_frequency(checkpoint_frequency)
     model_config = app_config.get_model_config(model_name)
 
     if model_config is None:
@@ -450,23 +466,33 @@ def make_lead_agent(config: RunnableConfig):
 
     if is_bootstrap:
         # Special bootstrap agent with minimal prompt for initial custom agent creation flow
+        middleware = normalize_middleware_state_schemas(
+            _build_middlewares(config, model_name=model_name),
+            checkpoint_mode,
+            checkpoint_frequency,
+        )
         return create_agent(
             model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled),
             tools=get_available_tools(model_name=model_name, subagent_enabled=subagent_enabled) + [setup_agent],
-            middleware=_build_middlewares(config, model_name=model_name),
+            middleware=middleware,
             system_prompt=apply_prompt_template(subagent_enabled=subagent_enabled, max_concurrent_subagents=max_concurrent_subagents, available_skills=set(["bootstrap"])),
-            state_schema=ThreadState,
+            state_schema=get_thread_state_schema(checkpoint_mode, checkpoint_frequency),
             context_schema=AgentContext,
         )
 
     # Default lead agent (unchanged behavior)
+    middleware = normalize_middleware_state_schemas(
+        _build_middlewares(config, model_name=model_name, agent_name=agent_name),
+        checkpoint_mode,
+        checkpoint_frequency,
+    )
     return create_agent(
         model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, reasoning_effort=reasoning_effort),
         tools=get_available_tools(model_name=model_name, groups=agent_config.tool_groups if agent_config else None, subagent_enabled=subagent_enabled),
-        middleware=_build_middlewares(config, model_name=model_name, agent_name=agent_name),
+        middleware=middleware,
         system_prompt=apply_prompt_template(
             subagent_enabled=subagent_enabled, max_concurrent_subagents=max_concurrent_subagents, agent_name=agent_name, available_skills=set(agent_config.skills) if agent_config and agent_config.skills is not None else None
         ),
-        state_schema=ThreadState,
+        state_schema=get_thread_state_schema(checkpoint_mode, checkpoint_frequency),
         context_schema=AgentContext,
     )

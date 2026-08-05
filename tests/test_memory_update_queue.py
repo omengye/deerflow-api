@@ -1,3 +1,4 @@
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -81,3 +82,163 @@ def test_process_queue_marks_pending_work_without_timer_spin(monkeypatch: pytest
 
     assert queue._process_requested is True
     assert queue.pending_count == 1
+
+
+def test_flush_waits_for_active_writer_and_drains_follow_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = MemoryUpdateQueue()
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    class BlockingManager:
+        def add(self, **kwargs: Any) -> bool:
+            calls.append(kwargs["thread_id"])
+            if len(calls) == 1:
+                started.set()
+                assert release.wait(2)
+            return True
+
+    monkeypatch.setattr(
+        "deerflow.agents.memory.manager.get_memory_manager",
+        lambda: BlockingManager(),
+    )
+    with queue._lock:
+        queue._queue.append(_context("first"))
+
+    processor = threading.Thread(target=queue._process_queue)
+    processor.start()
+    assert started.wait(1)
+    with queue._lock:
+        queue._queue.append(_context("second"))
+
+    result: list[bool] = []
+    flusher = threading.Thread(target=lambda: result.append(queue.flush(2)))
+    flusher.start()
+    assert flusher.is_alive()
+
+    release.set()
+    processor.join(2)
+    flusher.join(2)
+
+    assert not processor.is_alive()
+    assert not flusher.is_alive()
+    assert result == [True]
+    assert calls == ["first", "second"]
+    assert queue.pending_count == 0
+
+
+def test_flush_timeout_does_not_invalidate_active_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = MemoryUpdateQueue()
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingManager:
+        def add(self, **_kwargs: Any) -> bool:
+            started.set()
+            assert release.wait(2)
+            return True
+
+    monkeypatch.setattr(
+        "deerflow.agents.memory.manager.get_memory_manager",
+        lambda: BlockingManager(),
+    )
+    with queue._lock:
+        queue._queue.append(_context("first"))
+
+    processor = threading.Thread(target=queue._process_queue)
+    processor.start()
+    assert started.wait(1)
+    try:
+        assert queue.flush(0.01) is False
+        assert queue.is_processing is True
+    finally:
+        release.set()
+        processor.join(2)
+
+    assert not processor.is_alive()
+
+
+def test_flush_timeout_is_enforced_when_queued_write_has_not_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = MemoryUpdateQueue()
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingManager:
+        def add(self, **_kwargs: Any) -> bool:
+            started.set()
+            assert release.wait(2)
+            return True
+
+    monkeypatch.setattr(
+        "deerflow.agents.memory.manager.get_memory_manager",
+        lambda: BlockingManager(),
+    )
+    with queue._lock:
+        queue._queue.append(_context("queued"))
+
+    try:
+        assert queue.flush(0.05) is False
+        assert started.wait(1)
+        assert queue.is_processing is True
+    finally:
+        release.set()
+
+    assert queue.flush(1) is True
+    assert queue.pending_count == 0
+
+
+def test_queue_log_does_not_expose_backend_exception_text(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    queue = MemoryUpdateQueue()
+    secret = "custom-backend-secret"
+
+    class BrokenManager:
+        def add(self, **_kwargs: Any) -> bool:
+            raise RuntimeError(secret)
+
+    monkeypatch.setattr(
+        "deerflow.agents.memory.manager.get_memory_manager",
+        lambda: BrokenManager(),
+    )
+    with queue._lock:
+        queue._queue.append(_context("redacted"))
+
+    with caplog.at_level("ERROR"):
+        assert queue.flush(1) is True
+
+    assert secret not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+def test_pause_holds_new_writes_until_resume(monkeypatch: pytest.MonkeyPatch) -> None:
+    queue = MemoryUpdateQueue()
+    processed = threading.Event()
+
+    class RecordingManager:
+        def add(self, **_kwargs: Any) -> bool:
+            processed.set()
+            return True
+
+    monkeypatch.setattr(
+        "deerflow.agents.memory.manager.get_memory_manager",
+        lambda: RecordingManager(),
+    )
+
+    queue.pause()
+    queue.add_nowait("held", [_Msg("held")])
+    assert queue.is_paused is True
+    assert queue.pending_count == 1
+    assert processed.wait(0.05) is False
+
+    queue.resume()
+    assert processed.wait(1)
+    assert queue.flush(1) is True
+    assert queue.pending_count == 0

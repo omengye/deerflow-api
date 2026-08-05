@@ -482,6 +482,99 @@ button:focus-visible {
   gap: 18px;
 }
 
+.memory-panel {
+  grid-column: 1 / -1;
+}
+
+.memory-form {
+  display: grid;
+  gap: 16px;
+}
+
+.memory-status-strip {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-strong);
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.memory-status-strip > span:not(.status-badge) {
+  display: inline-flex;
+  gap: 5px;
+}
+
+.memory-status-strip strong {
+  color: var(--text);
+}
+
+.memory-fieldset {
+  min-width: 0;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+
+.memory-fieldset legend {
+  padding: 0 7px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.memory-form-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.memory-form-grid.single-column {
+  grid-template-columns: 1fr;
+}
+
+.memory-subsection + .memory-subsection {
+  margin-top: 18px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+
+.memory-subsection h4 {
+  margin: 0 0 12px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.memory-advanced {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfcfb;
+  padding: 12px 14px;
+}
+
+.memory-advanced summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 700;
+}
+
+.memory-advanced summary:focus-visible {
+  outline: 3px solid rgba(13, 127, 111, 0.24);
+  outline-offset: 3px;
+}
+
+.memory-advanced .code-preview {
+  max-height: 420px;
+  margin-bottom: 0;
+}
+
 .panel {
   min-width: 0;
   padding: 18px;
@@ -963,11 +1056,13 @@ pre {
 
 .readonly-grid {
   display: grid;
+  min-width: 0;
   gap: 12px;
 }
 
 .readonly-grid div {
   display: grid;
+  min-width: 0;
   gap: 4px;
   border-bottom: 1px solid var(--line);
   padding-bottom: 12px;
@@ -981,6 +1076,11 @@ pre {
 .readonly-grid span {
   color: var(--muted);
   font-size: 13px;
+}
+
+.readonly-grid strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .health-alerts {
@@ -1062,6 +1162,10 @@ pre {
   .evolution-review-grid {
     grid-template-columns: 1fr;
   }
+
+  .memory-form-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1101,5 +1205,13 @@ pre {
 
   .topbar h2 {
     font-size: 22px;
+  }
+
+  .memory-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .memory-fieldset {
+    padding: 12px;
   }
 }

@@ -21,11 +21,11 @@ export no_proxy="$NO_PROXY"
 export LANGCHAIN_OPENAI_TCP_KEEPALIVE=0
 # -----------------------------------------------------------------------------
 
-# Install dependencies (if not already installed)
-if [ ! -d ".venv" ]; then
-    echo "📦 Installing dependencies with uv..."
-    uv sync
-fi
+# Reconcile the environment on every deployment/start.  ``--frozen`` makes
+# uv.lock authoritative, while ``--inexact`` retains explicitly installed
+# optional/operational packages (for example Feishu or sandbox extras).
+echo "📦 Verifying dependencies from uv.lock..."
+uv sync --frozen --inexact
 
 # Install readabilipy's Readability.js dependencies (Node.js-based extraction)
 READABILIPY_JSDIR="$(uv run python -c "import readabilipy.simple_json as m, os; print(os.path.join(os.path.dirname(m.__file__), 'javascript'))" 2>/dev/null)"

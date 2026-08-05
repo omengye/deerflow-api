@@ -306,56 +306,193 @@
           </section>
 
           <div class="section-grid">
-            <section class="panel">
+            <section class="panel memory-panel">
               <div class="panel-header">
                 <div>
-                  <h3>Memory</h3>
-                  <p>控制全局记忆更新、事实存储和系统 Prompt 注入预算。</p>
+                  <h3>Memory 配置</h3>
+                  <p>配置召回模式、DeerMem、mem0 或自定义后端。后端切换不会自动迁移已有记忆。</p>
                 </div>
-                <button id="saveMemoryButton" class="primary-button" type="button">保存 Memory</button>
+                <div class="button-row">
+                  <button id="validateMemoryButton" class="ghost-button" type="button">校验配置</button>
+                  <button id="testMemoryButton" class="secondary-button" type="button">测试后端</button>
+                  <button id="saveMemoryButton" class="primary-button" type="button">保存并应用</button>
+                </div>
               </div>
-              <form id="memoryEditForm" class="form-grid compact">
-                <label class="checkbox-row">
-                  <input id="memoryEnabled" type="checkbox" />
-                  <span>enabled</span>
-                </label>
-                <label class="checkbox-row">
-                  <input id="memoryInjectionEnabled" type="checkbox" />
-                  <span>injection_enabled</span>
-                </label>
-                <label>
-                  <span>model_name</span>
-                  <select id="memoryModelName"></select>
-                </label>
-                <label>
-                  <span>debounce_seconds</span>
-                  <input id="memoryDebounce" type="number" min="1" max="300" />
-                </label>
-                <label>
-                  <span>max_facts</span>
-                  <input id="memoryMaxFacts" type="number" min="10" max="500" />
-                </label>
-                <label>
-                  <span>fact_confidence_threshold</span>
-                  <input id="memoryConfidence" type="number" min="0" max="1" step="0.05" />
-                </label>
-                <label>
-                  <span>max_injection_tokens</span>
-                  <input id="memoryMaxInjectionTokens" type="number" min="100" max="8000" />
-                </label>
-                <label>
-                  <span>storage_path</span>
-                  <input id="memoryStoragePath" type="text" placeholder="memory.json" />
-                </label>
-                <label>
-                  <span>storage_class</span>
-                  <input id="memoryStorageClass" type="text" />
-                </label>
+              <div id="memoryStatusSummary" class="memory-status-strip" aria-live="polite"></div>
+              <div id="memoryWarning" class="health-alert warning hidden" role="alert"></div>
+              <form id="memoryEditForm" class="memory-form">
+                <fieldset class="memory-fieldset">
+                  <legend>通用设置</legend>
+                  <div class="memory-form-grid">
+                    <label class="checkbox-row">
+                      <input id="memoryEnabled" type="checkbox" />
+                      <span>启用长期记忆</span>
+                    </label>
+                    <label>
+                      <span>后端类型</span>
+                      <select id="memoryManagerType">
+                        <option value="deermem">DeerMem（本地）</option>
+                        <option value="mem0">mem0（HTTP）</option>
+                        <option value="custom">自定义 Manager</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>召回模式</span>
+                      <select id="memoryMode">
+                        <option value="middleware">自动召回并注入（middleware）</option>
+                        <option value="tool">Agent 按需检索（tool）</option>
+                      </select>
+                    </label>
+                    <label class="checkbox-row">
+                      <input id="memoryInjectionEnabled" type="checkbox" />
+                      <span>允许自动注入</span>
+                    </label>
+                    <label>
+                      <span>关闭排空超时（秒）</span>
+                      <input id="memoryShutdownFlush" type="number" min="0.1" max="300" step="0.1" required />
+                    </label>
+                  </div>
+                  <p id="memoryModeHelp" class="field-help"></p>
+                </fieldset>
+
+                <fieldset id="memoryDeerMemSection" class="memory-fieldset">
+                  <legend>DeerMem 后端</legend>
+                  <div class="memory-subsection">
+                    <h4>存储与更新</h4>
+                    <div class="memory-form-grid">
+                      <label>
+                        <span>记忆更新模型</span>
+                        <select id="memoryModelName"></select>
+                      </label>
+                      <label>
+                        <span>更新防抖（秒）</span>
+                        <input id="memoryDebounce" type="number" min="1" max="300" required />
+                      </label>
+                      <label>
+                        <span>最多事实数</span>
+                        <input id="memoryMaxFacts" type="number" min="10" max="500" required />
+                      </label>
+                      <label>
+                        <span>事实置信度阈值</span>
+                        <input id="memoryConfidence" type="number" min="0" max="1" step="0.01" required />
+                      </label>
+                      <label>
+                        <span>记忆文件路径</span>
+                        <input id="memoryStoragePath" type="text" placeholder="memory.json" />
+                      </label>
+                      <label>
+                        <span>Storage 类</span>
+                        <input id="memoryStorageClass" type="text" required />
+                      </label>
+                    </div>
+                  </div>
+                  <div class="memory-subsection">
+                    <h4>召回与注入</h4>
+                    <div class="memory-form-grid">
+                      <label>
+                        <span>最大注入 Token</span>
+                        <input id="memoryMaxInjectionTokens" type="number" min="100" max="8000" required />
+                      </label>
+                      <label class="checkbox-row">
+                        <input id="memoryRetrievalEnabled" type="checkbox" />
+                        <span>启用 FTS5/BM25 相关性检索</span>
+                      </label>
+                      <label>
+                        <span>每次召回条数</span>
+                        <input id="memoryRetrievalTopK" type="number" min="1" max="100" required />
+                      </label>
+                      <label>
+                        <span>检索索引路径</span>
+                        <input id="memoryRetrievalIndexPath" type="text" placeholder="memory-fts5.sqlite3" />
+                      </label>
+                    </div>
+                  </div>
+                </fieldset>
+
+                <fieldset id="memoryMem0Section" class="memory-fieldset hidden">
+                  <legend>mem0 后端</legend>
+                  <div class="memory-form-grid">
+                    <label>
+                      <span>API Key 环境变量名</span>
+                      <input id="memoryMem0ApiKeyEnv" type="text" pattern="[A-Za-z_][A-Za-z0-9_]*" required />
+                    </label>
+                    <label>
+                      <span>服务地址</span>
+                      <input id="memoryMem0BaseUrl" type="url" required />
+                    </label>
+                    <label class="checkbox-row danger-check">
+                      <input id="memoryMem0AllowHttp" type="checkbox" />
+                      <span>允许不安全的 HTTP（仅限可信内网）</span>
+                    </label>
+                    <label>
+                      <span>默认用户 ID</span>
+                      <input id="memoryMem0DefaultUser" type="text" maxlength="256" required />
+                    </label>
+                    <label>
+                      <span>召回条数</span>
+                      <input id="memoryMem0TopK" type="number" min="1" max="100" required />
+                    </label>
+                    <label>
+                      <span>分数阈值</span>
+                      <input id="memoryMem0ScoreThreshold" type="number" min="0" max="1" step="0.01" required />
+                    </label>
+                    <label>
+                      <span>最大注入字符数</span>
+                      <input id="memoryMem0MaxChars" type="number" min="256" max="100000" required />
+                    </label>
+                    <label>
+                      <span>请求超时（秒）</span>
+                      <input id="memoryMem0Timeout" type="number" min="0.1" max="120" step="0.1" required />
+                    </label>
+                    <label>
+                      <span>启动策略</span>
+                      <select id="memoryMem0StartupPolicy">
+                        <option value="fail_fast">连接失败则启动失败</option>
+                        <option value="best_effort">连接失败仍继续启动</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>读取失败策略</span>
+                      <select id="memoryMem0ReadPolicy">
+                        <option value="fail_open">忽略记忆并继续</option>
+                        <option value="fail_closed">中止当前调用</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>写入失败策略</span>
+                      <select id="memoryMem0WritePolicy">
+                        <option value="log_and_drop">记录日志并丢弃</option>
+                        <option value="raise">抛出错误</option>
+                      </select>
+                    </label>
+                  </div>
+                  <p id="memoryMem0CredentialStatus" class="field-help"></p>
+                </fieldset>
+
+                <fieldset id="memoryCustomSection" class="memory-fieldset hidden">
+                  <legend>自定义 Memory Manager</legend>
+                  <div class="memory-form-grid single-column">
+                    <label>
+                      <span>Manager 类路径</span>
+                      <input id="memoryCustomManagerClass" type="text" placeholder="package.module:CustomMemoryManager" />
+                    </label>
+                    <label>
+                      <span>backend_config JSON</span>
+                      <textarea id="memoryCustomBackendConfig" class="json-editor compact-editor" spellcheck="false"></textarea>
+                    </label>
+                  </div>
+                  <p class="field-help">自定义配置中的密钥字段会被脱敏；推荐只保存环境变量引用，不保存明文密钥。</p>
+                </fieldset>
+
+                <details class="memory-advanced">
+                  <summary>查看规范化配置</summary>
+                  <pre id="memoryConfigPreview" class="code-preview"></pre>
+                </details>
               </form>
               <p id="memoryMessage" class="form-message" role="status"></p>
             </section>
 
-            <section class="panel">
+            <section class="panel memory-panel">
               <div class="panel-header">
                 <div>
                   <h3>Summarization</h3>

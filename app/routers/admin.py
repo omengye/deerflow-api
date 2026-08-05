@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import hashlib
 import json
+import logging
 import os
 import string
 import tempfile
-from copy import deepcopy
+import threading
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,6 +44,12 @@ from deerflow.config.subagents_config import SubagentsAppConfig
 from deerflow.config.summarization_config import ContextSize, SummarizationConfig
 from deerflow.config.title_config import TitleConfig
 from deerflow.runtime.scheduler import ScheduledTask, SchedulerStore
+from deerflow.skills.evolution import (
+    SkillEvolutionService,
+    SkillPublishConflict,
+    get_evolution_store,
+)
+from deerflow.skills.evolution.worker import get_evolution_worker
 from deerflow.skills.manager import (
     ALLOWED_SUPPORT_SUBDIRS,
     append_history,
@@ -56,8 +64,6 @@ from deerflow.skills.manager import (
     read_history,
     validate_skill_name,
 )
-from deerflow.skills.evolution import SkillEvolutionService, SkillPublishConflict, get_evolution_store
-from deerflow.skills.evolution.worker import get_evolution_worker
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +93,17 @@ _SECRET_KEY_NAMES = {
     "app_secret",
 }
 _SECRET_KEY_PARTS = ("api_key", "secret", "password", "authorization")
+_SAFE_REFERENCE_KEY_NAMES = {"api_key_env"}
+_MEMORY_CANONICAL_KEYS = {
+    "enabled",
+    "manager_class",
+    "mode",
+    "injection_enabled",
+    "shutdown_flush_timeout_seconds",
+    "backend_config",
+}
+_MEMORY_PROBE_TIMEOUT_SECONDS = 130.0
+_CONFIG_WRITE_LOCK = threading.RLock()
 
 
 class AdminModelsUpdateRequest(BaseModel):
@@ -214,8 +231,27 @@ class AdminSubagentsUpdateRequest(BaseModel):
 class AdminMemoryUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    config: MemoryConfig
+    # Stored secret values are restored before validating the candidate with
+    # ``MemoryConfig``.  Typing this field as MemoryConfig would reject the
+    # redaction sentinels returned by the Admin API before they can be restored.
+    config: dict[str, Any]
     reload: bool = True
+
+
+class AdminMemoryPatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: str = Field(min_length=1, max_length=128)
+    changes: dict[str, Any] = Field(default_factory=dict)
+    backend_config_mode: str = Field(default="merge", pattern="^(merge|replace)$")
+    probe: bool = True
+    reload: bool = True
+
+
+class AdminMemoryCandidateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: dict[str, Any]
 
 
 class AdminSummarizationUpdateRequest(BaseModel):
@@ -321,19 +357,71 @@ def _admin_app_config_context():
         yield
 
 
+class _VersionedConfigData(dict[str, Any]):
+    """Config mapping carrying the file revision it was read from."""
+
+    def __init__(self, data: dict[str, Any], *, source_sha256: str) -> None:
+        super().__init__(data)
+        self.source_sha256 = source_sha256
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _config_file_sha256(path: Path) -> str:
+    try:
+        return _sha256_bytes(path.read_bytes())
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read config file: {exc}") from exc
+
+
+@contextmanager
+def _config_write_guard(path: Path):
+    """Serialize writes and use a POSIX lock file for multi-worker Linux."""
+    with _CONFIG_WRITE_LOCK:
+        lock_file = None
+        if os.name == "posix":
+            try:
+                import fcntl
+
+                lock_path = path.with_name(f".{path.name}.lock")
+                lock_file = lock_path.open("a+b")
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                if lock_file is not None:
+                    lock_file.close()
+                raise HTTPException(status_code=500, detail=f"Failed to lock config file: {exc}") from exc
+        try:
+            yield
+        finally:
+            if lock_file is not None:
+                try:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    logger.warning("Failed to release Admin config file lock", exc_info=True)
+                finally:
+                    lock_file.close()
+
+
 def _load_config_data(path: Path | None = None) -> dict[str, Any]:
     config_path = path or _config_path()
     if not config_path.exists():
         raise HTTPException(status_code=404, detail=f"Config file not found: {config_path}")
     try:
-        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        raw = config_path.read_bytes()
+        data = yaml.safe_load(raw.decode("utf-8")) or {}
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"Config file is not valid UTF-8: {exc}") from exc
     except yaml.YAMLError as exc:
         raise HTTPException(status_code=500, detail=f"Config file is not valid YAML: {exc}") from exc
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Failed to read config file: {exc}") from exc
     if not isinstance(data, dict):
         raise HTTPException(status_code=500, detail="Config file must contain a YAML object")
-    return data
+    return _VersionedConfigData(data, source_sha256=_sha256_bytes(raw))
 
 
 def _resolve_extensions_config_path(*, create: bool = False) -> Path | None:
@@ -399,51 +487,98 @@ def _write_extensions_data(path: Path | None, data: dict[str, Any]) -> None:
             raise HTTPException(status_code=500, detail=f"Failed to write extensions config: {exc}") from exc
 
 
-def _validate_config_data(data: dict[str, Any], *, source_path: Path) -> None:
-    source_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        suffix=".yaml",
-        delete=False,
-        dir=str(source_path.parent),
-    ) as tmp_file:
-        yaml.safe_dump(data, tmp_file, allow_unicode=True, sort_keys=False)
-        tmp_path = Path(tmp_file.name)
-    try:
-        AppConfig.from_file(str(tmp_path))
-    finally:
-        tmp_path.unlink(missing_ok=True)
+def _validate_config_data(data: dict[str, Any], *, source_path: Path) -> AppConfig:
+    # ``AppConfig.from_file`` also updates process-wide singleton configs.  A
+    # pre-write validation must be side-effect free; otherwise a failed CAS or
+    # disk write can leave runtime state ahead of the persisted file.
+    raw = deepcopy(dict(data))
+    AppConfig._check_config_version(raw, source_path)
+    resolved = AppConfig.resolve_env_variables(raw)
+    return AppConfig.model_validate(resolved)
 
 
 def _atomic_write_config(data: dict[str, Any], *, path: Path) -> None:
-    try:
-        _validate_config_data(data, source_path=path)
-    except Exception as exc:
-        if isinstance(exc, HTTPException):
-            raise
-        raise HTTPException(status_code=400, detail=f"Updated config did not validate: {exc}") from exc
+    with _config_write_guard(path):
+        expected_sha256 = getattr(data, "source_sha256", None)
+        if expected_sha256 and _config_file_sha256(path) != expected_sha256:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "config_revision_conflict",
+                    "message": "Config changed after it was loaded; refresh and retry.",
+                },
+            )
 
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        suffix=".tmp",
-        delete=False,
-        dir=str(path.parent),
-    ) as tmp_file:
-        yaml.safe_dump(data, tmp_file, allow_unicode=True, sort_keys=False)
-        tmp_path = Path(tmp_file.name)
-    try:
-        tmp_path.replace(path)
-    except OSError as exc:
-        tmp_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"Failed to write config file: {exc}") from exc
+        try:
+            _validate_config_data(data, source_path=path)
+        except Exception as exc:
+            if isinstance(exc, HTTPException):
+                raise
+            message = _safe_config_error_message(exc, data)
+            raise HTTPException(status_code=400, detail=f"Updated config did not validate: {message}") from exc
+
+        previous_mode = None
+        try:
+            previous_mode = path.stat().st_mode
+        except OSError:
+            pass
+
+        tmp_path: Path | None = None
+        replaced = False
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                suffix=".tmp",
+                delete=False,
+                dir=str(path.parent),
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                yaml.safe_dump(dict(data), tmp_file, allow_unicode=True, sort_keys=False)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+            if expected_sha256 and _config_file_sha256(path) != expected_sha256:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "config_revision_conflict",
+                        "message": "Config changed while the update was prepared; refresh and retry.",
+                    },
+                )
+            if previous_mode is not None:
+                os.chmod(tmp_path, previous_mode)
+            tmp_path.replace(path)
+            replaced = True
+        except (OSError, yaml.YAMLError) as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to write config file: {exc}") from exc
+        finally:
+            if tmp_path is not None and not replaced:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Failed to remove temporary Admin config file %s", tmp_path, exc_info=True)
+
+        if os.name == "posix":
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                # The atomic replacement already committed.  Reporting the
+                # request as failed here would invite a retry even though the
+                # new config is visible, so retain success and log the weaker
+                # crash-durability guarantee.
+                logger.warning("Config was replaced but its parent directory could not be fsynced", exc_info=True)
 
 
 def _is_secret_key(key: str | None) -> bool:
     if not key:
         return False
     normalized = key.lower().replace("-", "_")
+    if normalized in _SAFE_REFERENCE_KEY_NAMES:
+        return False
     if normalized in _SECRET_KEY_NAMES or any(part in normalized for part in _SECRET_KEY_PARTS):
         return True
     # Match credential fields such as access_token without treating token-count
@@ -470,6 +605,59 @@ def _redact_value(key: str | None, value: Any) -> Any:
     if isinstance(value, list):
         return [_redact_value(None, item) for item in value]
     return value
+
+
+def _config_secret_values(value: Any, *, key: str | None = None, protected: bool = False) -> set[str]:
+    """Collect configured credentials without exposing them to callers."""
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+
+    normalized = (key or "").lower().replace("-", "_")
+    protect_children = protected or normalized in {"env", "headers"}
+    secrets: set[str] = set()
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            child_name = str(child_key)
+            child_protected = protect_children or _is_secret_key(child_name)
+            secrets.update(
+                _config_secret_values(
+                    child_value,
+                    key=child_name,
+                    protected=child_protected,
+                )
+            )
+            if child_name.lower().replace("-", "_") == "api_key_env" and isinstance(child_value, str):
+                env_value = os.environ.get(child_value)
+                if env_value:
+                    secrets.add(env_value)
+        return secrets
+    if isinstance(value, list):
+        for item in value:
+            secrets.update(_config_secret_values(item, key=key, protected=protect_children))
+        return secrets
+    if protect_children and value not in (None, ""):
+        secrets.add(str(value))
+        if isinstance(value, str) and value.startswith("$"):
+            try:
+                resolved = AppConfig.resolve_env_variables(value)
+            except (TypeError, ValueError):
+                resolved = value
+            if resolved not in (None, "", value):
+                secrets.add(str(resolved))
+    return secrets
+
+
+def _redact_config_error_text(message: str, *configs: Any) -> str:
+    secrets: set[str] = set()
+    for config in configs:
+        secrets.update(_config_secret_values(config))
+    for secret in sorted(secrets, key=len, reverse=True):
+        message = message.replace(secret, "[REDACTED]")
+    return message
+
+
+def _safe_config_error_message(exc: Exception, *configs: Any) -> str:
+    return _redact_config_error_text(str(exc) or type(exc).__name__, *configs)
 
 
 def _safe_skill_error(exc: Exception) -> HTTPException:
@@ -609,16 +797,33 @@ def _validate_support_path_or_raise(name: str, relative_path: str) -> Path:
 
 def _restore_redacted_values(incoming: Any, existing: Any, *, path: str = "") -> Any:
     if isinstance(incoming, dict):
-        if incoming.get("redacted") is True:
+        literal_sentinel = (
+            set(incoming) == {"redacted", "configured", "source"}
+            and incoming.get("redacted") is True
+            and incoming.get("configured") is True
+            and incoming.get("source") == "literal"
+        )
+        clear_sentinel = (
+            set(incoming) == {"redacted", "configured"}
+            and incoming.get("redacted") is False
+            and incoming.get("configured") is False
+        )
+        env_sentinel = (
+            set(incoming) == {"redacted", "configured", "source", "value"}
+            and incoming.get("redacted") is False
+            and incoming.get("configured") is True
+            and incoming.get("source") == "env_ref"
+        )
+        if literal_sentinel:
             if existing is None:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Cannot preserve redacted value for new field {path or '<root>'}",
                 )
             return existing
-        if incoming.get("configured") is False and "redacted" in incoming:
+        if clear_sentinel:
             return None
-        if incoming.get("source") == "env_ref" and "value" in incoming:
+        if env_sentinel:
             return incoming["value"]
         if isinstance(existing, dict):
             return {
@@ -638,6 +843,255 @@ def _restore_redacted_values(incoming: Any, existing: Any, *, path: str = "") ->
     return incoming
 
 
+def _memory_raw_config(config_data: dict[str, Any]) -> dict[str, Any]:
+    raw = config_data.get("memory")
+    return deepcopy(raw) if isinstance(raw, dict) else {}
+
+
+def _memory_revision(raw: dict[str, Any]) -> str:
+    payload = json.dumps(raw, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    return f"sha256:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _memory_canonical_dump(config: MemoryConfig) -> dict[str, Any]:
+    """Return the v2 persisted/editable Memory shape without legacy duplicates."""
+    return {
+        "enabled": config.enabled,
+        "manager_class": config.manager_class,
+        "mode": config.mode,
+        "injection_enabled": config.injection_enabled,
+        "shutdown_flush_timeout_seconds": config.shutdown_flush_timeout_seconds,
+        "backend_config": deepcopy(config.backend_config),
+    }
+
+
+def _deep_merge_mapping(existing: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(existing)
+    for key, value in changes.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_mapping(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def _validate_memory_candidate(config_data: dict[str, Any], raw_candidate: dict[str, Any]) -> MemoryConfig:
+    try:
+        config = MemoryConfig.model_validate(raw_candidate)
+    except ValidationError as exc:
+        errors = _validation_errors(exc)
+        for error in errors:
+            error["message"] = _redact_config_error_text(str(error["message"]), raw_candidate)
+        raise HTTPException(status_code=400, detail={"code": "invalid_memory_config", "errors": errors}) from exc
+
+    _validate_configured_model_name(config_data, config.model_name, field="memory.backend_config.model_name")
+    try:
+        from deerflow.agents.memory import validate_memory_manager_config
+
+        validate_memory_manager_config(config)
+    except Exception as exc:
+        message = _safe_config_error_message(exc, config, raw_candidate)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_memory_backend",
+                "message": message,
+            },
+        ) from exc
+    return config
+
+
+def _probe_memory_candidate(config: MemoryConfig) -> dict[str, Any]:
+    if not config.enabled:
+        return {"ok": True, "skipped": True, "reason": "memory_disabled"}
+    try:
+        from deerflow.agents.memory import probe_memory_manager_config
+
+        probe_memory_manager_config(config)
+    except Exception as exc:
+        message = _safe_config_error_message(exc, config)
+        logger.info("Admin memory backend probe failed: %s", message)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "memory_probe_failed",
+                "message": message,
+            },
+        ) from exc
+    return {"ok": True, "skipped": False}
+
+
+async def _probe_memory_candidate_async(config: MemoryConfig) -> dict[str, Any]:
+    """Probe without blocking the event loop and bound trusted custom code."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_probe_memory_candidate, config),
+            timeout=_MEMORY_PROBE_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        logger.warning(
+            "Admin memory backend probe exceeded %.1fs (%s)",
+            _MEMORY_PROBE_TIMEOUT_SECONDS,
+            config.manager_class,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "code": "memory_probe_timeout",
+                "message": f"Memory backend probe exceeded {_MEMORY_PROBE_TIMEOUT_SECONDS:.0f} seconds.",
+            },
+        ) from exc
+
+
+def _memory_admin_response(config_data: dict[str, Any], *, reload_result: dict[str, Any] | None = None) -> dict[str, Any]:
+    raw = _memory_raw_config(config_data)
+    config = MemoryConfig.model_validate(raw)
+    canonical = _memory_canonical_dump(config)
+
+    try:
+        from deerflow.agents.memory.queue import get_memory_queue
+
+        queue = get_memory_queue()
+        runtime = {
+            "pending_writes": queue.pending_count,
+            "processing": queue.is_processing,
+        }
+    except Exception:
+        logger.debug("Failed to read memory queue status", exc_info=True)
+        runtime = {"pending_writes": None, "processing": None}
+
+    credentials: dict[str, Any] | None = None
+    if config.manager_class == "mem0":
+        env_name = str(config.backend_config.get("api_key_env") or "")
+        credentials = {
+            "api_key_env": env_name,
+            "env_present": bool(env_name and os.environ.get(env_name)),
+        }
+
+    return {
+        "config": _redact_value("memory", config.model_dump()),
+        "canonical_config": _redact_value("memory", canonical),
+        "revision": _memory_revision(raw),
+        "runtime": runtime,
+        "credentials": credentials,
+        "reload": reload_result,
+    }
+
+
+def _memory_capabilities_response() -> dict[str, Any]:
+    from deerflow.agents.memory.backends.mem0.config import Mem0Config
+
+    return {
+        "modes": [
+            {"id": "middleware", "label": "自动召回", "automatic_injection": True},
+            {"id": "tool", "label": "按需工具召回", "automatic_injection": False},
+        ],
+        "backends": [
+            {
+                "id": "deermem",
+                "label": "DeerMem（本地）",
+                "supports_connection_test": True,
+                "supports_fact_crud": True,
+            },
+            {
+                "id": "mem0",
+                "label": "mem0（HTTP）",
+                "supports_connection_test": True,
+                "supports_fact_crud": False,
+            },
+            {
+                "id": "custom",
+                "label": "自定义 Manager",
+                "supports_connection_test": True,
+                "supports_fact_crud": None,
+            },
+        ],
+        "schemas": {
+            "memory": MemoryConfig.model_json_schema(),
+            "mem0": Mem0Config.model_json_schema(),
+        },
+    }
+
+
+def _reload_memory_with_rollback(
+    *,
+    path: Path,
+    previous_raw: dict[str, Any],
+    previous_present: bool,
+    candidate_raw: dict[str, Any],
+    reload: bool,
+) -> dict[str, Any] | None:
+    if not reload:
+        return None
+    try:
+        return _reload_after_config_write(reload=True)
+    except Exception as exc:
+        message = _safe_config_error_message(exc, candidate_raw, previous_raw)
+        logger.error("Admin memory update wrote config but reload failed: %s", message)
+        rollback_file = False
+        rollback_runtime = False
+        runtime_synchronized = False
+        superseded_by_newer_config = False
+        rollback_error: str | None = None
+        try:
+            rollback_data = _load_config_data(path)
+            if _memory_revision(_memory_raw_config(rollback_data)) != _memory_revision(candidate_raw):
+                # Another process saved a newer Memory revision after this
+                # request committed.  Never clobber it while compensating for
+                # this request's local reload failure; instead align this
+                # worker with the now-current file.
+                superseded_by_newer_config = True
+                _reload_after_config_write(reload=True)
+                runtime_synchronized = True
+            else:
+                if previous_present:
+                    rollback_data["memory"] = previous_raw
+                else:
+                    rollback_data.pop("memory", None)
+                _atomic_write_config(rollback_data, path=path)
+                rollback_file = True
+                _reload_after_config_write(reload=True)
+                rollback_runtime = True
+                runtime_synchronized = True
+        except Exception as rollback_exc:
+            rollback_error = _safe_config_error_message(rollback_exc, candidate_raw, previous_raw)
+            logger.error("Admin memory update rollback failed: %s", rollback_error)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "memory_reload_failed",
+                "message": message,
+                "rollback": {
+                    "file_restored": rollback_file,
+                    "runtime_restored": rollback_runtime,
+                    "runtime_synchronized": runtime_synchronized,
+                    "superseded_by_newer_config": superseded_by_newer_config,
+                    "error": rollback_error,
+                },
+            },
+        ) from exc
+
+
+def _persist_memory_and_reload(
+    *,
+    path: Path,
+    config_data: dict[str, Any],
+    previous_raw: dict[str, Any],
+    previous_present: bool,
+    candidate_raw: dict[str, Any],
+    reload: bool,
+) -> dict[str, Any] | None:
+    """Persist and apply Memory config in one worker-thread operation."""
+    _atomic_write_config(config_data, path=path)
+    return _reload_memory_with_rollback(
+        path=path,
+        previous_raw=previous_raw,
+        previous_present=previous_present,
+        candidate_raw=candidate_raw,
+        reload=reload,
+    )
+
+
 def _model_summary(model: ModelConfig) -> dict[str, Any]:
     return {
         "name": model.name,
@@ -654,10 +1108,13 @@ def _admin_config_response(raw_config: dict[str, Any], path: Path) -> dict[str, 
     raw_models = raw_config.get("models") if isinstance(raw_config.get("models"), list) else []
 
     try:
-        app_config = AppConfig.from_file(str(path))
+        app_config = _validate_config_data(raw_config, source_path=path)
         skills_root = str(app_config.skills.get_skills_path())
-    except Exception:
-        logger.debug("Failed to load app config while building admin config response", exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "Failed to validate app config while building Admin response: %s",
+            _safe_config_error_message(exc, raw_config),
+        )
         skills_root = None
 
     try:
@@ -1109,12 +1566,17 @@ def _config_health_response(config_data: dict[str, Any], path: Path) -> dict[str
     warnings: list[dict[str, str]] = []
     validation_errors: list[dict[str, Any]] = []
     try:
-        AppConfig.from_file(str(path))
+        _validate_config_data(config_data, source_path=path)
         valid = True
     except Exception as exc:
         valid = False
         validation_errors = _validation_errors(exc)
-        logger.debug("Admin config health validation failed", exc_info=True)
+        for error in validation_errors:
+            error["message"] = _redact_config_error_text(str(error["message"]), config_data)
+        logger.debug(
+            "Admin config health validation failed: %s",
+            _safe_config_error_message(exc, config_data),
+        )
 
     example_path = _config_example_path(path)
     example_data: dict[str, Any] = {}
@@ -1192,6 +1654,17 @@ def _config_health_response(config_data: dict[str, Any], path: Path) -> dict[str
     )
     unknown_sections = sorted(str(key) for key in config_data if key not in _KNOWN_TOP_LEVEL_CONFIG_KEYS)
     literal_secret_count, literal_secret_sections = _literal_secret_summary(config_data)
+    file_writable = os.access(path, os.W_OK)
+    directory_writable = os.access(path.parent, os.W_OK)
+    if not file_writable or not directory_writable:
+        warnings.append(
+            {
+                "code": "config_not_atomically_writable",
+                "severity": "warning",
+                "path": "",
+                "message": "config.yaml and its parent directory must both be writable for atomic Admin saves",
+            }
+        )
     if literal_secret_count:
         warnings.append(
             {
@@ -1212,7 +1685,9 @@ def _config_health_response(config_data: dict[str, Any], path: Path) -> dict[str
         "status": status,
         "valid": valid,
         "config_path": str(path),
-        "writable": os.access(path, os.W_OK),
+        "writable": file_writable and directory_writable,
+        "file_writable": file_writable,
+        "directory_writable": directory_writable,
         "current_version": current_version,
         "latest_version": latest_version,
         "outdated": current_version < latest_version,
@@ -1499,24 +1974,157 @@ async def update_admin_subagents(req: AdminSubagentsUpdateRequest = Body()):
 async def get_admin_memory():
     """Return validated global-memory configuration."""
     config_data = _load_config_data(_config_path())
-    config = MemoryConfig.model_validate(config_data.get("memory") or {})
-    return {"config": config.model_dump()}
+    return _memory_admin_response(config_data)
+
+
+@router.get("/memory/capabilities")
+async def get_admin_memory_capabilities():
+    """Return stable UI metadata and generated validation schemas."""
+    return _memory_capabilities_response()
+
+
+@router.post("/memory/validate")
+async def validate_admin_memory(req: AdminMemoryCandidateRequest = Body()):
+    """Validate a complete candidate without writing or opening a backend."""
+    config_data = _load_config_data(_config_path())
+    current = MemoryConfig.model_validate(_memory_raw_config(config_data))
+    current_canonical = _memory_canonical_dump(current)
+    restored = _restore_redacted_values(req.config, current_canonical, path="memory")
+    config = _validate_memory_candidate(config_data, restored)
+    warnings: list[dict[str, str]] = []
+    if config.mode == "tool" and config.injection_enabled:
+        warnings.append(
+            {
+                "code": "injection_ignored_in_tool_mode",
+                "message": "injection_enabled is preserved but ignored while mode is 'tool'.",
+            }
+        )
+    if config.manager_class != current.manager_class:
+        warnings.append(
+            {
+                "code": "memory_backend_migration_not_automatic",
+                "message": "Changing memory backend does not migrate existing memory data.",
+            }
+        )
+    return {
+        "valid": True,
+        "canonical_config": _redact_value("memory", _memory_canonical_dump(config)),
+        "warnings": warnings,
+    }
+
+
+@router.post("/memory/test")
+async def test_admin_memory(req: AdminMemoryCandidateRequest = Body()):
+    """Construct and warm an isolated candidate backend without changing runtime state."""
+    config_data = _load_config_data(_config_path())
+    current = MemoryConfig.model_validate(_memory_raw_config(config_data))
+    restored = _restore_redacted_values(req.config, _memory_canonical_dump(current), path="memory")
+    config = _validate_memory_candidate(config_data, restored)
+    probe = await _probe_memory_candidate_async(config)
+    credentials = None
+    if config.manager_class == "mem0":
+        env_name = str(config.backend_config.get("api_key_env") or "")
+        credentials = {"api_key_env": env_name, "env_present": bool(env_name and os.environ.get(env_name))}
+    return {
+        "success": True,
+        "probe": probe,
+        "credentials": credentials,
+        "canonical_config": _redact_value("memory", _memory_canonical_dump(config)),
+    }
 
 
 @router.put("/memory")
 async def update_admin_memory(req: AdminMemoryUpdateRequest = Body()):
-    """Update global-memory configuration and reload new clients."""
+    """Compatibility full replacement using the legacy serializable shape."""
     path = _config_path()
     config_data = _load_config_data(path)
-    _validate_configured_model_name(config_data, req.config.model_name, field="memory.model_name")
-    config_data["memory"] = req.config.model_dump(exclude_none=True)
-    _atomic_write_config(config_data, path=path)
-    try:
-        reload_result = _reload_after_config_write(reload=req.reload)
-    except Exception as exc:
-        logger.exception("Admin memory update wrote config but reload failed")
-        raise HTTPException(status_code=500, detail=f"Memory config saved but reload failed: {exc}") from exc
-    return {"success": True, "config": req.config.model_dump(), "reload": reload_result}
+    previous_present = "memory" in config_data
+    previous_raw = _memory_raw_config(config_data)
+    current = MemoryConfig.model_validate(previous_raw)
+    restored = _restore_redacted_values(req.config, current.model_dump(), path="memory")
+    config = _validate_memory_candidate(config_data, restored)
+    persisted_memory = config.model_dump(exclude_none=True)
+    config_data["memory"] = persisted_memory
+    reload_result = await asyncio.to_thread(
+        _persist_memory_and_reload,
+        path=path,
+        config_data=config_data,
+        previous_raw=previous_raw,
+        previous_present=previous_present,
+        candidate_raw=persisted_memory,
+        reload=req.reload,
+    )
+    response = _memory_admin_response(_load_config_data(path), reload_result=reload_result)
+    return {"success": True, **response}
+
+
+@router.patch("/memory")
+async def patch_admin_memory(req: AdminMemoryPatchRequest = Body()):
+    """Safely update canonical memory configuration with optimistic concurrency."""
+    unknown = sorted(str(key) for key in req.changes if key not in _MEMORY_CANONICAL_KEYS)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "unknown_memory_fields", "fields": unknown},
+        )
+
+    path = _config_path()
+    config_data = _load_config_data(path)
+    previous_present = "memory" in config_data
+    previous_raw = _memory_raw_config(config_data)
+    current_revision = _memory_revision(previous_raw)
+    if req.expected_revision != current_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "memory_revision_conflict",
+                "message": "Memory config changed after it was loaded; refresh and retry.",
+                "current_revision": current_revision,
+            },
+        )
+
+    current = MemoryConfig.model_validate(previous_raw)
+    current_canonical = _memory_canonical_dump(current)
+    requested_manager = str(req.changes.get("manager_class", current.manager_class)).strip()
+    manager_changed = requested_manager != current.manager_class
+    if manager_changed and req.backend_config_mode != "replace":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "backend_replace_required",
+                "message": "backend_config_mode='replace' is required when changing manager_class.",
+            },
+        )
+
+    candidate = deepcopy(current_canonical)
+    for key, value in req.changes.items():
+        if key == "backend_config":
+            if not isinstance(value, dict):
+                raise HTTPException(status_code=400, detail="memory.backend_config must be an object")
+            existing_backend = {} if manager_changed else current_canonical["backend_config"]
+            restored_backend = _restore_redacted_values(value, existing_backend, path="memory.backend_config")
+            candidate["backend_config"] = (
+                restored_backend
+                if req.backend_config_mode == "replace"
+                else _deep_merge_mapping(existing_backend, restored_backend)
+            )
+        else:
+            candidate[key] = deepcopy(value)
+
+    config = _validate_memory_candidate(config_data, candidate)
+    probe_result = await _probe_memory_candidate_async(config) if req.probe else None
+    config_data["memory"] = _memory_canonical_dump(config)
+    reload_result = await asyncio.to_thread(
+        _persist_memory_and_reload,
+        path=path,
+        config_data=config_data,
+        previous_raw=previous_raw,
+        previous_present=previous_present,
+        candidate_raw=_memory_canonical_dump(config),
+        reload=req.reload,
+    )
+    response = _memory_admin_response(_load_config_data(path), reload_result=reload_result)
+    return {"success": True, "probe": probe_result, **response}
 
 
 @router.get("/summarization")

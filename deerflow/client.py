@@ -16,7 +16,6 @@ Usage:
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import mimetypes
@@ -37,11 +36,19 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 
 from deerflow.agents.lead_agent.agent import _build_middlewares
-from deerflow.agents.middlewares.subagent_limit_middleware import clamp_subagent_limit
 from deerflow.agents.lead_agent.prompt import apply_prompt_template
-from deerflow.agents.thread_state import AgentContext, ThreadState
+from deerflow.agents.middlewares.subagent_limit_middleware import clamp_subagent_limit
+from deerflow.agents.thread_state import (
+    AgentContext,
+    get_thread_state_schema,
+    normalize_middleware_state_schemas,
+)
 from deerflow.config.agents_config import AGENT_NAME_PATTERN
 from deerflow.config.app_config import get_app_config, reload_app_config
+from deerflow.config.checkpointer_config import (
+    DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY,
+    CheckpointChannelMode,
+)
 from deerflow.config.extensions_config import (
     ExtensionsConfig,
     get_extensions_config,
@@ -65,6 +72,11 @@ from deerflow.uploads.manager import (
 )
 
 logger = logging.getLogger(__name__)
+
+from deerflow.runtime.checkpoint_lock import (
+    checkpoint_thread_lock_async,
+    checkpoint_thread_lock_sync,
+)
 
 # Shown to the user when a run exhausts the graph ``recursion_limit``. The
 # loop-detection middleware normally forces a clean wrap-up well before this,
@@ -158,6 +170,8 @@ class DeerFlowClient:
         available_skills: set[str] | None = None,
         middlewares: Sequence[AgentMiddleware] | None = None,
         recursion_limit: int = 200,
+        checkpoint_channel_mode: CheckpointChannelMode | None = None,
+        checkpoint_snapshot_frequency: int | None = None,
     ):
         """Initialize the client.
 
@@ -194,6 +208,19 @@ class DeerFlowClient:
         self._available_skills = set(available_skills) if available_skills is not None else None
         self._middlewares = list(middlewares) if middlewares else []
         self._recursion_limit = recursion_limit
+        configured_checkpointer = getattr(self._app_config, "checkpointer", None)
+        self._checkpoint_channel_mode: CheckpointChannelMode = (
+            checkpoint_channel_mode
+            or getattr(configured_checkpointer, "channel_mode", "full")
+        )
+        self._checkpoint_snapshot_frequency = (
+            checkpoint_snapshot_frequency
+            or getattr(
+                getattr(configured_checkpointer, "delta", None),
+                "snapshot_frequency",
+                DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY,
+            )
+        )
 
         # Lazy agent — created on first call, recreated when config changes.
         self._agent: CompiledStateGraph[Any, Any, Any, Any] | None = None
@@ -260,26 +287,34 @@ class DeerFlowClient:
             metadata["model_name"] = effective_model
         metadata["thinking_enabled"] = bool(overrides.get("thinking_enabled", self._thinking_enabled))
         metadata["agent_name"] = self._agent_name or "agent"
-        return RunnableConfig(
+        if overrides.get("user_id") is not None:
+            metadata["user_id"] = str(overrides["user_id"])
+        result = RunnableConfig(
             configurable=configurable,
             metadata=metadata,
             recursion_limit=overrides.get("recursion_limit", self._recursion_limit),
         )
+        from deerflow.runtime.checkpoint_mode import inject_checkpoint_mode
+
+        inject_checkpoint_mode(result, self._checkpoint_channel_mode)
+        return result
 
     @staticmethod
     def _get_memory_signature(agent_name: str | None = None) -> str | None:
         """Return a stable signature for prompt-injected memory content."""
         try:
-            from deerflow.agents.memory import get_memory_data
+            from deerflow.agents.memory import memory_manager_lease
             from deerflow.config.memory_config import get_memory_config
 
             memory_config = get_memory_config()
-            if not memory_config.enabled or not memory_config.injection_enabled:
+            if (
+                not memory_config.enabled
+                or not memory_config.injection_enabled
+                or memory_config.mode in {"middleware", "tool"}
+            ):
                 return None
-
-            memory_data = get_memory_data(agent_name)
-            payload = json.dumps(memory_data, sort_keys=True, ensure_ascii=False, default=str)
-            return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            with memory_manager_lease() as manager:
+                return manager.cache_signature(agent_name)
         except Exception:
             logger.debug("Failed to build memory signature for agent cache key", exc_info=True)
             return None
@@ -307,6 +342,12 @@ class DeerFlowClient:
         skill_evolution_config = getattr(app_config, "skill_evolution", None)
         skill_evolution_enabled = bool(getattr(skill_evolution_config, "enabled", False))
         skill_evolution_mode = getattr(skill_evolution_config, "mode", "review")
+        checkpoint_mode = getattr(self, "_checkpoint_channel_mode", "full")
+        checkpoint_frequency = getattr(
+            self,
+            "_checkpoint_snapshot_frequency",
+            DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY,
+        )
         key = (
             model_name,
             getattr(model_config, "supports_vision", False),
@@ -321,6 +362,8 @@ class DeerFlowClient:
             skill_evolution_mode,
             self._agent_name,
             frozenset(self._available_skills) if self._available_skills is not None else None,
+            checkpoint_mode,
+            checkpoint_frequency,
         )
 
         if self._agent is not None and self._agent_config_key == key:
@@ -330,6 +373,25 @@ class DeerFlowClient:
         subagent_enabled = bool(cfg.get("subagent_enabled", False)) and getattr(app_config.subagents, "enabled", True)
         max_concurrent_subagents = clamp_subagent_limit(cfg.get("max_concurrent_subagents", 3))
 
+        from deerflow.runtime.checkpoint_mode import (
+            freeze_checkpoint_channel_mode,
+            freeze_checkpoint_snapshot_frequency,
+        )
+
+        freeze_checkpoint_channel_mode(checkpoint_mode)
+        freeze_checkpoint_snapshot_frequency(checkpoint_frequency)
+        middlewares = _build_middlewares(
+            config,
+            model_name=model_name,
+            agent_name=self._agent_name,
+            custom_middlewares=self._middlewares,
+            recursion_limit=self._recursion_limit,
+        )
+        middlewares = normalize_middleware_state_schemas(
+            middlewares,
+            checkpoint_mode,
+            checkpoint_frequency,
+        )
         kwargs: dict[str, Any] = {
             # disable_keepalive: the lead agent's ChatOpenAI is cached per
             # config and reused across requests; opting out of keep-alive
@@ -337,14 +399,17 @@ class DeerFlowClient:
             # could later be torn down on a foreign loop.
             "model": create_chat_model(name=model_name, thinking_enabled=thinking_enabled, disable_keepalive=True),
             "tools": self._get_tools(model_name=model_name, subagent_enabled=subagent_enabled),
-            "middleware": _build_middlewares(config, model_name=model_name, agent_name=self._agent_name, custom_middlewares=self._middlewares, recursion_limit=self._recursion_limit),
+            "middleware": middlewares,
             "system_prompt": apply_prompt_template(
                 subagent_enabled=subagent_enabled,
                 max_concurrent_subagents=max_concurrent_subagents,
                 agent_name=self._agent_name,
                 available_skills=self._available_skills,
             ),
-            "state_schema": ThreadState,
+            "state_schema": get_thread_state_schema(
+                checkpoint_mode,
+                checkpoint_frequency,
+            ),
             "context_schema": AgentContext,
         }
         checkpointer = self._checkpointer
@@ -501,6 +566,15 @@ class DeerFlowClient:
             return
         try:
             check_config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            if self._checkpoint_channel_mode == "delta" and self._agent is not None:
+                from deerflow.runtime.checkpoint_mode import inject_checkpoint_mode
+
+                inject_checkpoint_mode(check_config, "delta")
+                snapshot = await self._agent.aget_state(check_config)
+                for msg in (getattr(snapshot, "values", {}) or {}).get("messages", []):
+                    if (msg_id := getattr(msg, "id", None)):
+                        stream_state.seen_ids.add(msg_id)
+                return
             aget_tuple = getattr(checkpointer, "aget_tuple", None)
             if aget_tuple is not None:
                 cp_tuple = await aget_tuple(check_config)
@@ -524,6 +598,15 @@ class DeerFlowClient:
             return
         try:
             check_config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+            if self._checkpoint_channel_mode == "delta" and self._agent is not None:
+                from deerflow.runtime.checkpoint_mode import inject_checkpoint_mode
+
+                inject_checkpoint_mode(check_config, "delta")
+                snapshot = self._agent.get_state(check_config)
+                for msg in (getattr(snapshot, "values", {}) or {}).get("messages", []):
+                    if (msg_id := getattr(msg, "id", None)):
+                        stream_state.seen_ids.add(msg_id)
+                return
             get_tuple = getattr(checkpointer, "get_tuple", None)
             if get_tuple is None:
                 return
@@ -535,6 +618,24 @@ class DeerFlowClient:
                     stream_state.seen_ids.add(msg_id)
         except Exception:
             logger.debug("Failed to seed seen_ids from checkpoint (thread=%s)", thread_id, exc_info=True)
+
+    def _ensure_checkpoint_compatible_sync(self, config: RunnableConfig) -> None:
+        from deerflow.runtime.checkpoint_mode import ensure_checkpoint_mode_compatible
+
+        ensure_checkpoint_mode_compatible(
+            getattr(self, "_effective_checkpointer", None),
+            config,
+            getattr(self, "_checkpoint_channel_mode", "full"),
+        )
+
+    async def _ensure_checkpoint_compatible(self, config: RunnableConfig) -> None:
+        from deerflow.runtime.checkpoint_mode import aensure_checkpoint_mode_compatible
+
+        await aensure_checkpoint_mode_compatible(
+            getattr(self, "_effective_checkpointer", None),
+            config,
+            getattr(self, "_checkpoint_channel_mode", "full"),
+        )
 
     def _prepare_stream_invocation(
         self,
@@ -558,6 +659,8 @@ class DeerFlowClient:
         }
         if self._agent_name:
             context["agent_name"] = self._agent_name
+        if kwargs.get("user_id") is not None:
+            context["user_id"] = str(kwargs["user_id"])
         return config, state, context
 
     @staticmethod
@@ -717,6 +820,18 @@ class DeerFlowClient:
             return {"thread_list": []}
 
         for cp in checkpointer.list(config=None, limit=limit):
+            if self._checkpoint_channel_mode == "full":
+                from deerflow.runtime.checkpoint_mode import checkpoint_tuple_uses_delta
+
+                if checkpoint_tuple_uses_delta(cp):
+                    from deerflow.runtime.checkpoint_mode import (
+                        CheckpointModeMismatchError,
+                    )
+
+                    raise CheckpointModeMismatchError(
+                        "Checkpoint database contains delta threads; restart with "
+                        "checkpoint_channel_mode=delta before listing them."
+                    )
             cfg = cp.config.get("configurable", {})
             thread_id = cfg.get("thread_id")
             if not thread_id:
@@ -750,6 +865,21 @@ class DeerFlowClient:
                         thread_info_map[thread_id]["title"] = channel_values.get("title")
 
         threads = list(thread_info_map.values())
+        if self._checkpoint_channel_mode == "delta" and threads:
+            for item in threads:
+                runnable_config = self._get_runnable_config(item["thread_id"])
+                self._ensure_agent(runnable_config)
+                if self._agent is not None:
+                    from deerflow.runtime.checkpoint_state import (
+                        CheckpointStateAccessor,
+                    )
+
+                    snapshot = CheckpointStateAccessor(
+                        self._agent, checkpointer, "delta"
+                    ).get(runnable_config)
+                    item["title"] = (getattr(snapshot, "values", {}) or {}).get(
+                        "title"
+                    )
         threads.sort(key=lambda x: x.get("created_at") or "", reverse=True)
 
         return {"thread_list": threads[:limit]}
@@ -774,6 +904,49 @@ class DeerFlowClient:
 
         if not isinstance(checkpointer, BaseCheckpointSaver):
             return {"thread_id": thread_id, "checkpoints": checkpoints}
+
+        if self._checkpoint_channel_mode == "delta":
+            runnable_config = self._get_runnable_config(thread_id)
+            self._ensure_agent(runnable_config)
+            if self._agent is None:
+                return {"thread_id": thread_id, "checkpoints": checkpoints}
+            timestamp_by_id = {
+                (cp.config.get("configurable", {}) or {}).get("checkpoint_id"):
+                cp.checkpoint.get("ts")
+                for cp in checkpointer.list(config)
+            }
+            from deerflow.runtime.checkpoint_state import CheckpointStateAccessor
+
+            accessor = CheckpointStateAccessor(self._agent, checkpointer, "delta")
+            for snapshot in accessor.history(runnable_config):
+                values = dict(getattr(snapshot, "values", {}) or {})
+                if "messages" in values:
+                    values["messages"] = [
+                        self._serialize_message(message)
+                        if hasattr(message, "content")
+                        else message
+                        for message in values["messages"]
+                    ]
+                snapshot_config = getattr(snapshot, "config", {}) or {}
+                parent_config = getattr(snapshot, "parent_config", {}) or {}
+                cfg = snapshot_config.get("configurable", {})
+                parent_cfg = parent_config.get("configurable", {})
+                checkpoints.append(
+                    {
+                        "checkpoint_id": cfg.get("checkpoint_id"),
+                        "parent_checkpoint_id": parent_cfg.get("checkpoint_id"),
+                        "ts": timestamp_by_id.get(cfg.get("checkpoint_id")),
+                        "metadata": getattr(snapshot, "metadata", {}) or {},
+                        "values": values,
+                        "pending_writes": [],
+                    }
+                )
+            checkpoints.reverse()
+            return {"thread_id": thread_id, "checkpoints": checkpoints}
+
+        from deerflow.runtime.checkpoint_mode import ensure_checkpoint_mode_compatible
+
+        ensure_checkpoint_mode_compatible(checkpointer, config, "full")
 
         for cp in checkpointer.list(config):
             channel_values = dict(cp.checkpoint.get("channel_values", {}))
@@ -890,24 +1063,28 @@ class DeerFlowClient:
         stream_state = _StreamProcessingState()
 
         actual_thread_id = config.get("configurable", {}).get("thread_id")
-        if actual_thread_id:
-            self._seed_seen_ids_from_checkpoint_sync(stream_state, actual_thread_id)
-
-        try:
-            for item in agent.stream(
-                state,
-                config=config,
-                context=context,
-                stream_mode=["values", "messages", "custom"],
-                subgraphs=True,
-            ):
-                yield from self._events_from_stream_item(item, stream_state)
-        except GraphRecursionError:
-            logger.warning(
-                "Recursion limit reached (thread=%s) — emitting graceful final answer",
-                actual_thread_id,
-            )
-            yield self._recursion_limit_event()
+        lock_id = str(actual_thread_id or uuid.uuid4())
+        with checkpoint_thread_lock_sync(lock_id):
+            self._ensure_checkpoint_compatible_sync(config)
+            if actual_thread_id:
+                self._seed_seen_ids_from_checkpoint_sync(
+                    stream_state, actual_thread_id
+                )
+            try:
+                for item in agent.stream(
+                    state,
+                    config=config,
+                    context=context,
+                    stream_mode=["values", "messages", "custom"],
+                    subgraphs=True,
+                ):
+                    yield from self._events_from_stream_item(item, stream_state)
+            except GraphRecursionError:
+                logger.warning(
+                    "Recursion limit reached (thread=%s) — emitting graceful final answer",
+                    actual_thread_id,
+                )
+                yield self._recursion_limit_event()
 
         yield StreamEvent(type="end", data={"usage": stream_state.cumulative_usage})
 
@@ -932,25 +1109,29 @@ class DeerFlowClient:
         stream_state = _StreamProcessingState()
 
         actual_thread_id = config.get("configurable", {}).get("thread_id")
-        if actual_thread_id:
-            await self._seed_seen_ids_from_checkpoint(stream_state, actual_thread_id)
-
-        try:
-            async for item in agent.astream(
-                state,
-                config=config,
-                context=context,
-                stream_mode=["values", "messages", "custom"],
-                subgraphs=True,
-            ):
-                for event in self._events_from_stream_item(item, stream_state):
-                    yield event
-        except GraphRecursionError:
-            logger.warning(
-                "Recursion limit reached (thread=%s) — emitting graceful final answer",
-                actual_thread_id,
-            )
-            yield self._recursion_limit_event()
+        lock_id = str(actual_thread_id or uuid.uuid4())
+        async with checkpoint_thread_lock_async(lock_id):
+            await self._ensure_checkpoint_compatible(config)
+            if actual_thread_id:
+                await self._seed_seen_ids_from_checkpoint(
+                    stream_state, actual_thread_id
+                )
+            try:
+                async for item in agent.astream(
+                    state,
+                    config=config,
+                    context=context,
+                    stream_mode=["values", "messages", "custom"],
+                    subgraphs=True,
+                ):
+                    for event in self._events_from_stream_item(item, stream_state):
+                        yield event
+            except GraphRecursionError:
+                logger.warning(
+                    "Recursion limit reached (thread=%s) — emitting graceful final answer",
+                    actual_thread_id,
+                )
+                yield self._recursion_limit_event()
 
         yield StreamEvent(type="end", data={"usage": stream_state.cumulative_usage})
 
@@ -1048,21 +1229,24 @@ class DeerFlowClient:
         Returns:
             Memory data dict (see src/agents/memory/updater.py for structure).
         """
-        from deerflow.agents.memory.updater import get_memory_data
+        from deerflow.agents.memory import memory_manager_lease
 
-        return get_memory_data()
+        with memory_manager_lease() as manager:
+            return manager.get_memory(self._agent_name)
 
     def export_memory(self) -> dict:
         """Export current memory data for backup or transfer."""
-        from deerflow.agents.memory.updater import get_memory_data
+        from deerflow.agents.memory import memory_manager_lease
 
-        return get_memory_data()
+        with memory_manager_lease() as manager:
+            return manager.export_memory(self._agent_name)
 
     def import_memory(self, memory_data: dict) -> dict:
         """Import and persist full memory data."""
-        from deerflow.agents.memory.updater import import_memory_data
+        from deerflow.agents.memory import memory_manager_lease
 
-        return import_memory_data(memory_data)
+        with memory_manager_lease() as manager:
+            return manager.import_memory(memory_data, self._agent_name)
 
     def get_model(self, name: str) -> dict | None:
         """Get a specific model's configuration by name.
@@ -1273,27 +1457,36 @@ class DeerFlowClient:
         Returns:
             The reloaded memory data dict.
         """
-        from deerflow.agents.memory.updater import reload_memory_data
+        from deerflow.agents.memory import memory_manager_lease
 
-        return reload_memory_data()
+        with memory_manager_lease() as manager:
+            return manager.reload_memory(self._agent_name)
 
     def clear_memory(self) -> dict:
         """Clear all persisted memory data."""
-        from deerflow.agents.memory.updater import clear_memory_data
+        from deerflow.agents.memory import memory_manager_lease
 
-        return clear_memory_data()
+        with memory_manager_lease() as manager:
+            return manager.clear_memory(self._agent_name)
 
     def create_memory_fact(self, content: str, category: str = "context", confidence: float = 0.5) -> dict:
         """Create a single fact manually."""
-        from deerflow.agents.memory.updater import create_memory_fact
+        from deerflow.agents.memory import memory_manager_lease
 
-        return create_memory_fact(content=content, category=category, confidence=confidence)
+        with memory_manager_lease() as manager:
+            return manager.create_fact(
+                content=content,
+                category=category,
+                confidence=confidence,
+                agent_name=self._agent_name,
+            )
 
     def delete_memory_fact(self, fact_id: str) -> dict:
         """Delete a single fact from memory by fact id."""
-        from deerflow.agents.memory.updater import delete_memory_fact
+        from deerflow.agents.memory import memory_manager_lease
 
-        return delete_memory_fact(fact_id)
+        with memory_manager_lease() as manager:
+            return manager.delete_fact(fact_id, agent_name=self._agent_name)
 
     def update_memory_fact(
         self,
@@ -1303,14 +1496,16 @@ class DeerFlowClient:
         confidence: float | None = None,
     ) -> dict:
         """Update a single fact manually, preserving omitted fields."""
-        from deerflow.agents.memory.updater import update_memory_fact
+        from deerflow.agents.memory import memory_manager_lease
 
-        return update_memory_fact(
-            fact_id=fact_id,
-            content=content,
-            category=category,
-            confidence=confidence,
-        )
+        with memory_manager_lease() as manager:
+            return manager.update_fact(
+                fact_id=fact_id,
+                content=content,
+                category=category,
+                confidence=confidence,
+                agent_name=self._agent_name,
+            )
 
     def get_memory_config(self) -> dict:
         """Get memory system configuration.
@@ -1321,15 +1516,7 @@ class DeerFlowClient:
         from deerflow.config.memory_config import get_memory_config
 
         config = get_memory_config()
-        return {
-            "enabled": config.enabled,
-            "storage_path": config.storage_path,
-            "debounce_seconds": config.debounce_seconds,
-            "max_facts": config.max_facts,
-            "fact_confidence_threshold": config.fact_confidence_threshold,
-            "injection_enabled": config.injection_enabled,
-            "max_injection_tokens": config.max_injection_tokens,
-        }
+        return config.model_dump()
 
     def get_memory_status(self) -> dict:
         """Get memory status: config + current data.

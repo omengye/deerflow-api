@@ -34,6 +34,23 @@ from deerflow.runtime.store._sqlite_utils import ensure_sqlite_parent_dir, resol
 
 logger = logging.getLogger(__name__)
 
+
+@contextlib.asynccontextmanager
+async def _with_checkpoint_cache(saver, config):
+    if config.channel_mode != "delta":
+        yield saver
+        return
+    from deerflow.runtime.checkpoint_cache import (
+        checkpoint_cache_key_prefix,
+        make_async_checkpoint_cache,
+    )
+    from deerflow.runtime.checkpointer import CachedHistorySaver
+
+    identity = f"{config.type}:{config.connection_string or ''}"
+    prefix = checkpoint_cache_key_prefix(config.cache, identity)
+    async with make_async_checkpoint_cache(config.cache, serde=saver.serde) as cache:
+        yield CachedHistorySaver(saver, cache, key_prefix=prefix)
+
 # ---------------------------------------------------------------------------
 # Async factory
 # ---------------------------------------------------------------------------
@@ -45,7 +62,8 @@ async def _async_checkpointer(config) -> AsyncIterator[Checkpointer]:
     if config.type == "memory":
         from langgraph.checkpoint.memory import InMemorySaver
 
-        yield InMemorySaver()
+        async with _with_checkpoint_cache(InMemorySaver(), config) as saver:
+            yield saver
         return
 
     if config.type == "sqlite":
@@ -58,7 +76,8 @@ async def _async_checkpointer(config) -> AsyncIterator[Checkpointer]:
         await asyncio.to_thread(ensure_sqlite_parent_dir, conn_str)
         async with AsyncSqliteSaver.from_conn_string(conn_str) as saver:
             await saver.setup()
-            yield saver
+            async with _with_checkpoint_cache(saver, config) as cached:
+                yield cached
         return
 
     if config.type == "postgres":
@@ -72,7 +91,8 @@ async def _async_checkpointer(config) -> AsyncIterator[Checkpointer]:
 
         async with AsyncPostgresSaver.from_conn_string(config.connection_string) as saver:
             await saver.setup()
-            yield saver
+            async with _with_checkpoint_cache(saver, config) as cached:
+                yield cached
         return
 
     raise ValueError(f"Unknown checkpointer type: {config.type!r}")

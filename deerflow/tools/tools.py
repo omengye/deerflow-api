@@ -5,7 +5,15 @@ from langchain_core.tools import BaseTool, StructuredTool
 from deerflow.config import get_app_config
 from deerflow.reflection import resolve_variable
 from deerflow.sandbox.security import is_host_bash_allowed
-from deerflow.tools.builtins import ask_clarification_tool, list_uploaded_files_tool, present_file_tool, scheduled_task_tools, task_tool, view_image_tool
+from deerflow.tools.builtins import (
+    ask_clarification_tool,
+    list_uploaded_files_tool,
+    memory_search_tool,
+    present_file_tool,
+    scheduled_task_tools,
+    task_tool,
+    view_image_tool,
+)
 from deerflow.tools.builtins.tool_search import get_deferred_registry
 from deerflow.tools.sync import make_sync_tool_wrapper
 
@@ -89,6 +97,9 @@ def get_available_tools(
 
     # Conditionally add tools based on config
     builtin_tools = BUILTIN_TOOLS.copy()
+    if config.memory.enabled and config.memory.mode == "tool":
+        builtin_tools.append(memory_search_tool)
+        logger.info("Including memory_search tool (memory.mode=tool)")
     skill_evolution_config = getattr(config, "skill_evolution", None)
     if getattr(skill_evolution_config, "enabled", False):
         from deerflow.tools.skill_manage_tool import skill_manage_tool

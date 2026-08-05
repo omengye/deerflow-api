@@ -1,12 +1,16 @@
 import asyncio
+import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import yaml
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from app.config import settings
@@ -15,6 +19,11 @@ from app.middleware import ApiKeyAuthMiddleware
 from app.routers import admin as admin_router
 from deerflow.config.app_config import reset_app_config
 from deerflow.config.extensions_config import reset_extensions_config
+from deerflow.config.memory_config import (
+    MemoryConfig,
+    get_memory_config,
+    set_memory_config,
+)
 from deerflow.runtime.scheduler import SchedulerStore
 from deerflow.skills.evolution import (
     EvolutionSignal,
@@ -45,6 +54,7 @@ class AdminApiTests(unittest.TestCase):
         }
         self._original_feishu = settings.feishu
         self._original_thread_cleanup = settings.thread_cleanup.model_copy(deep=True)
+        self._original_memory_config = get_memory_config().model_copy(deep=True)
         self._tmp = tempfile.TemporaryDirectory()
         self.config_path = Path(self._tmp.name) / "config.yaml"
         self.skills_root = Path(self._tmp.name) / "skills"
@@ -137,6 +147,7 @@ tool_groups: []
             setattr(settings, key, value)
         settings.feishu = self._original_feishu
         settings.thread_cleanup = self._original_thread_cleanup
+        set_memory_config(self._original_memory_config)
         reset_app_config()
         reset_extensions_config()
         self._tmp.cleanup()
@@ -775,6 +786,416 @@ tool_groups: []
         )
         self.assertEqual(summarization.status_code, 400)
 
+    def test_memory_patch_supports_mem0_and_rejects_stale_revision(self) -> None:
+        client = self._client()
+        current = client.get("/api/admin/memory", headers=self._auth_headers())
+        self.assertEqual(current.status_code, 200)
+        revision = current.json()["revision"]
+
+        patched = client.patch(
+            "/api/admin/memory",
+            headers=self._auth_headers(),
+            json={
+                "expected_revision": revision,
+                "changes": {
+                    "enabled": True,
+                    "manager_class": "mem0",
+                    "mode": "tool",
+                    "injection_enabled": True,
+                    "shutdown_flush_timeout_seconds": 12,
+                    "backend_config": {
+                        "api_key_env": "ADMIN_TEST_MEM0_KEY",
+                        "base_url": "https://mem0.example.test",
+                        "allow_insecure_http": False,
+                        "default_user_id": "admin-test",
+                        "top_k": 7,
+                        "score_threshold": 0.25,
+                        "max_injection_chars": 9000,
+                        "timeout_seconds": 8,
+                        "startup_policy": "best_effort",
+                        "failure_policy": {"read": "fail_open", "write": "log_and_drop"},
+                    },
+                },
+                "backend_config_mode": "replace",
+                "probe": False,
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(patched.status_code, 200, patched.text)
+        payload = patched.json()
+        self.assertEqual(payload["canonical_config"]["manager_class"], "mem0")
+        self.assertEqual(payload["canonical_config"]["backend_config"]["top_k"], 7)
+        self.assertNotEqual(payload["revision"], revision)
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["memory"]["manager_class"], "mem0")
+        self.assertEqual(raw["memory"]["backend_config"]["default_user_id"], "admin-test")
+        self.assertNotIn("storage_path", raw["memory"])
+
+        stale = client.patch(
+            "/api/admin/memory",
+            headers=self._auth_headers(),
+            json={
+                "expected_revision": revision,
+                "changes": {"enabled": False},
+                "probe": False,
+                "reload": False,
+            },
+        )
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.json()["detail"]["code"], "memory_revision_conflict")
+
+    def test_memory_patch_preserves_redacted_custom_backend_secrets(self) -> None:
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        raw["memory"] = {
+            "enabled": True,
+            "manager_class": "deerflow.agents.memory.backends.deermem:DeerMemManager",
+            "mode": "middleware",
+            "injection_enabled": True,
+            "shutdown_flush_timeout_seconds": 30,
+            "backend_config": {"api_key": "literal-memory-secret", "custom_option": "keep-me"},
+        }
+        self.config_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        client = self._client()
+
+        current = client.get("/api/admin/memory", headers=self._auth_headers())
+        self.assertEqual(current.status_code, 200, current.text)
+        payload = current.json()
+        backend = payload["canonical_config"]["backend_config"]
+        self.assertTrue(backend["api_key"]["redacted"])
+        self.assertNotIn("literal-memory-secret", current.text)
+
+        patched = client.patch(
+            "/api/admin/memory",
+            headers=self._auth_headers(),
+            json={
+                "expected_revision": payload["revision"],
+                "changes": {
+                    **payload["canonical_config"],
+                    "mode": "tool",
+                },
+                "backend_config_mode": "merge",
+                "probe": False,
+                "reload": False,
+            },
+        )
+        self.assertEqual(patched.status_code, 200, patched.text)
+        persisted = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))["memory"]
+        self.assertEqual(persisted["backend_config"]["api_key"], "literal-memory-secret")
+        self.assertEqual(persisted["backend_config"]["custom_option"], "keep-me")
+        self.assertEqual(persisted["mode"], "tool")
+
+    def test_memory_patch_replace_can_remove_custom_backend_fields_and_preserve_secret(self) -> None:
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        raw["memory"] = {
+            "enabled": True,
+            "manager_class": "deerflow.agents.memory.backends.deermem:DeerMemManager",
+            "mode": "middleware",
+            "injection_enabled": True,
+            "shutdown_flush_timeout_seconds": 30,
+            "backend_config": {
+                "api_key": "literal-memory-secret",
+                "keep": "old",
+                "remove_me": True,
+            },
+        }
+        self.config_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        client = self._client()
+        current = client.get("/api/admin/memory", headers=self._auth_headers()).json()
+
+        response = client.patch(
+            "/api/admin/memory",
+            headers=self._auth_headers(),
+            json={
+                "expected_revision": current["revision"],
+                "changes": {
+                    "backend_config": {
+                        "api_key": current["canonical_config"]["backend_config"]["api_key"],
+                        "keep": "new",
+                    },
+                },
+                "backend_config_mode": "replace",
+                "probe": False,
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        persisted = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))["memory"]["backend_config"]
+        self.assertEqual(persisted["api_key"], "literal-memory-secret")
+        self.assertEqual(persisted["keep"], "new")
+        self.assertNotIn("remove_me", persisted)
+
+    def test_memory_patch_without_reload_does_not_mutate_runtime_config(self) -> None:
+        runtime_config = MemoryConfig(
+            enabled=False,
+            manager_class="deermem",
+            backend_config={"max_facts": 111},
+        )
+        set_memory_config(runtime_config)
+        client = self._client()
+        current = client.get("/api/admin/memory", headers=self._auth_headers()).json()
+
+        response = client.patch(
+            "/api/admin/memory",
+            headers=self._auth_headers(),
+            json={
+                "expected_revision": current["revision"],
+                "changes": {"shutdown_flush_timeout_seconds": 17},
+                "probe": False,
+                "reload": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        persisted = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))["memory"]
+        self.assertEqual(persisted["shutdown_flush_timeout_seconds"], 17)
+        self.assertEqual(get_memory_config(), runtime_config)
+
+    def test_config_reads_do_not_apply_file_memory_config(self) -> None:
+        runtime_config = MemoryConfig(enabled=False, manager_class="deermem")
+        set_memory_config(runtime_config)
+        raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        raw["memory"] = MemoryConfig(enabled=True, manager_class="deermem").model_dump()
+        self.config_path.write_text(
+            yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+
+        client = self._client()
+        config_response = client.get("/api/admin/config", headers=self._auth_headers())
+        self.assertEqual(config_response.status_code, 200, config_response.text)
+        self.assertEqual(get_memory_config(), runtime_config)
+
+        health_response = client.get("/api/admin/config/health", headers=self._auth_headers())
+        self.assertEqual(health_response.status_code, 200, health_response.text)
+        self.assertTrue(health_response.json()["valid"])
+        self.assertEqual(get_memory_config(), runtime_config)
+
+    def test_memory_write_failure_leaves_runtime_and_file_unchanged_and_removes_temp_file(self) -> None:
+        runtime_config = MemoryConfig(enabled=False, manager_class="deermem")
+        set_memory_config(runtime_config)
+        before = self.config_path.read_text(encoding="utf-8")
+        client = self._client()
+        current = client.get("/api/admin/memory", headers=self._auth_headers()).json()
+
+        with patch.object(Path, "replace", side_effect=OSError("simulated replace failure")):
+            response = client.patch(
+                "/api/admin/memory",
+                headers=self._auth_headers(),
+                json={
+                    "expected_revision": current["revision"],
+                    "changes": {"shutdown_flush_timeout_seconds": 18},
+                    "probe": False,
+                    "reload": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(self.config_path.read_text(encoding="utf-8"), before)
+        self.assertEqual(get_memory_config(), runtime_config)
+        self.assertEqual(list(self.config_path.parent.glob("*.tmp")), [])
+
+    def test_config_file_cas_conflict_does_not_mutate_runtime_memory(self) -> None:
+        runtime_config = MemoryConfig(enabled=False, manager_class="deermem")
+        set_memory_config(runtime_config)
+        loaded = admin_router._load_config_data(self.config_path)
+        loaded["memory"] = MemoryConfig(enabled=True, manager_class="deermem").model_dump()
+
+        concurrent = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        concurrent["log_level"] = "DEBUG"
+        self.config_path.write_text(
+            yaml.safe_dump(concurrent, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            admin_router._atomic_write_config(loaded, path=self.config_path)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(get_memory_config(), runtime_config)
+        persisted = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["log_level"], "DEBUG")
+        self.assertNotIn("memory", persisted)
+
+    def test_memory_reload_rollback_does_not_overwrite_newer_worker_revision(self) -> None:
+        client = self._client()
+        current = client.get("/api/admin/memory", headers=self._auth_headers()).json()
+        reload_calls = 0
+
+        def fail_then_sync(*, reload: bool):
+            nonlocal reload_calls
+            self.assertTrue(reload)
+            reload_calls += 1
+            if reload_calls == 1:
+                concurrent = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+                concurrent["memory"]["shutdown_flush_timeout_seconds"] = 19
+                self.config_path.write_text(
+                    yaml.safe_dump(concurrent, allow_unicode=True, sort_keys=False),
+                    encoding="utf-8",
+                )
+                raise RuntimeError("simulated local reload failure")
+            return {"success": True}
+
+        with patch.object(admin_router, "_reload_after_config_write", side_effect=fail_then_sync):
+            response = client.patch(
+                "/api/admin/memory",
+                headers=self._auth_headers(),
+                json={
+                    "expected_revision": current["revision"],
+                    "changes": {"shutdown_flush_timeout_seconds": 18},
+                    "probe": False,
+                    "reload": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 500, response.text)
+        rollback = response.json()["detail"]["rollback"]
+        self.assertFalse(rollback["file_restored"])
+        self.assertFalse(rollback["runtime_restored"])
+        self.assertTrue(rollback["runtime_synchronized"])
+        self.assertTrue(rollback["superseded_by_newer_config"])
+        persisted = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["memory"]["shutdown_flush_timeout_seconds"], 19)
+        self.assertEqual(reload_calls, 2)
+
+    def test_memory_validation_error_redacts_custom_backend_secret(self) -> None:
+        secret = "literal-custom-memory-secret"
+        candidate = {
+            "enabled": True,
+            "manager_class": "deermem",
+            "mode": "middleware",
+            "injection_enabled": True,
+            "shutdown_flush_timeout_seconds": 30,
+            "backend_config": {"api_key": secret},
+        }
+        client = self._client()
+
+        with patch(
+            "deerflow.agents.memory.validate_memory_manager_config",
+            side_effect=RuntimeError(f"custom validation exposed {secret}"),
+        ):
+            response = client.post(
+                "/api/admin/memory/validate",
+                headers=self._auth_headers(),
+                json={"config": candidate},
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertNotIn(secret, response.text)
+        self.assertIn("[REDACTED]", response.text)
+
+    def test_memory_custom_backend_model_name_is_not_validated_as_deermem_model(
+        self,
+    ) -> None:
+        candidate = {
+            "enabled": True,
+            "manager_class": "deerflow.agents.memory.backends.deermem:DeerMemManager",
+            "mode": "middleware",
+            "injection_enabled": True,
+            "shutdown_flush_timeout_seconds": 30,
+            "backend_config": {"model_name": "external-backend-model"},
+        }
+
+        response = self._client().post(
+            "/api/admin/memory/validate",
+            headers=self._auth_headers(),
+            json={"config": candidate},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["canonical_config"]["backend_config"]["model_name"],
+            "external-backend-model",
+        )
+
+    def test_memory_probe_error_redacts_mem0_environment_secret_from_response_and_log(self) -> None:
+        secret = "mem0-environment-secret-value"
+        candidate = {
+            "enabled": True,
+            "manager_class": "mem0",
+            "mode": "middleware",
+            "injection_enabled": True,
+            "shutdown_flush_timeout_seconds": 30,
+            "backend_config": {
+                "api_key_env": "ADMIN_TEST_MEM0_SECRET",
+                "base_url": "https://mem0.example.test",
+            },
+        }
+        client = self._client()
+
+        with (
+            patch.dict(os.environ, {"ADMIN_TEST_MEM0_SECRET": secret}),
+            patch(
+                "deerflow.agents.memory.probe_memory_manager_config",
+                side_effect=RuntimeError(f"remote probe exposed {secret}"),
+            ),
+            self.assertLogs("app.routers.admin", level="INFO") as captured,
+        ):
+            response = client.post(
+                "/api/admin/memory/test",
+                headers=self._auth_headers(),
+                json={"config": candidate},
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertNotIn(secret, response.text)
+        self.assertNotIn(secret, "\n".join(captured.output))
+        self.assertIn("[REDACTED]", response.text)
+
+    def test_memory_probe_timeout_is_bounded_and_does_not_write_config(self) -> None:
+        before = self.config_path.read_text(encoding="utf-8")
+        candidate = {
+            "enabled": True,
+            "manager_class": "deermem",
+            "mode": "middleware",
+            "injection_enabled": True,
+            "shutdown_flush_timeout_seconds": 30,
+            "backend_config": {},
+        }
+
+        def slow_probe(_config: MemoryConfig) -> dict[str, Any]:
+            time.sleep(0.05)
+            return {"ok": True, "skipped": False}
+
+        with (
+            patch.object(admin_router, "_MEMORY_PROBE_TIMEOUT_SECONDS", 0.01),
+            patch.object(admin_router, "_probe_memory_candidate", side_effect=slow_probe),
+        ):
+            response = self._client().post(
+                "/api/admin/memory/test",
+                headers=self._auth_headers(),
+                json={"config": candidate},
+            )
+
+        self.assertEqual(response.status_code, 504, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "memory_probe_timeout")
+        self.assertEqual(self.config_path.read_text(encoding="utf-8"), before)
+
+    def test_memory_test_reports_missing_mem0_environment_without_writing(self) -> None:
+        client = self._client()
+        before = self.config_path.read_text(encoding="utf-8")
+        response = client.post(
+            "/api/admin/memory/test",
+            headers=self._auth_headers(),
+            json={
+                "config": {
+                    "enabled": True,
+                    "manager_class": "mem0",
+                    "mode": "middleware",
+                    "injection_enabled": True,
+                    "shutdown_flush_timeout_seconds": 30,
+                    "backend_config": {
+                        "api_key_env": "DEERFLOW_TEST_KEY_THAT_IS_NOT_SET",
+                        "base_url": "https://mem0.example.test",
+                    },
+                }
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"]["code"], "memory_probe_failed")
+        self.assertEqual(self.config_path.read_text(encoding="utf-8"), before)
+
     def test_summarization_reject_enabled_without_trigger(self) -> None:
         client = self._client()
         summarization = client.put(
@@ -989,6 +1410,52 @@ tool_groups: []
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["clients_reset"])
         self.assertEqual(manager._client_map, {})
+        self.assertEqual(manager._async_client_map, {})
+
+    def test_async_client_cache_insert_is_atomic_with_reload(self) -> None:
+        manager = ClientManager()
+        insert_started = threading.Event()
+        reload_finished = threading.Event()
+
+        class PausingCache(dict):
+            def __setitem__(self, key, value):
+                insert_started.set()
+                # Without the cache lock, reload finishes here and the stale
+                # entry is inserted after the clear. With the lock, the wait
+                # times out, insertion completes, and reload clears it next.
+                reload_finished.wait(timeout=0.5)
+                super().__setitem__(key, value)
+
+        manager._async_client_map = PausingCache()
+
+        def reload_cache() -> None:
+            if not insert_started.wait(timeout=2):
+                reload_finished.set()
+                return
+            with manager._client_cache_lock:
+                manager._config_generation += 1
+                manager._client_map.clear()
+                manager._async_client_map.clear()
+            reload_finished.set()
+
+        reload_thread = threading.Thread(target=reload_cache, daemon=True)
+        reload_thread.start()
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        with (
+            patch("deerflow.client.DeerFlowClient", FakeClient),
+            patch.object(manager, "_get_async_checkpointer", new=AsyncMock(return_value=object())),
+        ):
+            client = asyncio.run(manager.get_async_client())
+
+        reload_thread.join(timeout=2)
+        self.assertFalse(reload_thread.is_alive())
+        self.assertTrue(insert_started.is_set())
+        self.assertIsInstance(client, FakeClient)
+        self.assertEqual(manager._config_generation, 1)
         self.assertEqual(manager._async_client_map, {})
 
     def test_custom_skill_crud_history_and_support_files(self) -> None:

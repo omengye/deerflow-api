@@ -1,7 +1,7 @@
 """Client manager — singleton DeerFlowClient with checkpointer lifecycle."""
 import asyncio
-import logging
 import atexit
+import logging
 import sqlite3
 import threading
 from collections.abc import Coroutine
@@ -9,7 +9,15 @@ from pathlib import Path
 from typing import Any
 
 from app.config import settings
-from deerflow.runtime import ConflictError, DisconnectMode, MemoryStreamBridge, RunManager, RunRecord, RunStatus, make_stream_bridge
+from deerflow.runtime import (
+    ConflictError,
+    DisconnectMode,
+    MemoryStreamBridge,
+    RunManager,
+    RunRecord,
+    RunStatus,
+    make_stream_bridge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +65,11 @@ class ClientManager:
         self._init_lock = asyncio.Lock()
         self._async_checkpointer = None
         self._async_checkpointer_cm = None
+        self._async_checkpoint_cache_cm = None
         self._async_init_lock = asyncio.Lock()
         self._async_client_lock = asyncio.Lock()
+        self._client_cache_lock = threading.RLock()
+        self._config_generation = 0
         self._client_map: dict[tuple[object, ...], Any] = {}  # config_key -> DeerFlowClient
         self._async_client_map: dict[tuple[object, ...], Any] = {}  # config_key -> DeerFlowClient with async checkpointer
         self._running_threads: set[str] = set()  # thread_ids currently running
@@ -141,8 +152,8 @@ class ClientManager:
 
     async def startup(self):
         """Initialize the DeerFlowClient on startup."""
-        from deerflow.config.app_config import get_app_config, reload_app_config
         from app.config import ensure_data_dirs
+        from deerflow.config.app_config import get_app_config, reload_app_config
 
         ensure_data_dirs()
         if settings.auth_enabled and not settings.api_keys:
@@ -171,6 +182,18 @@ class ClientManager:
             )
 
         self._assert_storage_ready()
+
+        if config.memory.enabled:
+            from deerflow.agents.memory import memory_manager_lease
+
+            # Eager construction makes unknown/custom backends and mem0
+            # fail-fast connectivity errors startup failures instead of the
+            # first user's model-call failure.
+            def warm_memory_manager() -> None:
+                with memory_manager_lease() as manager:
+                    manager.warm()
+
+            await asyncio.to_thread(warm_memory_manager)
 
         if settings.checkpointer_type == "sqlite":
             from app.thread_cleanup import ThreadCleanupService
@@ -214,8 +237,12 @@ class ClientManager:
         """Get or create a DeerFlowClient instance."""
         from deerflow.client import DeerFlowClient
 
+        generation = self._config_generation
         key = (
+            generation,
             settings.checkpointer_type,
+            settings.checkpoint_channel_mode,
+            settings.checkpoint_delta.snapshot_frequency,
             settings.model_name,
             settings.thinking_enabled,
             settings.subagent_enabled,
@@ -225,10 +252,15 @@ class ClientManager:
             frozenset(overrides.items()),
         )
 
-        if key not in self._client_map:
+        with self._client_cache_lock:
+            cached = self._client_map.get(key)
+            if cached is not None:
+                return cached
             kwargs: dict[str, Any] = {
                 "config_path": settings.config_path or None,
                 "checkpointer": self._get_checkpointer(),
+                "checkpoint_channel_mode": settings.checkpoint_channel_mode,
+                "checkpoint_snapshot_frequency": settings.checkpoint_delta.snapshot_frequency,
                 "model_name": settings.model_name,
                 "thinking_enabled": settings.thinking_enabled,
                 "subagent_enabled": settings.subagent_enabled,
@@ -237,43 +269,61 @@ class ClientManager:
                 "recursion_limit": settings.recursion_limit,
             }
             kwargs.update(overrides)
-            self._client_map[key] = DeerFlowClient(**kwargs)
-
-        return self._client_map[key]
+            client = DeerFlowClient(**kwargs)
+            if generation == self._config_generation:
+                self._client_map[key] = client
+            return client
 
     async def get_async_client(self, **overrides) -> Any:
         """Get or create a DeerFlowClient instance backed by an async checkpointer."""
         from deerflow.client import DeerFlowClient
 
-        key = (
-            "async",
-            settings.checkpointer_type,
-            settings.model_name,
-            settings.thinking_enabled,
-            settings.subagent_enabled,
-            settings.plan_mode,
-            settings.max_concurrent_subagents,
-            settings.recursion_limit,
-            frozenset(overrides.items()),
-        )
-
-        if key not in self._async_client_map:
-            async with self._async_client_lock:
-                if key not in self._async_client_map:
-                    kwargs: dict[str, Any] = {
-                        "config_path": settings.config_path or None,
-                        "checkpointer": await self._get_async_checkpointer(),
-                        "model_name": settings.model_name,
-                        "thinking_enabled": settings.thinking_enabled,
-                        "subagent_enabled": settings.subagent_enabled,
-                        "plan_mode": settings.plan_mode,
-                        "max_concurrent_subagents": settings.max_concurrent_subagents,
-                        "recursion_limit": settings.recursion_limit,
-                    }
-                    kwargs.update(overrides)
-                    self._async_client_map[key] = DeerFlowClient(**kwargs)
-
-        return self._async_client_map[key]
+        with self._client_cache_lock:
+            generation = self._config_generation
+            key = (
+                generation,
+                "async",
+                settings.checkpointer_type,
+                settings.checkpoint_channel_mode,
+                settings.checkpoint_delta.snapshot_frequency,
+                settings.model_name,
+                settings.thinking_enabled,
+                settings.subagent_enabled,
+                settings.plan_mode,
+                settings.max_concurrent_subagents,
+                settings.recursion_limit,
+                frozenset(overrides.items()),
+            )
+            cached = self._async_client_map.get(key)
+            if cached is not None:
+                return cached
+        async with self._async_client_lock:
+            with self._client_cache_lock:
+                cached = self._async_client_map.get(key)
+                if cached is not None:
+                    return cached
+            kwargs: dict[str, Any] = {
+                "config_path": settings.config_path or None,
+                "checkpointer": await self._get_async_checkpointer(),
+                "checkpoint_channel_mode": settings.checkpoint_channel_mode,
+                "checkpoint_snapshot_frequency": settings.checkpoint_delta.snapshot_frequency,
+                "model_name": settings.model_name,
+                "thinking_enabled": settings.thinking_enabled,
+                "subagent_enabled": settings.subagent_enabled,
+                "plan_mode": settings.plan_mode,
+                "max_concurrent_subagents": settings.max_concurrent_subagents,
+                "recursion_limit": settings.recursion_limit,
+            }
+            kwargs.update(overrides)
+            client = DeerFlowClient(**kwargs)
+            # The generation comparison and insertion must be one critical
+            # section with reload_runtime_config(). Otherwise a reload can
+            # clear the map between these operations and an old client can be
+            # inserted back into the freshly invalidated cache.
+            with self._client_cache_lock:
+                if generation == self._config_generation:
+                    self._async_client_map[key] = client
+            return client
 
     def get_checkpointer(self):
         """Get the shared checkpointer for direct operations."""
@@ -287,7 +337,22 @@ class ClientManager:
         if settings.checkpointer_type == "memory":
             from langgraph.checkpoint.memory import InMemorySaver
             if self._checkpointer is None:
-                self._checkpointer = InMemorySaver()
+                saver = InMemorySaver()
+                if settings.checkpoint_channel_mode == "delta":
+                    from deerflow.runtime.checkpoint_cache import (
+                        MemoryCheckpointHistoryCache,
+                        checkpoint_cache_key_prefix,
+                    )
+                    from deerflow.runtime.checkpointer import CachedHistorySaver
+
+                    cache = MemoryCheckpointHistoryCache(
+                        max_entries=settings.checkpoint_cache.max_entries
+                    )
+                    prefix = checkpoint_cache_key_prefix(
+                        settings.checkpoint_cache, "memory"
+                    )
+                    saver = CachedHistorySaver(saver, cache, key_prefix=prefix)
+                self._checkpointer = saver
             return self._checkpointer
 
         if self._checkpointer is not None:
@@ -307,6 +372,20 @@ class ClientManager:
                 conn.close()
                 raise
             self._sync_sqlite_conn = conn
+            if settings.checkpoint_channel_mode == "delta":
+                from deerflow.runtime.checkpoint_cache import (
+                    MemoryCheckpointHistoryCache,
+                    checkpoint_cache_key_prefix,
+                )
+                from deerflow.runtime.checkpointer import CachedHistorySaver
+
+                cache = MemoryCheckpointHistoryCache(
+                    max_entries=settings.checkpoint_cache.max_entries
+                )
+                prefix = checkpoint_cache_key_prefix(
+                    settings.checkpoint_cache, f"sqlite:{db_path.resolve()}"
+                )
+                saver = CachedHistorySaver(saver, cache, key_prefix=prefix)
             self._checkpointer = saver
             atexit.register(conn.close)
             return saver
@@ -341,7 +420,25 @@ class ClientManager:
             if settings.checkpointer_type == "memory":
                 from langgraph.checkpoint.memory import InMemorySaver
 
-                self._async_checkpointer = InMemorySaver()
+                saver = InMemorySaver()
+                if settings.checkpoint_channel_mode == "delta":
+                    from deerflow.runtime.checkpoint_cache import (
+                        checkpoint_cache_key_prefix,
+                        make_async_checkpoint_cache,
+                    )
+                    from deerflow.runtime.checkpointer import CachedHistorySaver
+
+                    cache_cm = make_async_checkpoint_cache(
+                        settings.checkpoint_cache,
+                        serde=saver.serde,
+                    )
+                    cache = await cache_cm.__aenter__()
+                    self._async_checkpoint_cache_cm = cache_cm
+                    prefix = checkpoint_cache_key_prefix(
+                        settings.checkpoint_cache, "memory"
+                    )
+                    saver = CachedHistorySaver(saver, cache, key_prefix=prefix)
+                self._async_checkpointer = saver
                 return self._async_checkpointer
 
             from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -351,18 +448,38 @@ class ClientManager:
 
             cm = AsyncSqliteSaver.from_conn_string(str(db_path))
             saver = None
+            cache_cm = None
             try:
                 saver = await cm.__aenter__()
                 await saver.setup()
+                if settings.checkpoint_channel_mode == "delta":
+                    from deerflow.runtime.checkpoint_cache import (
+                        checkpoint_cache_key_prefix,
+                        make_async_checkpoint_cache,
+                    )
+                    from deerflow.runtime.checkpointer import CachedHistorySaver
+
+                    cache_cm = make_async_checkpoint_cache(
+                        settings.checkpoint_cache,
+                        serde=saver.serde,
+                    )
+                    cache = await cache_cm.__aenter__()
+                    prefix = checkpoint_cache_key_prefix(
+                        settings.checkpoint_cache, f"sqlite:{db_path.resolve()}"
+                    )
+                    saver = CachedHistorySaver(saver, cache, key_prefix=prefix)
             except Exception:
                 # Roll back partial initialization so a retry can succeed and we
                 # do not leak an open SQLite connection.
                 try:
+                    if cache_cm is not None:
+                        await cache_cm.__aexit__(None, None, None)
                     await cm.__aexit__(None, None, None)
                 except Exception:
                     logger.warning("async checkpointer cleanup failed during init", exc_info=True)
                 raise
             self._async_checkpointer_cm = cm
+            self._async_checkpoint_cache_cm = cache_cm
             self._async_checkpointer = saver
             return self._async_checkpointer
 
@@ -422,6 +539,8 @@ class ClientManager:
                     "ok": True,
                     "type": settings.checkpointer_type,
                     "path": str(Path(settings.checkpointer_path)),
+                    "channel_mode": settings.checkpoint_channel_mode,
+                    "snapshot_frequency": settings.checkpoint_delta.snapshot_frequency,
                 }
             else:
                 checks["checkpointer"] = {"ok": True, "type": settings.checkpointer_type}
@@ -434,6 +553,30 @@ class ClientManager:
             checks["auth"] = {"ok": False, "error": "auth enabled without API keys"}
         else:
             checks["auth"] = {"ok": True, "enabled": settings.auth_enabled}
+
+        try:
+            from deerflow.agents.memory import memory_manager_lease
+            from deerflow.config.memory_config import get_memory_config
+
+            memory_config = get_memory_config()
+            if memory_config.enabled:
+                with memory_manager_lease():
+                    pass
+            checks["memory"] = {
+                "ok": True,
+                "enabled": memory_config.enabled,
+                "manager_class": memory_config.manager_class,
+                "mode": memory_config.mode,
+            }
+        except Exception as exc:
+            ok = False
+            # Readiness is unauthenticated and custom backends control their
+            # exception text.  Keep credentials out of the public response;
+            # the authenticated Admin backend test returns a sanitized detail.
+            checks["memory"] = {
+                "ok": False,
+                "error": f"Memory backend initialization failed ({type(exc).__name__})",
+            }
 
         return {"status": "ok" if ok else "error", "checks": checks}
 
@@ -466,8 +609,10 @@ class ClientManager:
 
         clients_reset = False
         if reset_clients:
-            self._client_map.clear()
-            self._async_client_map.clear()
+            with self._client_cache_lock:
+                self._config_generation += 1
+                self._client_map.clear()
+                self._async_client_map.clear()
             clients_reset = True
 
         with self._thread_lock:
@@ -482,6 +627,7 @@ class ClientManager:
             "extensions_reloaded": extensions_reloaded,
             "mcp_cache_reset": mcp_cache_reset,
             "clients_reset": clients_reset,
+            "config_generation": self._config_generation,
             "active_threads": active_threads,
         }
         if active_threads:
@@ -914,13 +1060,46 @@ class ClientManager:
         await self.stop_feishu_channel()
 
         try:
-            from deerflow.agents.memory.queue import get_memory_queue
+            from deerflow.agents.memory import (
+                get_memory_manager,
+                reset_memory_manager,
+            )
             from deerflow.config.memory_config import get_memory_config
 
-            if get_memory_config().enabled:
-                await asyncio.to_thread(get_memory_queue().flush)
+            memory_config = get_memory_config()
+            if memory_config.enabled:
+                manager = get_memory_manager()
+                drained = False
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(manager.shutdown_flush),
+                        # Built-in managers apply the configured timeout inside
+                        # the queue.  A small scheduling grace keeps this outer
+                        # guard useful for custom managers without racing a
+                        # normal condition wake-up at the exact deadline.
+                        timeout=memory_config.shutdown_flush_timeout_seconds + 1.0,
+                    )
+                    drained = result is not False
+                except TimeoutError:
+                    logger.warning(
+                        "Memory shutdown flush exceeded %.1fs",
+                        memory_config.shutdown_flush_timeout_seconds,
+                    )
+                finally:
+                    if drained:
+                        # Retire through the lease-aware factory.  A model call
+                        # that still holds a manager lease can finish before
+                        # the underlying HTTP client is closed.
+                        await asyncio.to_thread(reset_memory_manager)
+                    else:
+                        # Do not invalidate a remote client while an in-flight
+                        # queue worker may still be using it.  Process teardown
+                        # will reclaim it after the best-effort write finishes.
+                        logger.warning(
+                            "Memory manager left open because queued writes did not drain"
+                        )
         except Exception:
-            pass
+            logger.warning("Error during memory manager shutdown", exc_info=True)
 
         self._client_map.clear()
         self._async_client_map.clear()
@@ -930,6 +1109,13 @@ class ClientManager:
             shutdown_sandbox_provider()
         except Exception:
             logger.warning("Error during sandbox provider cleanup", exc_info=True)
+        if self._async_checkpoint_cache_cm is not None:
+            try:
+                await self._async_checkpoint_cache_cm.__aexit__(None, None, None)
+            except Exception:
+                logger.warning("Error closing async checkpoint cache", exc_info=True)
+            finally:
+                self._async_checkpoint_cache_cm = None
         if self._async_checkpointer_cm is not None:
             try:
                 await self._async_checkpointer_cm.__aexit__(None, None, None)

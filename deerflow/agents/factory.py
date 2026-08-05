@@ -18,15 +18,22 @@ from typing import TYPE_CHECKING, Any, cast
 from langchain.agents.middleware import AgentMiddleware
 
 from deerflow.agents.features import RuntimeFeatures
-from deerflow.agents.thread_state import AgentContext, ThreadState
+from deerflow.agents.thread_state import (
+    AgentContext,
+    adapt_state_schema_for_mode,
+    get_thread_state_schema,
+    normalize_middleware_state_schemas,
+)
+from deerflow.config.checkpointer_config import (
+    DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY,
+    CheckpointChannelMode,
+)
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
     from langchain_core.tools import BaseTool
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.graph.state import CompiledStateGraph
-
-    from deerflow.agents.middlewares.clarification_middleware import ClarificationMiddleware
 else:
     BaseChatModel = Any
     BaseTool = Any
@@ -72,6 +79,8 @@ def create_deerflow_agent(
     state_schema: type | None = None,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     name: str = "default",
+    checkpoint_channel_mode: CheckpointChannelMode = "full",
+    checkpoint_snapshot_frequency: int | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Create a DeerFlow agent from plain Python arguments.
 
@@ -121,7 +130,18 @@ def create_deerflow_agent(
                 raise TypeError(f"extra_middleware items must be AgentMiddleware instances, got {type(mw).__name__}")
 
     effective_tools: list[BaseTool] = list(tools or [])
-    effective_state = state_schema or ThreadState
+    checkpoint_frequency = (
+        checkpoint_snapshot_frequency
+        if checkpoint_snapshot_frequency is not None
+        else DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY
+    )
+    effective_state = state_schema or get_thread_state_schema(
+        checkpoint_channel_mode, checkpoint_frequency
+    )
+    if state_schema is not None:
+        effective_state = adapt_state_schema_for_mode(
+            state_schema, checkpoint_channel_mode, checkpoint_frequency
+        )
 
     if middleware is not None:
         effective_middleware: list[AgentMiddleware[Any, Any, Any]] = list(middleware)
@@ -139,6 +159,19 @@ def create_deerflow_agent(
             if t.name not in existing_names:
                 effective_tools.append(t)
                 existing_names.add(t.name)
+
+    effective_middleware = normalize_middleware_state_schemas(
+        effective_middleware,
+        checkpoint_channel_mode,
+        checkpoint_frequency,
+    )
+    from deerflow.runtime.checkpoint_mode import (
+        freeze_checkpoint_channel_mode,
+        freeze_checkpoint_snapshot_frequency,
+    )
+
+    freeze_checkpoint_channel_mode(checkpoint_channel_mode)
+    freeze_checkpoint_snapshot_frequency(checkpoint_frequency)
 
     from langchain.agents import create_agent
 

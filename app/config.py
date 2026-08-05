@@ -9,6 +9,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
+from deerflow.config.checkpointer_config import (
+    CheckpointCacheConfig,
+    CheckpointDeltaConfig,
+)
+
 logger = logging.getLogger(__name__)
 
 # Force IPv4-only DNS resolution — this host has no working IPv6 to
@@ -70,10 +75,18 @@ def _resolve_config_scalar(value: Any) -> Any:
     return value
 
 
+def _resolve_config_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _resolve_config_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_config_value(item) for item in value]
+    return _resolve_config_scalar(value)
+
+
 def _raw_setting(name: str) -> Any:
     if name not in _API_CONFIG:
         return None
-    return _resolve_config_scalar(_API_CONFIG[name])
+    return _resolve_config_value(_API_CONFIG[name])
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -131,6 +144,43 @@ def _setting_checkpointer_type() -> Literal["memory", "sqlite", "none"]:
         return value
     logger.warning("checkpointer_type=%r is invalid; falling back to sqlite", value)
     return "sqlite"
+
+
+def _setting_checkpoint_mode() -> Literal["full", "delta"]:
+    value = _setting_str(
+        "checkpoint_channel_mode", "DEER_FLOW_CHECKPOINT_CHANNEL_MODE", "full"
+    ).lower()
+    if value in {"full", "delta"}:
+        return value
+    logger.warning(
+        "checkpoint_channel_mode=%r is invalid; falling back to full", value
+    )
+    return "full"
+
+
+def _setting_checkpoint_delta() -> CheckpointDeltaConfig:
+    raw = _raw_setting("checkpoint_delta")
+    data = dict(raw) if isinstance(raw, dict) else {}
+    env_frequency = os.environ.get("DEER_FLOW_CHECKPOINT_SNAPSHOT_FREQUENCY")
+    if env_frequency is not None:
+        try:
+            data["snapshot_frequency"] = int(env_frequency)
+        except ValueError:
+            logger.warning(
+                "DEER_FLOW_CHECKPOINT_SNAPSHOT_FREQUENCY=%r is invalid; ignoring",
+                env_frequency,
+            )
+    return CheckpointDeltaConfig.model_validate(data)
+
+
+def _setting_checkpoint_cache() -> CheckpointCacheConfig:
+    raw = _raw_setting("checkpoint_cache")
+    data = dict(raw) if isinstance(raw, dict) else {}
+    if os.environ.get("DEER_FLOW_CHECKPOINT_CACHE_TYPE"):
+        data["type"] = os.environ["DEER_FLOW_CHECKPOINT_CACHE_TYPE"]
+    if os.environ.get("DEER_FLOW_CHECKPOINT_CACHE_REDIS_URL"):
+        data["redis_url"] = os.environ["DEER_FLOW_CHECKPOINT_CACHE_REDIS_URL"]
+    return CheckpointCacheConfig.model_validate(data)
 
 
 def _setting_optional_str(name: str, env_name: str) -> str | None:
@@ -299,6 +349,15 @@ class Settings(BaseModel):
     # Checkpointer: memory / sqlite / none
     checkpointer_type: Literal["memory", "sqlite", "none"] = Field(default_factory=_setting_checkpointer_type)
     checkpointer_path: str = Field(default_factory=lambda: _setting_str("checkpointer_path", "DEER_FLOW_CHECKPOINTER_PATH", "./data/checkpoints.db"))
+    checkpoint_channel_mode: Literal["full", "delta"] = Field(
+        default_factory=_setting_checkpoint_mode
+    )
+    checkpoint_delta: CheckpointDeltaConfig = Field(
+        default_factory=_setting_checkpoint_delta
+    )
+    checkpoint_cache: CheckpointCacheConfig = Field(
+        default_factory=_setting_checkpoint_cache
+    )
 
     # Default model override (None = use config default)
     model_name: str | None = Field(default_factory=lambda: _setting_optional_str("model_name", "DEER_FLOW_MODEL_NAME"))

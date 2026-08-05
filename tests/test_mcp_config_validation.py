@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from app.routers.mcp import _validate_mcp_servers
+from app.routers.mcp import MCPConfigRequest, _validate_mcp_servers, update_mcp_config
 
 
 def _stdio(*, command: str = "npx", args: list[str] | None = None, env: dict | None = None) -> dict:
@@ -141,3 +141,29 @@ def test_remote_transport_does_not_require_stdio_launcher():
 def test_remote_transport_requires_matching_url_scheme(transport, url):
     with pytest.raises(HTTPException, match="valid"):
         _validate_mcp_servers({"remote": {"type": transport, "url": url}})
+
+
+@pytest.mark.asyncio
+async def test_update_mcp_config_runs_sync_client_off_event_loop(monkeypatch):
+    class Client:
+        def update_mcp_config(self, servers):
+            return {"mcp_servers": servers}
+
+    class Manager:
+        def get_client(self):
+            return Client()
+
+    monkeypatch.setattr(
+        "app.routers.mcp.get_client_manager",
+        lambda: Manager(),
+    )
+
+    result = await update_mcp_config(
+        MCPConfigRequest(mcp_servers={}),
+    )
+
+    assert result == {
+        "success": True,
+        "message": "MCP configuration updated",
+        "mcp_servers": {},
+    }

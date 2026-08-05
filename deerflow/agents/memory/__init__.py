@@ -6,6 +6,15 @@ This module provides a global memory mechanism that:
 - Injects relevant memory into system prompts for personalized responses
 """
 
+from deerflow.agents.memory.manager import (
+    MemoryManager,
+    MemoryOperationUnsupported,
+    get_memory_manager,
+    memory_manager_lease,
+    probe_memory_manager_config,
+    reset_memory_manager,
+    validate_memory_manager_config,
+)
 from deerflow.agents.memory.prompt import (
     FACT_EXTRACTION_PROMPT,
     MEMORY_UPDATE_PROMPT,
@@ -44,6 +53,14 @@ __all__ = [
     "MemoryUpdateQueue",
     "get_memory_queue",
     "reset_memory_queue",
+    # Backend-neutral manager
+    "MemoryManager",
+    "MemoryOperationUnsupported",
+    "get_memory_manager",
+    "memory_manager_lease",
+    "probe_memory_manager_config",
+    "reset_memory_manager",
+    "validate_memory_manager_config",
     # Storage
     "MemoryStorage",
     "FileMemoryStorage",

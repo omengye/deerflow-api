@@ -566,6 +566,12 @@ def _get_memory_context(agent_name: str | None = None) -> str:
         config = get_memory_config()
         if not config.enabled or not config.injection_enabled:
             return ""
+        # Pluggable backends are queried at model-call time by
+        # MemoryMiddleware.  Static prompt injection would duplicate DeerMem
+        # context and would freeze remote mem0 results until the agent cache is
+        # rebuilt.
+        if config.mode in {"middleware", "tool"}:
+            return ""
 
         memory_data = get_memory_data(agent_name)
         # Query-relevant facts are injected transiently by MemoryMiddleware.

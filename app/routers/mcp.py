@@ -1,4 +1,5 @@
 """MCP configuration endpoints."""
+import asyncio
 import logging
 import os
 import re
@@ -408,7 +409,7 @@ async def get_mcp_config():
     try:
         result = client.get_mcp_config()
         return {"mcp_servers": result.get("mcp_servers", {})}
-    except Exception as e:
+    except Exception:
         logger.exception("Unhandled error")
         raise HTTPException(status_code=500, detail="Internal server error")
 
@@ -424,6 +425,6 @@ async def update_mcp_config(req: MCPConfigRequest = Body()):
     try:
         result = await asyncio.to_thread(client.update_mcp_config, req.mcp_servers)
         return {"success": True, "message": "MCP configuration updated", **result}
-    except Exception as e:
+    except Exception:
         logger.exception("Unhandled error")
         raise HTTPException(status_code=500, detail="Internal server error")

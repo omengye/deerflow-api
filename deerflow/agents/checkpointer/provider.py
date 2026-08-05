@@ -31,6 +31,24 @@ from deerflow.runtime.store._sqlite_utils import ensure_sqlite_parent_dir, resol
 
 logger = logging.getLogger(__name__)
 
+
+@contextlib.contextmanager
+def _with_checkpoint_cache(saver, config: CheckpointerConfig):
+    """Wrap a raw saver only when delta history caching is meaningful."""
+    if config.channel_mode != "delta":
+        yield saver
+        return
+    from deerflow.runtime.checkpoint_cache import (
+        checkpoint_cache_key_prefix,
+        make_sync_checkpoint_cache,
+    )
+    from deerflow.runtime.checkpointer import CachedHistorySaver
+
+    identity = f"{config.type}:{config.connection_string or ''}"
+    prefix = checkpoint_cache_key_prefix(config.cache, identity)
+    with make_sync_checkpoint_cache(config.cache) as cache:
+        yield CachedHistorySaver(saver, cache, key_prefix=prefix)
+
 # ---------------------------------------------------------------------------
 # Error message constants — imported by aio.provider too
 # ---------------------------------------------------------------------------
@@ -57,7 +75,8 @@ def _sync_checkpointer_cm(config: CheckpointerConfig) -> Iterator[Checkpointer]:
         from langgraph.checkpoint.memory import InMemorySaver
 
         logger.info("Checkpointer: using InMemorySaver (in-process, not persistent)")
-        yield InMemorySaver()
+        with _with_checkpoint_cache(InMemorySaver(), config) as saver:
+            yield saver
         return
 
     if config.type == "sqlite":
@@ -71,7 +90,8 @@ def _sync_checkpointer_cm(config: CheckpointerConfig) -> Iterator[Checkpointer]:
         with SqliteSaver.from_conn_string(conn_str) as saver:
             saver.setup()
             logger.info("Checkpointer: using SqliteSaver (%s)", conn_str)
-            yield saver
+            with _with_checkpoint_cache(saver, config) as cached:
+                yield cached
         return
 
     if config.type == "postgres":
@@ -86,7 +106,8 @@ def _sync_checkpointer_cm(config: CheckpointerConfig) -> Iterator[Checkpointer]:
         with PostgresSaver.from_conn_string(config.connection_string) as saver:
             saver.setup()
             logger.info("Checkpointer: using PostgresSaver")
-            yield saver
+            with _with_checkpoint_cache(saver, config) as cached:
+                yield cached
         return
 
     raise ValueError(f"Unknown checkpointer type: {config.type!r}")

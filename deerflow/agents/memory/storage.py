@@ -4,9 +4,11 @@ import abc
 import copy
 import json
 import logging
+import os
 import threading
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,34 @@ from deerflow.config.memory_config import get_memory_config
 from deerflow.config.paths import get_paths
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _memory_file_write_guard(file_path: Path):
+    """Coordinate read-modify-write transactions across Linux workers."""
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = None
+    if os.name == "posix":
+        import fcntl
+
+        lock_path = file_path.with_name(f".{file_path.name}.lock")
+        try:
+            lock_file = lock_path.open("a+b")
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            if lock_file is not None:
+                lock_file.close()
+            raise
+    try:
+        yield
+    finally:
+        if lock_file is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_file.close()
 
 
 def utc_now_iso_z() -> str:
@@ -115,9 +145,15 @@ class FileMemoryStorage(MemoryStorage):
             return p if p.is_absolute() else get_paths().base_dir / p
         return get_paths().memory_file
 
-    def _load_memory_from_file(self, agent_name: str | None = None) -> dict[str, Any]:
+    def _load_memory_from_file(
+        self,
+        agent_name: str | None = None,
+        *,
+        file_path: Path | None = None,
+        strict: bool = False,
+    ) -> dict[str, Any]:
         """Load memory data from file."""
-        file_path = self._get_memory_file_path(agent_name)
+        file_path = file_path or self._get_memory_file_path(agent_name)
 
         if not file_path.exists():
             return create_empty_memory()
@@ -127,6 +163,8 @@ class FileMemoryStorage(MemoryStorage):
                 data = json.load(f)
             return data
         except (json.JSONDecodeError, OSError) as e:
+            if strict:
+                raise
             logger.warning("Failed to load memory file: %s", e)
             return create_empty_memory()
 
@@ -165,9 +203,16 @@ class FileMemoryStorage(MemoryStorage):
             self._memory_cache[agent_name] = (memory_data, mtime)
         return memory_data
 
-    def _save_unlocked(self, memory_data: dict[str, Any], agent_name: str | None = None) -> bool:
+    def _save_unlocked(
+        self,
+        memory_data: dict[str, Any],
+        agent_name: str | None = None,
+        *,
+        file_path: Path | None = None,
+    ) -> bool:
         """Save memory data while ``_mutation_lock`` is already held."""
-        file_path = self._get_memory_file_path(agent_name)
+        file_path = file_path or self._get_memory_file_path(agent_name)
+        temp_path: Path | None = None
 
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,11 +221,28 @@ class FileMemoryStorage(MemoryStorage):
             # updated before the file write succeeds.
             memory_data = {**memory_data, "lastUpdated": utc_now_iso_z()}
 
+            previous_mode = file_path.stat().st_mode if file_path.exists() else None
             temp_path = file_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
             with open(temp_path, "w", encoding="utf-8") as f:
                 json.dump(memory_data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
 
+            if previous_mode is not None:
+                os.chmod(temp_path, previous_mode)
             temp_path.replace(file_path)
+            temp_path = None
+            if os.name == "posix":
+                try:
+                    directory_fd = os.open(file_path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    # Replacement already committed; retain success and report
+                    # only the weaker crash-durability guarantee.
+                    logger.warning("Memory file replaced but parent directory fsync failed", exc_info=True)
 
             try:
                 mtime = file_path.stat().st_mtime
@@ -202,24 +264,54 @@ class FileMemoryStorage(MemoryStorage):
         except OSError as e:
             logger.error("Failed to save memory file: %s", e)
             return False
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Failed to remove temporary memory file %s", temp_path, exc_info=True)
 
     def save(self, memory_data: dict[str, Any], agent_name: str | None = None) -> bool:
         """Save memory data to file and update cache."""
         with self._mutation_lock:
-            return self._save_unlocked(memory_data, agent_name)
+            file_path = self._get_memory_file_path(agent_name)
+            try:
+                with _memory_file_write_guard(file_path):
+                    return self._save_unlocked(memory_data, agent_name, file_path=file_path)
+            except OSError as exc:
+                logger.error("Failed to lock memory file %s: %s", file_path, exc)
+                return False
 
     def mutate(
         self,
         mutator: Callable[[dict[str, Any]], dict[str, Any] | None],
         agent_name: str | None = None,
     ) -> dict[str, Any] | None:
-        """Atomically apply one in-process read-modify-write operation."""
+        """Atomically apply a read-modify-write operation across Linux workers."""
         with self._mutation_lock:
-            current = copy.deepcopy(self._load_memory_from_file(agent_name))
-            updated = mutator(current)
-            if updated is None or not self._save_unlocked(updated, agent_name):
+            file_path = self._get_memory_file_path(agent_name)
+            try:
+                with _memory_file_write_guard(file_path):
+                    # A failed/corrupt read must never be interpreted as an
+                    # empty memory document and overwrite recoverable data.
+                    current = copy.deepcopy(
+                        self._load_memory_from_file(
+                            agent_name,
+                            file_path=file_path,
+                            strict=True,
+                        )
+                    )
+                    updated = mutator(current)
+                    if updated is None or not self._save_unlocked(updated, agent_name, file_path=file_path):
+                        return None
+                    return updated
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.error(
+                    "Failed to mutate memory file %s (%s)",
+                    file_path,
+                    type(exc).__name__,
+                )
                 return None
-            return updated
 
 
 _storage_instance: MemoryStorage | None = None

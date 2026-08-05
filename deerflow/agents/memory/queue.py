@@ -20,6 +20,7 @@ class ConversationContext:
     messages: list[Any]
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     agent_name: str | None = None
+    user_id: str | None = None
     correction_detected: bool = False
     reinforcement_detected: bool = False
 
@@ -36,15 +37,19 @@ class MemoryUpdateQueue:
         """Initialize the memory update queue."""
         self._queue: list[ConversationContext] = []
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         self._timer: threading.Timer | None = None
         self._processing = False
+        self._process_starting = False
         self._process_requested = False
+        self._paused = False
 
     def add(
         self,
         thread_id: str,
         messages: list[Any],
         agent_name: str | None = None,
+        user_id: str | None = None,
         correction_detected: bool = False,
         reinforcement_detected: bool = False,
     ) -> None:
@@ -66,10 +71,13 @@ class MemoryUpdateQueue:
                 thread_id=thread_id,
                 messages=messages,
                 agent_name=agent_name,
+                user_id=user_id,
                 correction_detected=correction_detected,
                 reinforcement_detected=reinforcement_detected,
             )
-            if self._processing:
+            if self._paused:
+                self._condition.notify_all()
+            elif self._processing:
                 self._process_requested = True
             else:
                 self._reset_timer()
@@ -81,6 +89,7 @@ class MemoryUpdateQueue:
         thread_id: str,
         messages: list[Any],
         agent_name: str | None = None,
+        user_id: str | None = None,
         correction_detected: bool = False,
         reinforcement_detected: bool = False,
     ) -> None:
@@ -94,10 +103,13 @@ class MemoryUpdateQueue:
                 thread_id=thread_id,
                 messages=messages,
                 agent_name=agent_name,
+                user_id=user_id,
                 correction_detected=correction_detected,
                 reinforcement_detected=reinforcement_detected,
             )
-            if self._processing:
+            if self._paused:
+                self._condition.notify_all()
+            elif self._processing:
                 self._process_requested = True
             else:
                 self._schedule_timer(0)
@@ -110,10 +122,20 @@ class MemoryUpdateQueue:
         thread_id: str,
         messages: list[Any],
         agent_name: str | None,
-        correction_detected: bool,
-        reinforcement_detected: bool,
+        user_id: str | None = None,
+        correction_detected: bool = False,
+        reinforcement_detected: bool = False,
     ) -> None:
-        existing_context = next((context for context in self._queue if context.thread_id == thread_id and context.agent_name == agent_name), None)
+        existing_context = next(
+            (
+                context
+                for context in self._queue
+                if context.thread_id == thread_id
+                and context.agent_name == agent_name
+                and context.user_id == user_id
+            ),
+            None,
+        )
         merged_correction_detected = correction_detected or (existing_context.correction_detected if existing_context is not None else False)
         merged_reinforcement_detected = reinforcement_detected or (existing_context.reinforcement_detected if existing_context is not None else False)
         merged_messages = self._merge_messages(existing_context.messages if existing_context is not None else [], messages)
@@ -121,11 +143,20 @@ class MemoryUpdateQueue:
             thread_id=thread_id,
             messages=merged_messages,
             agent_name=agent_name,
+            user_id=user_id,
             correction_detected=merged_correction_detected,
             reinforcement_detected=merged_reinforcement_detected,
         )
 
-        self._queue = [c for c in self._queue if not (c.thread_id == thread_id and c.agent_name == agent_name)]
+        self._queue = [
+            context
+            for context in self._queue
+            if not (
+                context.thread_id == thread_id
+                and context.agent_name == agent_name
+                and context.user_id == user_id
+            )
+        ]
         self._queue.append(context)
 
     @staticmethod
@@ -162,18 +193,28 @@ class MemoryUpdateQueue:
         self._timer.daemon = True
         self._timer.start()
 
-    def _process_queue(self) -> None:
+    def _process_queue(self, *, force: bool = False, claimed_start: bool = False) -> None:
         """Process all queued conversation contexts."""
-        # Import here to avoid circular dependency
-        from deerflow.agents.memory.updater import MemoryUpdater
+        # Import here to avoid circular dependency and resolve the active
+        # backend at processing time (configuration may have been reloaded
+        # while an item was waiting in the debounce window).
+        from deerflow.agents.memory.manager import memory_manager_lease
 
         with self._lock:
+            if claimed_start:
+                self._process_starting = False
+            if self._paused and not force:
+                self._timer = None
+                self._condition.notify_all()
+                return
             if self._processing:
                 self._process_requested = True
+                self._condition.notify_all()
                 return
 
             if not self._queue:
                 self._timer = None
+                self._condition.notify_all()
                 return
 
             self._processing = True
@@ -181,52 +222,124 @@ class MemoryUpdateQueue:
             contexts_to_process = self._queue.copy()
             self._queue.clear()
             self._timer = None
+            self._condition.notify_all()
 
         logger.info("Processing %d queued memory updates", len(contexts_to_process))
 
         try:
-            updater = MemoryUpdater()
+            with memory_manager_lease() as manager:
+                for context in contexts_to_process:
+                    try:
+                        logger.info("Updating memory for thread %s", context.thread_id)
+                        success = manager.add(
+                            messages=context.messages,
+                            thread_id=context.thread_id,
+                            agent_name=context.agent_name,
+                            user_id=context.user_id,
+                            correction_detected=context.correction_detected,
+                            reinforcement_detected=context.reinforcement_detected,
+                        )
+                        if success:
+                            logger.info("Memory updated successfully for thread %s", context.thread_id)
+                        else:
+                            logger.warning("Memory update skipped/failed for thread %s", context.thread_id)
+                    except Exception as exc:
+                        # Custom backends control exception text and may include
+                        # credentials.  Keep logs useful without copying it.
+                        logger.error(
+                            "Error updating memory for thread %s (%s)",
+                            context.thread_id,
+                            type(exc).__name__,
+                        )
 
-            for context in contexts_to_process:
-                try:
-                    logger.info("Updating memory for thread %s", context.thread_id)
-                    success = updater.update_memory(
-                        messages=context.messages,
-                        thread_id=context.thread_id,
-                        agent_name=context.agent_name,
-                        correction_detected=context.correction_detected,
-                        reinforcement_detected=context.reinforcement_detected,
-                    )
-                    if success:
-                        logger.info("Memory updated successfully for thread %s", context.thread_id)
-                    else:
-                        logger.warning("Memory update skipped/failed for thread %s", context.thread_id)
-                except Exception as e:
-                    logger.error("Error updating memory for thread %s: %s", context.thread_id, e)
-
-                # Small delay between updates to avoid rate limiting
-                if len(contexts_to_process) > 1:
-                    time.sleep(0.5)
+                    # Small delay between updates to avoid rate limiting
+                    if len(contexts_to_process) > 1:
+                        time.sleep(0.5)
 
         finally:
             with self._lock:
                 self._processing = False
                 should_process_pending = bool(self._queue) and self._process_requested
                 self._process_requested = False
-                if should_process_pending:
+                if should_process_pending and not self._paused:
                     self._schedule_timer(0)
+                self._condition.notify_all()
 
-    def flush(self) -> None:
-        """Force immediate processing of the queue.
+    def flush(self, timeout_seconds: float | None = None) -> bool:
+        """Process all work queued before or during this flush.
 
-        This is useful for testing or graceful shutdown.
+        If another worker is already writing memory, wait for it and then drain
+        anything that arrived meanwhile.  ``False`` means the timeout expired
+        while a write was still active; the active worker is left intact and
+        will continue processing in the background.
         """
-        with self._lock:
+        deadline = (
+            time.monotonic() + timeout_seconds
+            if timeout_seconds is not None
+            else None
+        )
+
+        while True:
+            with self._condition:
+                if self._timer is not None:
+                    self._timer.cancel()
+                    self._timer = None
+
+                while self._processing or self._process_starting:
+                    # Ensure work appended during the active batch is picked up
+                    # immediately when that worker finishes.
+                    self._process_requested = True
+                    remaining = (
+                        deadline - time.monotonic()
+                        if deadline is not None
+                        else None
+                    )
+                    if remaining is not None and remaining <= 0:
+                        return False
+                    self._condition.wait(timeout=remaining)
+                    if self._timer is not None:
+                        self._timer.cancel()
+                        self._timer = None
+
+                if not self._queue:
+                    return True
+
+                # Never execute backend I/O in the caller: a synchronous
+                # manager.add() cannot be interrupted.  A daemon worker lets
+                # the condition wait enforce the configured timeout while an
+                # overrun continues safely with its manager lease.
+                self._process_starting = True
+                worker = threading.Thread(
+                    target=self._process_queue,
+                    kwargs={"force": True, "claimed_start": True},
+                    daemon=True,
+                    name="deerflow-memory-flush",
+                )
+                try:
+                    worker.start()
+                except Exception:
+                    self._process_starting = False
+                    self._condition.notify_all()
+                    raise
+
+    def pause(self) -> None:
+        """Pause timer-driven processing while continuing to accept writes."""
+        with self._condition:
+            self._paused = True
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
+            self._condition.notify_all()
 
-        self._process_queue()
+    def resume(self) -> None:
+        """Resume processing and schedule any writes held during a transition."""
+        with self._condition:
+            self._paused = False
+            if self._queue and not self._processing:
+                self._schedule_timer(0)
+            elif self._queue and self._processing:
+                self._process_requested = True
+            self._condition.notify_all()
 
     def flush_nowait(self) -> None:
         """Start queue processing immediately in a background thread."""
@@ -240,13 +353,13 @@ class MemoryUpdateQueue:
 
         This is useful for testing.
         """
-        with self._lock:
+        with self._condition:
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
             self._queue.clear()
-            self._processing = False
             self._process_requested = False
+            self._condition.notify_all()
 
     @property
     def pending_count(self) -> int:
@@ -259,6 +372,11 @@ class MemoryUpdateQueue:
         """Check if the queue is currently being processed."""
         with self._lock:
             return self._processing
+
+    @property
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._paused
 
 
 # Global singleton instance
