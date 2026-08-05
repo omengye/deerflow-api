@@ -21,6 +21,64 @@ uv sync --frozen --inexact
 uv run uvicorn app:app --host 0.0.0.0 --port 8000 --app-dir app
 ```
 
+## 飞书与七牛云可选依赖
+
+飞书和七牛云 SDK 是可选依赖，普通的 `uv sync` 不会安装。请在项目根目录按实际需要执行：
+
+```bash
+# 仅安装飞书 SDK（lark-oapi）
+uv sync --frozen --inexact --extra feishu
+
+# 仅安装七牛云 SDK（qiniu）
+uv sync --frozen --inexact --extra qiniu
+
+# 同时安装两者（推荐需要同时启用两个功能时使用）
+uv sync --frozen --inexact --extra feishu --extra qiniu
+```
+
+`--frozen` 会严格使用仓库现有的 `uv.lock`，`--inexact` 可避免清理由同一虚拟环境中的其他可选包。安装后可分别验证 SDK 是否能被项目环境导入：
+
+```bash
+uv run python -c "import lark_oapi; print('Feishu SDK OK')"
+uv run python -c "import qiniu; print('Qiniu SDK OK')"
+```
+
+### 启用飞书频道
+
+安装 SDK 后，还需要在 `config.yaml` 的 `api:` 下配置飞书应用凭据。建议让密钥来自服务进程环境变量：
+
+```yaml
+api:
+  feishu:
+    enabled: true
+    app_id: $FEISHU_APP_ID
+    app_secret: $FEISHU_APP_SECRET
+    verification_token: $FEISHU_VERIFICATION_TOKEN
+```
+
+如果 YAML 中没有填写对应字段，也兼容 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_VERIFICATION_TOKEN`，以及相应的 `LARK_*` 环境变量。飞书开放平台侧还需要启用机器人能力并配置长连接事件订阅；这些平台设置不会由依赖安装命令自动完成。
+
+### 启用七牛云 Kodo 工具
+
+安装 SDK 后，将需要的 `qiniu_*` 项合并到 `config.yaml` 已有的 `tools:` 列表中，不要创建第二个 `tools:` 键。以下是上传工具的最小示例：
+
+```yaml
+tools:
+  - name: qiniu_upload_file
+    group: object_storage
+    use: deerflow.community.qiniu_kodo.tools:qiniu_upload_file_tool
+    access_key: $QINIU_ACCESS_KEY
+    secret_key: $QINIU_SECRET_KEY
+    bucket: $QINIU_BUCKET
+    domain: $QINIU_DOMAIN
+    key_prefix: deerflow/{thread_id}/
+    private_bucket: false
+```
+
+七牛云配置也可以全部由服务进程环境变量提供：`QINIU_ACCESS_KEY`、`QINIU_SECRET_KEY`、`QINIU_BUCKET`、`QINIU_DOMAIN`、`QINIU_KEY_PREFIX` 和 `QINIU_PRIVATE_BUCKET`。下载、列举、查看元数据、删除和生成下载链接等工具的完整模板见 [config.example.yaml](config.example.yaml)。
+
+依赖和配置完成后请重启 API 服务；systemd、Docker 或多 worker 部署需要更新实际运行环境并重启所有 worker。若启动时仍提示缺少 SDK，请确认安装命令与启动命令都在本项目目录执行，并使用同一个 `.venv`（推荐始终通过 `uv run` 启动）。
+
 ## 配置方式
 
 运行参数优先写入 `config.yaml` 的 `api:` 段，例如监听地址、端口、CORS、上传限制、默认 agent 模式、并发子 agent 数和 DeerFlow 数据目录。旧的 `DEER_FLOW_*`、`HOST`、`PORT` 环境变量仍作为兼容 fallback，但常规部署不再需要 `.env`。
@@ -67,6 +125,66 @@ tracing:
 Linux 生产部署时，运行用户必须对 `config.yaml` 和 DeerMem 数据所在目录有写权限，以便创建 `.config.yaml.lock`、`.memory.json.lock` 及同目录原子临时文件。单机多 worker 必须共享相同的配置、数据和锁文件目录；由于热重载只作用于接收管理请求的进程，多 worker 部署在保存后仍应滚动重启全部 worker。上线前请备份 `config.yaml` 和 DeerMem 数据文件，并用 `/health/ready` 与管理页“测试后端”复核。
 
 完整配置、迁移规则和故障策略见 [Checkpoint 与记忆优化说明](docs/checkpoint-memory-optimizations.md)，可直接复制的 YAML 见 [config.example.yaml](config.example.yaml)。
+
+## Skill Self-Improving（技能自我改进）
+
+当前项目的 self-improving 是一个**只演进自定义 Skill、默认人工审核、支持受限自动补丁**的闭环。它不会自行修改项目源码、`config.yaml` 或 `skills/public/` 内置 Skill；所有候选先进入隔离目录并生成 Proposal，只有通过审核或严格的 `auto_patch` 门槛后，才会发布到 `skills/custom/`。
+
+该能力推荐先以 `review` 模式上线：
+
+```yaml
+skill_evolution:
+  enabled: false
+  mode: review                 # review 或 auto_patch
+  storage_path: skill-evolution
+```
+
+`storage_path` 的相对路径会从 DeerFlow 数据根目录解析。修改 `enabled`、运行模式或模型配置后应重启 API；启动时会恢复尚未处理完的自动发现 Signal。
+
+### 工作链路
+
+```mermaid
+flowchart LR
+    A["完成一轮对话"] --> B["SignalMiddleware 脱敏分析"]
+    B --> C{"命中触发条件、配额和冷却规则？"}
+    C -- "否" --> D["不生成候选"]
+    C -- "是" --> E["持久化 Signal"]
+    E --> F["单后台 Worker 生成 Candidate"]
+    F --> G["结构校验 + 静态/LLM 安全扫描"]
+    G --> H["Proposal + Diff"]
+    H --> I{"review / auto_patch 门禁"}
+    I -- "人工批准" --> J["原子发布 Revision"]
+    I -- "自动补丁全部通过" --> J
+    I -- "拒绝或不满足" --> K["保留待审或拒绝"]
+    J --> L["刷新 Skill Catalog 与 Prompt 缓存"]
+    L --> M["Probation 观察"]
+    M -- "通过" --> N["Graduated"]
+    M -- "自动发布连续失败" --> O["自动回滚"]
+    M -- "人工发布连续失败" --> P["告警，等待管理员处理"]
+```
+
+系统有两种候选入口：
+
+- **Agent 主动提案**：启用后，主 Agent 会获得 `skill_manage` 工具，可为自定义 Skill 提交 `create`、`edit`、精确 `patch`、`delete` 和支持文件变更。工具只创建 Proposal，不直接修改正在使用的 Skill；人工来源的 Proposal 即使在 `auto_patch` 模式下也不会自动发布。
+- **自动发现**：同时启用 `discovery.enabled` 后，`EvolutionSignalMiddleware` 只分析已经产生最终回答的最近一轮对话。用户纠正、工具调用过多、错误恢复、重复任务，以及使用 Skill 后出现未恢复错误或下一轮明确纠正，都可能成为 Signal。摘要会移除常见密钥、Bearer Token、URL 查询参数和长 Token，并受重复窗口、冷却时间、每日 Proposal 数和待审数量限制。
+
+Signal 持久化后由单个后台 Worker 异步处理，不阻塞当前用户响应。生成模型只能返回 `skip`、创建新 Skill 或对现有 `SKILL.md` 做精确替换；自动生成器不允许提出脚本、支持文件、删除、Shell 命令、凭据、权限或 URL。证据不足、输出不合法或模型不可用时会安全地 `skip`。
+
+### 校验、审核与发布边界
+
+每个 Candidate 都会检查 Skill 名称和 frontmatter、路径穿越、符号链接、嵌套 `SKILL.md`、支持文件目录、UTF-8，以及文件数量和大小限制。受管理的文本还会经过确定性静态扫描和独立的 LLM 安全扫描；静态规则判定为 `block` 时模型不能覆盖。默认 `security_fail_closed: true`，安全模型不可用或输出异常时拒绝候选。
+
+`review` 模式下所有 Proposal 都需要管理员批准。`auto_patch` 也不是全自动写权限：只有自动发现产生、风险为低、仅修改现有自定义 Skill 的 `SKILL.md`、改动行数未超限、不新增 URL/Shell/权限/环境变量/凭据内容、所有安全扫描明确 `allow`、基础版本哈希未变化，并且独立质量评估也明确 `allow` 的精确补丁才能自动发布。自动创建、删除、脚本和支持文件变更始终需要人工处理。
+
+批准发布前会重新扫描 Candidate，并用 Proposal 创建时的 Skill 树 SHA-256 做乐观并发检查，不会覆盖后来修改的新内容；人工发布冲突会把 Proposal 标记为 `stale`，自动发布冲突则安全降级回 `pending_review`。发布器在进程内锁下创建不可变 Revision 快照、使用 staging/backup 目录原子替换活动 Skill、递增 Catalog 版本，并刷新 Skill Prompt 缓存。管理员直接编辑自定义 Skill 也复用同一套版本事务和静态校验。
+
+### Probation、回滚与管理入口
+
+每个普通发布且未删除的 Revision 都进入 probation，删除和回滚操作除外。默认观察该 Skill 后续 3 次实际使用：正常使用会清零连续失败计数；使用后存在未恢复工具错误，或下一轮用户明确纠正，会记录为失败。达到连续 2 次失败时，自动发布的 Revision 会回滚到上一版本；人工批准或管理员直接发布的 Revision 只产生回归告警，不自动撤销。即使暂停 `discovery.enabled`，只要 `skill_evolution.enabled` 仍开启，已有 probation 仍会继续观察。
+
+启用 API 鉴权后，可在 `/management/` 的 **Skill Self-Improving** 区域查看脱敏 Signal、工具错误摘要、Proposal Diff、安全扫描、质量评估和 probation 状态，并执行批准、拒绝、归档、恢复、Revision 查看及手动回滚。启用飞书频道后，也可以通过 `/proposals` 查看当前会话的待审 Proposal，并在交互卡片中批准或拒绝；两种入口调用同一发布服务和并发校验。
+
+演进状态默认持久化为 `state.json`、`signals/`、`proposals/`、`revisions/` 和 `audit.jsonl`。Signal 虽然做了规则脱敏，但不应视为完整 DLP；候选 Skill、Diff 和扫描内容还可能发送给配置的生成、审核或评估模型。该文件存储实现按**单用户、单写入进程**设计，锁只在进程内协调；多 worker 部署应把 Proposal 审批、发布、回滚和自动 Worker 固定到一个写入进程，或在扩展为跨进程协调存储后再开放并发写入。
 
 ## ACP Agent 对接（Codex / Claude Code）
 
