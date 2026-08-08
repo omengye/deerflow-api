@@ -25,13 +25,14 @@ from typing import ClassVar
 from deerflow.sandbox.local.local_sandbox import LocalSandbox, PathMapping
 from deerflow.sandbox.local.wsl_exceptions import WslUnavailableError
 
-# Capture drive-letter prefixed Windows paths inside a shell command.  The
+# Capture drive-letter prefixed Windows paths inside a shell command, including
+# Windows verbatim forms such as ``\\?\D:\foo``.  The
 # negative lookbehind guards against matching URL schemes (``http://...``) or
 # identifier-like ``X:`` tokens following alphanumerics.  The trailing path
 # character class is intentionally identical to LocalSandbox._resolve_paths_in_command
 # so the two regex passes operate on the same tokens.
 _WINDOWS_PATH_IN_COMMAND_RE = re.compile(
-    r"(?<![\w/])([A-Za-z]):([\\/][^\s\"';&|<>()]*)"
+    r"(?<![\w/])(?:\\\\\?\\|//\?/)?([A-Za-z]):([\\/][^\s\"';&|<>()]*)"
 )
 
 # Capture ``/mnt/<letter>`` style WSL mount paths in command output.  The
@@ -73,7 +74,11 @@ class WslSandbox(LocalSandbox):
         Raises ``ValueError`` for UNC paths and for inputs that do not start
         with ``<drive-letter>:``.
         """
-        if path.startswith("\\\\") or path.startswith("//"):
+        if path.startswith(("\\\\?\\UNC\\", "//?/UNC/")):
+            raise ValueError(f"UNC paths are not supported in WSL sandbox: {path}")
+        if path.startswith(("\\\\?\\", "//?/")):
+            path = path[4:]
+        if path.startswith(("\\\\", "//")):
             raise ValueError(f"UNC paths are not supported in WSL sandbox: {path}")
         if len(path) < 2 or path[1] != ":" or not path[0].isalpha():
             raise ValueError(f"Not a drive-letter absolute path: {path}")
@@ -105,6 +110,8 @@ class WslSandbox(LocalSandbox):
     def _translate_windows_paths_in_command(self, command: str) -> str:
         """Rewrite all drive-letter Windows paths in *command* to WSL form.
 
+        Drive-letter verbatim paths (``\\\\?\\D:\\...``) are normalized as a
+        unit so the Windows-only prefix cannot leak into the Linux command.
         UNC paths (``\\\\server\\share\\...``) are not detected here because
         backslash pairs frequently appear as escape syntax inside shell-quoted
         Python literals (``"open('D:\\\\foo')"``).  Callers needing strict UNC

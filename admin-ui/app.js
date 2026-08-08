@@ -42,6 +42,7 @@
     adminConfig: null,
     titleConfig: null,
     subagentsConfig: null,
+    subagentBuiltinAgents: [],
     memoryConfig: null,
     memoryRevision: null,
     memoryRuntime: null,
@@ -160,6 +161,8 @@
     subagentsMaxTurns: document.getElementById("subagentsMaxTurns"),
     subagentsAgentsEditor: document.getElementById("subagentsAgentsEditor"),
     subagentsCustomEditor: document.getElementById("subagentsCustomEditor"),
+    subagentModelList: document.getElementById("subagentModelList"),
+    subagentModelEmpty: document.getElementById("subagentModelEmpty"),
     subagentsMessage: document.getElementById("subagentsMessage"),
     agentSystemSummary: document.getElementById("agentSystemSummary"),
     memoryEditForm: document.getElementById("memoryEditForm"),
@@ -567,6 +570,7 @@
   async function loadSubagentsConfig() {
     const data = await request("/api/admin/subagents");
     state.subagentsConfig = data?.config && typeof data.config === "object" ? data.config : {};
+    state.subagentBuiltinAgents = Array.isArray(data?.builtin_agents) ? data.builtin_agents : [];
     renderSubagentsConfig();
     return data;
   }
@@ -734,6 +738,7 @@
       const selected = field.value || configured || "";
       field.innerHTML = modelOptions(selected);
     });
+    renderSubagentModelAssignments();
   }
 
   function renderTitleConfig() {
@@ -755,7 +760,142 @@
       el.subagentsMaxTurns.value = subagents.max_turns ?? "";
       el.subagentsAgentsEditor.value = JSON.stringify(subagents.agents || {}, null, 2);
       el.subagentsCustomEditor.value = JSON.stringify(subagents.custom_agents || {}, null, 2);
+      renderSubagentModelAssignments();
     }
+  }
+
+  function subagentModelOptions(selected) {
+    const normalized = selected && selected !== "inherit" ? selected : "inherit";
+    const options = [`<option value="inherit"${normalized === "inherit" ? " selected" : ""}>继承主 Agent 模型</option>`];
+    state.models.forEach((model) => {
+      const value = String(model.name || "");
+      const displayName = model.display_name && model.display_name !== value ? `${model.display_name} · ${value}` : value;
+      options.push(`<option value="${escapeHtml(value)}"${value === normalized ? " selected" : ""}>${escapeHtml(displayName)}</option>`);
+    });
+    if (normalized !== "inherit" && !state.models.some((model) => model.name === normalized)) {
+      options.push(`<option value="${escapeHtml(normalized)}" selected>${escapeHtml(normalized)}（当前配置）</option>`);
+    }
+    return options.join("");
+  }
+
+  function trySubagentEditorConfig() {
+    try {
+      return {
+        agents: parseJsonObject(el.subagentsAgentsEditor.value, "agents"),
+        customAgents: parseJsonObject(el.subagentsCustomEditor.value, "custom_agents"),
+      };
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function subagentAssignmentRows(agents, customAgents) {
+    const rows = [];
+    const builtinNames = new Set();
+    const customNames = new Set(Object.keys(customAgents));
+    state.subagentBuiltinAgents.forEach((builtin) => {
+      const name = String(builtin?.name || "").trim();
+      if (!name || builtinNames.has(name)) return;
+      builtinNames.add(name);
+      const override = agents[name] && typeof agents[name] === "object" && !Array.isArray(agents[name]) ? agents[name] : {};
+      rows.push({
+        name,
+        kind: "builtin",
+        kindLabel: "内置",
+        description: override.description || builtin.description || "内置 Subagent",
+        model: override.model || builtin.default_model || "inherit",
+      });
+    });
+    Object.entries(agents).forEach(([name, override]) => {
+      if (builtinNames.has(name) || customNames.has(name)) return;
+      const config = override && typeof override === "object" && !Array.isArray(override) ? override : {};
+      rows.push({
+        name,
+        kind: "override",
+        kindLabel: "覆盖",
+        description: config.description || "额外的 Subagent 覆盖配置",
+        model: config.model || "inherit",
+      });
+    });
+    Object.entries(customAgents).forEach(([name, custom]) => {
+      const config = custom && typeof custom === "object" && !Array.isArray(custom) ? custom : {};
+      const override = agents[name] && typeof agents[name] === "object" && !Array.isArray(agents[name]) ? agents[name] : {};
+      rows.push({
+        name,
+        kind: "custom",
+        kindLabel: "自定义",
+        description: config.description || "自定义 Subagent",
+        model: override.model || config.model || "inherit",
+      });
+    });
+    return rows;
+  }
+
+  function renderSubagentModelAssignments() {
+    if (!el.subagentModelList) return;
+    const editorConfig = trySubagentEditorConfig();
+    if (!editorConfig) return;
+    const rows = subagentAssignmentRows(editorConfig.agents, editorConfig.customAgents);
+    el.subagentModelList.innerHTML = rows
+      .map((row) => {
+        const effective = row.model && row.model !== "inherit" ? `固定使用 ${row.model}` : "每次运行跟随主 Agent";
+        return `
+          <div class="subagent-model-row">
+            <div class="subagent-identity">
+              <div class="subagent-name-line">
+                <strong>${escapeHtml(row.name)}</strong>
+                <span class="subagent-kind ${escapeHtml(row.kind)}">${escapeHtml(row.kindLabel)}</span>
+              </div>
+              <p>${escapeHtml(row.description)}</p>
+            </div>
+            <label class="subagent-model-field">
+              <span>执行模型</span>
+              <select data-subagent-model data-subagent-kind="${escapeHtml(row.kind)}" data-subagent-name="${escapeHtml(row.name)}">
+                ${subagentModelOptions(row.model)}
+              </select>
+              <small>${escapeHtml(effective)}</small>
+            </label>
+          </div>`;
+      })
+      .join("");
+    el.subagentModelEmpty?.classList.toggle("hidden", rows.length > 0);
+  }
+
+  function updateSubagentModelAssignment(kind, name, model) {
+    const editorConfig = trySubagentEditorConfig();
+    if (!editorConfig) {
+      el.subagentsMessage.textContent = "高级 JSON 配置存在格式错误，请修正后再选择模型。";
+      return;
+    }
+    if (kind === "custom") {
+      const current = editorConfig.customAgents[name];
+      if (!current || typeof current !== "object" || Array.isArray(current)) return;
+      current.model = model;
+      el.subagentsCustomEditor.value = JSON.stringify(editorConfig.customAgents, null, 2);
+      const override = editorConfig.agents[name];
+      if (override && typeof override === "object" && !Array.isArray(override) && Object.hasOwn(override, "model")) {
+        delete override.model;
+        if (!Object.keys(override).length) delete editorConfig.agents[name];
+        el.subagentsAgentsEditor.value = JSON.stringify(editorConfig.agents, null, 2);
+      }
+    } else {
+      const current = editorConfig.agents[name] && typeof editorConfig.agents[name] === "object" && !Array.isArray(editorConfig.agents[name])
+        ? { ...editorConfig.agents[name] }
+        : {};
+      if (model === "inherit") {
+        delete current.model;
+      } else {
+        current.model = model;
+      }
+      if (Object.keys(current).length) {
+        editorConfig.agents[name] = current;
+      } else {
+        delete editorConfig.agents[name];
+      }
+      el.subagentsAgentsEditor.value = JSON.stringify(editorConfig.agents, null, 2);
+    }
+    el.subagentsMessage.textContent = "模型分配已更新，点击“保存 Subagents”后生效。";
+    renderSubagentModelAssignments();
   }
 
   function renderMemoryConfig() {
@@ -2309,6 +2449,7 @@
         timeoutMs: 20000,
       });
       state.subagentsConfig = data.config;
+      if (Array.isArray(data.builtin_agents)) state.subagentBuiltinAgents = data.builtin_agents;
       renderSubagentsConfig();
       const active = data.reload?.active_threads ? `；当前活动线程 ${data.reload.active_threads} 个保持原状态` : "";
       el.subagentsMessage.textContent = `Subagents 配置已保存${active}。`;
@@ -3226,6 +3367,14 @@
     el.saveRuntimeButton.addEventListener("click", saveRuntimeConfig);
     el.saveTitleButton.addEventListener("click", saveTitleConfig);
     el.saveSubagentsButton.addEventListener("click", saveSubagentsConfig);
+    el.subagentModelList.addEventListener("change", (event) => {
+      const field = event.target.closest("[data-subagent-model]");
+      if (!field) return;
+      updateSubagentModelAssignment(field.dataset.subagentKind, field.dataset.subagentName, field.value);
+    });
+    [el.subagentsAgentsEditor, el.subagentsCustomEditor].forEach((editor) => {
+      editor.addEventListener("input", renderSubagentModelAssignments);
+    });
     el.saveMemoryButton.addEventListener("click", saveMemoryConfig);
     el.validateMemoryButton.addEventListener("click", validateMemoryConfig);
     el.testMemoryButton.addEventListener("click", testMemoryConfig);

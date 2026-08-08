@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import fnmatch
 import logging
 import os
 import re
@@ -11,7 +10,6 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX, get_paths
 from deerflow.sandbox.sandbox import Sandbox
@@ -184,6 +182,64 @@ print("\n".join(result))
             )
         if result.returncode != 0:
             raise OSError(f"Failed to write file {path}: {self._output_from_result(result)}")
+
+    def delete_path(self, path: str, *, recursive: bool = False) -> None:
+        script = r"""
+import os, shutil, sys
+path = sys.argv[1]
+recursive = sys.argv[2] == "1"
+if os.path.islink(path) or os.path.isfile(path):
+    os.unlink(path)
+elif os.path.isdir(path):
+    if recursive:
+        shutil.rmtree(path)
+    else:
+        os.rmdir(path)
+else:
+    raise FileNotFoundError(path)
+"""
+        result = self._docker_exec(
+            ["python3", "-", path, "1" if recursive else "0"],
+            input_data=script,
+        )
+        if result.returncode != 0:
+            raise OSError(f"Failed to delete path {path}: {self._output_from_result(result)}")
+
+    def move_path(
+        self,
+        source: str,
+        destination: str,
+        *,
+        overwrite: bool = False,
+    ) -> None:
+        script = r"""
+import os, shutil, sys
+source, destination = sys.argv[1], sys.argv[2]
+overwrite = sys.argv[3] == "1"
+if not os.path.lexists(source):
+    raise FileNotFoundError(source)
+if os.path.abspath(source) == os.path.abspath(destination):
+    raise FileExistsError("source and destination are the same path")
+if os.path.lexists(destination):
+    if not overwrite:
+        raise FileExistsError(destination)
+    if os.path.isdir(destination) and not os.path.islink(destination):
+        raise IsADirectoryError(destination)
+    os.unlink(destination)
+parent = os.path.dirname(destination)
+if parent:
+    os.makedirs(parent, exist_ok=True)
+shutil.move(source, destination)
+"""
+        result = self._docker_exec(
+            ["python3", "-", source, destination, "1" if overwrite else "0"],
+            input_data=script,
+        )
+        if result.returncode != 0:
+            raise OSError(
+                f"Failed to move path {source} to {destination}: "
+                f"{self._output_from_result(result)}"
+            )
 
     def glob(self, path: str, pattern: str, *, include_dirs: bool = False, max_results: int = 200) -> tuple[list[str], bool]:
         script = r"""

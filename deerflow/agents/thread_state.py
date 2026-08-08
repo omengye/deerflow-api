@@ -37,10 +37,13 @@ class AgentContext(TypedDict, total=False):
     sandbox_id: NotRequired[str]
     agent_name: NotRequired[str]
     user_id: NotRequired[str]
+    workspace_path: NotRequired[str]
 
 
 class ThreadDataState(TypedDict):
+    thread_id: NotRequired[str]
     workspace_path: NotRequired[str | None]
+    workspace_path_managed: NotRequired[bool]
     uploads_path: NotRequired[str | None]
     outputs_path: NotRequired[str | None]
 

@@ -92,8 +92,14 @@ class ThreadDataMiddleware(AgentMiddleware[ThreadDataMiddlewareState]):
             paths = self._create_thread_directories(thread_id)
             logger.debug("Created thread data directories for thread %s", thread_id)
 
+        workspace_path = context.get("workspace_path")
+        if workspace_path:
+            paths["workspace_path"] = str(workspace_path)
+
         return {
             "thread_data": {
+                "thread_id": str(thread_id),
+                "workspace_path_managed": not bool(workspace_path),
                 **paths,
             }
         }

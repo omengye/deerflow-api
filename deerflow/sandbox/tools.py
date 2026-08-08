@@ -1,6 +1,7 @@
 import posixpath
 import re
 import shlex
+from contextlib import ExitStack
 from pathlib import Path
 
 from langchain.tools import ToolRuntime, tool
@@ -17,7 +18,10 @@ from deerflow.sandbox.file_operation_lock import get_file_operation_lock
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import get_sandbox_provider
 from deerflow.sandbox.search import GrepMatch
-from deerflow.sandbox.security import LOCAL_HOST_BASH_DISABLED_MESSAGE, is_host_bash_allowed
+from deerflow.sandbox.security import (
+    LOCAL_HOST_BASH_DISABLED_MESSAGE,
+    is_host_bash_allowed,
+)
 
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![:\w])(?<!:/)/(?:[^\s\"'`;&|<>()]+)")
 _FILE_URL_PATTERN = re.compile(r"\bfile://\S+", re.IGNORECASE)
@@ -206,7 +210,7 @@ def _get_custom_mount_for_path(path: str):
 
 
 def _extract_thread_id_from_thread_data(thread_data: "ThreadDataState | None") -> str | None:
-    """Extract thread_id from thread_data by inspecting workspace_path.
+    """Extract thread_id from explicit state or the legacy workspace layout.
 
     The workspace_path has the form
     ``{base_dir}/threads/{thread_id}/user-data/workspace``, so
@@ -214,6 +218,9 @@ def _extract_thread_id_from_thread_data(thread_data: "ThreadDataState | None") -
     """
     if thread_data is None:
         return None
+    explicit_thread_id = thread_data.get("thread_id")
+    if explicit_thread_id:
+        return str(explicit_thread_id)
     workspace_path = thread_data.get("workspace_path")
     if not workspace_path:
         return None
@@ -639,22 +646,27 @@ def _validate_resolved_user_data_path(resolved: Path, thread_data: ThreadDataSta
 
     Raises PermissionError if the path escapes workspace/uploads/outputs.
     """
-    allowed_roots = [
-        Path(p).resolve()
-        for p in (
-            thread_data.get("workspace_path"),
-            thread_data.get("uploads_path"),
-            thread_data.get("outputs_path"),
-        )
-        if p is not None
+    configured_roots = [
+        (key, Path(value))
+        for key in ("workspace_path", "uploads_path", "outputs_path")
+        if (value := thread_data.get(key)) is not None
     ]
 
-    if not allowed_roots:
+    if not configured_roots:
         raise SandboxRuntimeError("No allowed local sandbox directories configured")
 
-    for root in allowed_roots:
+    for key, configured_root in configured_roots:
+        root = configured_root.resolve()
         try:
             resolved.relative_to(root)
+            if (
+                key == "workspace_path"
+                and not thread_data.get("workspace_path_managed", True)
+                and not configured_root.is_dir()
+            ):
+                raise FileNotFoundError(
+                    f"ACP workspace directory is unavailable: {configured_root}"
+                )
             return
         except ValueError:
             continue
@@ -671,6 +683,64 @@ def _resolve_and_validate_user_data_path(path: str, thread_data: ThreadDataState
     resolved = Path(resolved_str).resolve()
     _validate_resolved_user_data_path(resolved, thread_data)
     return str(resolved)
+
+
+def _validate_destructive_virtual_path(path: str) -> None:
+    """Require destructive operations to target a child of an allowed root."""
+
+    _reject_path_traversal(path)
+    normalized = path.replace("\\", "/").rstrip("/")
+    user_roots = (
+        f"{VIRTUAL_PATH_PREFIX}/workspace",
+        f"{VIRTUAL_PATH_PREFIX}/uploads",
+        f"{VIRTUAL_PATH_PREFIX}/outputs",
+    )
+    if any(normalized.startswith(root + "/") for root in user_roots):
+        return
+    for mount in _get_custom_mounts():
+        root = mount.container_path.replace("\\", "/").rstrip("/")
+        if normalized.startswith(root + "/"):
+            return
+    raise PermissionError(
+        "Delete and move operations must target a child path under "
+        f"{VIRTUAL_PATH_PREFIX}/workspace, uploads, outputs, or a configured mount"
+    )
+
+
+def _resolve_and_validate_mutation_path(
+    path: str,
+    thread_data: ThreadDataState,
+) -> str:
+    """Resolve a mutable user-data path while preserving its final symlink.
+
+    Read/write resolution follows final symlinks and then checks the target.
+    Delete/move must instead operate on the symlink entry itself, while still
+    resolving and validating every parent component.
+    """
+
+    candidate = Path(replace_virtual_path(path, thread_data))
+    resolved_parent = candidate.parent.resolve()
+    _validate_resolved_user_data_path(resolved_parent, thread_data)
+    preserved = resolved_parent / candidate.name
+
+    if candidate.is_symlink():
+        return str(preserved)
+    if candidate.exists():
+        resolved = candidate.resolve()
+        _validate_resolved_user_data_path(resolved, thread_data)
+        return str(resolved)
+    return str(preserved)
+
+
+def _resolve_local_mutation_path(
+    path: str,
+    thread_data: ThreadDataState,
+) -> str:
+    _validate_destructive_virtual_path(path)
+    validate_local_tool_path(path, thread_data)
+    if _is_custom_mount_path(path):
+        return path
+    return _resolve_and_validate_mutation_path(path, thread_data)
 
 
 def _is_non_file_url_token(token: str) -> bool:
@@ -1020,7 +1090,10 @@ def is_host_fs_sandbox(runtime: ToolRuntime[AgentContext, ThreadState] | None) -
     sandbox_state = runtime.state.get("sandbox")
     if sandbox_state is None:
         return False
-    return sandbox_state.get("sandbox_id") in _HOST_FS_SANDBOX_IDS
+    sandbox_id = sandbox_state.get("sandbox_id")
+    if sandbox_id in _HOST_FS_SANDBOX_IDS:
+        return True
+    return isinstance(sandbox_id, str) and sandbox_id.startswith("local:")
 
 
 # Back-compat alias. The historical name implied "local-only" semantics; the
@@ -1142,10 +1215,14 @@ def ensure_thread_directories_exist(runtime: ToolRuntime[AgentContext, ThreadSta
     if runtime.state.get("thread_directories_created"):
         return
 
-    # Create the three directories
+    # uploads/outputs are DeerFlow-managed. A workspace supplied by ACP is an
+    # existing client project and must never be silently recreated if removed.
     import os
 
-    for key in ["workspace_path", "uploads_path", "outputs_path"]:
+    managed_keys = ["uploads_path", "outputs_path"]
+    if thread_data.get("workspace_path_managed", True):
+        managed_keys.insert(0, "workspace_path")
+    for key in managed_keys:
         path = thread_data.get(key)
         if path:
             os.makedirs(path, exist_ok=True)
@@ -1607,3 +1684,106 @@ def str_replace_tool(
         return f"Error: Permission denied accessing file: {requested_path}"
     except Exception as e:
         return f"Error: Unexpected error replacing string: {_sanitize_error(e, runtime)}"
+
+
+@tool("delete_path", parse_docstring=True)
+def delete_path_tool(
+    runtime: ToolRuntime[AgentContext, ThreadState],
+    description: str,
+    path: str,
+    recursive: bool = False,
+) -> str:
+    """Delete a file, symlink, or directory from an allowed workspace path.
+
+    Directories must be empty unless ``recursive`` is true. The workspace,
+    uploads, outputs, and configured mount roots themselves cannot be deleted.
+
+    Args:
+        description: Explain why you are deleting this path in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
+        path: The **absolute** virtual path to delete. ALWAYS PROVIDE THIS PARAMETER SECOND.
+        recursive: Delete a non-empty directory tree. Default is False.
+    """
+
+    requested_path = path
+    try:
+        _validate_destructive_virtual_path(path)
+        sandbox = ensure_sandbox_initialized(runtime)
+        ensure_thread_directories_exist(runtime)
+        if is_local_sandbox(runtime):
+            thread_data = get_thread_data(runtime)
+            if thread_data is None:
+                raise SandboxRuntimeError("Thread data not available for local sandbox")
+            path = _resolve_local_mutation_path(path, thread_data)
+        with get_file_operation_lock(sandbox, path):
+            sandbox.delete_path(path, recursive=recursive)
+        return "OK"
+    except SandboxError as e:
+        return f"Error: {e}"
+    except FileNotFoundError:
+        return f"Error: Path not found: {requested_path}"
+    except PermissionError:
+        return f"Error: Permission denied deleting path: {requested_path}"
+    except OSError as e:
+        return f"Error: Failed to delete path '{requested_path}': {_sanitize_error(e, runtime)}"
+    except Exception as e:
+        return f"Error: Unexpected error deleting path: {_sanitize_error(e, runtime)}"
+
+
+@tool("move_path", parse_docstring=True)
+def move_path_tool(
+    runtime: ToolRuntime[AgentContext, ThreadState],
+    description: str,
+    source: str,
+    destination: str,
+    overwrite: bool = False,
+) -> str:
+    """Move or rename a file, symlink, or directory within allowed paths.
+
+    Parent directories for the destination are created automatically. Existing
+    files or symlinks are replaced only when ``overwrite`` is true. Existing
+    directories are never overwritten implicitly.
+
+    Args:
+        description: Explain why you are moving this path in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
+        source: The **absolute** virtual source path. ALWAYS PROVIDE THIS PARAMETER SECOND.
+        destination: The **absolute** virtual destination path. ALWAYS PROVIDE THIS PARAMETER THIRD.
+        overwrite: Replace an existing file or symlink at the destination. Default is False.
+    """
+
+    requested_source = source
+    requested_destination = destination
+    try:
+        _validate_destructive_virtual_path(source)
+        _validate_destructive_virtual_path(destination)
+        sandbox = ensure_sandbox_initialized(runtime)
+        ensure_thread_directories_exist(runtime)
+        if is_local_sandbox(runtime):
+            thread_data = get_thread_data(runtime)
+            if thread_data is None:
+                raise SandboxRuntimeError("Thread data not available for local sandbox")
+            source = _resolve_local_mutation_path(source, thread_data)
+            destination = _resolve_local_mutation_path(destination, thread_data)
+
+        with ExitStack() as stack:
+            for operation_path in sorted({source, destination}):
+                stack.enter_context(get_file_operation_lock(sandbox, operation_path))
+            sandbox.move_path(source, destination, overwrite=overwrite)
+        return "OK"
+    except SandboxError as e:
+        return f"Error: {e}"
+    except FileNotFoundError:
+        return f"Error: Source path not found: {requested_source}"
+    except FileExistsError:
+        return f"Error: Destination already exists: {requested_destination}"
+    except PermissionError:
+        return (
+            "Error: Permission denied moving path: "
+            f"{requested_source} -> {requested_destination}"
+        )
+    except OSError as e:
+        return (
+            f"Error: Failed to move path '{requested_source}' to "
+            f"'{requested_destination}': {_sanitize_error(e, runtime)}"
+        )
+    except Exception as e:
+        return f"Error: Unexpected error moving path: {_sanitize_error(e, runtime)}"

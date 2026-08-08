@@ -8,6 +8,7 @@ __pycache__/
 build/
 dist/
 site/
+bridge/target/
 .eggs/
 *.egg-info/
 pip-wheel-metadata/
@@ -58,3 +59,10 @@ data/uploads/
 .codex
 .opencode
 todo.md
+.codewhale/
+data/acp-checkpoints.db
+data/acp-checkpoints.db-shm
+data/acp-checkpoints.db-wal
+data/acp-sessions.db
+data/acp-sessions.db-shm
+data/acp-sessions.db-wal

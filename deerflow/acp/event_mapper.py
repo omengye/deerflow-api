@@ -1,0 +1,390 @@
+"""Map embedded DeerFlow stream events to ACP session updates."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import mimetypes
+import uuid
+from collections.abc import Awaitable, Callable
+from pathlib import PurePosixPath
+from typing import Any, cast
+
+import acp
+from acp import schema
+
+from deerflow.config.paths import get_paths
+
+SendUpdate = Callable[[Any], Awaitable[None]]
+ArtifactResolver = Callable[[str], schema.ResourceContentBlock | None]
+_MESSAGE_NAMESPACE = uuid.UUID("d0af913a-b872-4e87-9b31-3fc58f03b3f8")
+_OUTPUT_PREFIX = "/mnt/user-data/outputs/"
+_MAX_TOOL_TEXT = 20_000
+
+
+def _message_uuid(kind: str, raw_id: Any) -> str:
+    value = str(raw_id or "")
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError):
+        return str(uuid.uuid5(_MESSAGE_NAMESPACE, f"{kind}:{value}"))
+
+
+def _safe_json(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _display_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        pieces: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                pieces.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    pieces.append(text)
+        if pieces:
+            return "\n".join(pieces)
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _limited_text(value: Any) -> str:
+    text = _display_text(value)
+    if len(text) <= _MAX_TOOL_TEXT:
+        return text
+    return text[:_MAX_TOOL_TEXT] + "\n… (truncated)"
+
+
+def _tool_kind(name: str) -> schema.ToolKind:
+    lowered = name.lower()
+    if any(part in lowered for part in ("read", "view", "list_file")):
+        return "read"
+    if any(part in lowered for part in ("write", "edit", "patch", "create_file")):
+        return "edit"
+    if any(part in lowered for part in ("delete", "remove")):
+        return "delete"
+    if any(part in lowered for part in ("search", "query", "grep", "find")):
+        return "search"
+    if any(part in lowered for part in ("fetch", "web", "http", "browser")):
+        return "fetch"
+    if any(part in lowered for part in ("bash", "shell", "execute", "run_command")):
+        return "execute"
+    if any(part in lowered for part in ("think", "task", "subagent")):
+        return "think"
+    return "other"
+
+
+class ACPEventMapper:
+    """Stateful, per-prompt ACP event mapper."""
+
+    def __init__(
+        self,
+        session_id: str,
+        send_update: SendUpdate,
+        *,
+        artifact_resolver: ArtifactResolver | None = None,
+    ):
+        self.session_id = session_id
+        self._send_update = send_update
+        self._artifact_resolver = artifact_resolver or self._default_artifact_resolver
+        self._lock = asyncio.Lock()
+        self._reasoning: dict[str, str] = {}
+        self._started_tools: set[str] = set()
+        self._finished_tools: set[str] = set()
+        self._seen_artifacts: set[str] = set()
+        self._last_plan: str | None = None
+        self._last_title: str | None = None
+        self.title: str | None = None
+        self.usage: dict[str, int] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+        self.failure_message: str | None = None
+        self._closed = False
+
+    async def _send(self, update: Any) -> None:
+        await self._send_update(update)
+
+    def _default_artifact_resolver(self, virtual_path: str) -> schema.ResourceContentBlock | None:
+        if not virtual_path.startswith(_OUTPUT_PREFIX):
+            return None
+        try:
+            host_path = get_paths().resolve_virtual_path(self.session_id, virtual_path).resolve()
+        except (OSError, ValueError):
+            return None
+        name = PurePosixPath(virtual_path).name or "artifact"
+        mime_type, _ = mimetypes.guess_type(name)
+        try:
+            size = host_path.stat().st_size
+        except OSError:
+            size = None
+        return acp.resource_link_block(
+            name,
+            host_path.as_uri(),
+            mime_type=mime_type,
+            size=size,
+            description="DeerFlow local artifact",
+        )
+
+    async def handle(self, event: Any) -> None:
+        async with self._lock:
+            event_type = str(getattr(event, "type", ""))
+            data = getattr(event, "data", {})
+            if not isinstance(data, dict):
+                return
+            if event_type == "messages-tuple":
+                await self._handle_message(data)
+            elif event_type == "values":
+                await self._handle_values(data)
+            elif event_type == "custom":
+                await self._handle_live_unlocked(data)
+            elif event_type == "end":
+                usage = data.get("usage")
+                if isinstance(usage, dict):
+                    self.usage = {
+                        "input_tokens": max(0, int(usage.get("input_tokens", 0) or 0)),
+                        "output_tokens": max(0, int(usage.get("output_tokens", 0) or 0)),
+                        "total_tokens": max(0, int(usage.get("total_tokens", 0) or 0)),
+                    }
+            else:
+                await self._handle_live_unlocked({"type": event_type, **data})
+
+    async def handle_live(self, data: dict[str, Any]) -> None:
+        async with self._lock:
+            if self._closed:
+                return
+            await self._handle_live_unlocked(data)
+
+    async def _handle_message(self, data: dict[str, Any]) -> None:
+        message_type = data.get("type")
+        if message_type == "ai":
+            raw_id = data.get("id") or "agent"
+            message_id = _message_uuid("agent", raw_id)
+            reasoning = data.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                previous = self._reasoning.get(message_id, "")
+                delta = reasoning[len(previous) :] if previous and reasoning.startswith(previous) else reasoning
+                self._reasoning[message_id] = reasoning if reasoning.startswith(previous) else previous + delta
+                if delta:
+                    await self._send(
+                        schema.AgentThoughtChunk(
+                            session_update="agent_thought_chunk",
+                            content=acp.text_block(delta),
+                            message_id=_message_uuid("thought", raw_id),
+                        )
+                    )
+
+            content = data.get("content")
+            if isinstance(content, str) and content:
+                await self._send(
+                    schema.AgentMessageChunk(
+                        session_update="agent_message_chunk",
+                        content=acp.text_block(content),
+                        message_id=message_id,
+                    )
+                )
+
+            tool_calls = data.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tool_call in tool_calls:
+                    if isinstance(tool_call, dict):
+                        await self._start_tool(tool_call)
+            return
+
+        if message_type == "tool":
+            tool_call_id = str(data.get("tool_call_id") or data.get("id") or uuid.uuid4())
+            if tool_call_id not in self._started_tools:
+                await self._start_tool(
+                    {
+                        "id": tool_call_id,
+                        "name": data.get("name") or "tool",
+                        "args": {},
+                    }
+                )
+            await self._finish_tool(
+                tool_call_id,
+                status="failed" if data.get("status") in {"error", "failed"} else "completed",
+                output=data.get("content"),
+            )
+
+    async def _start_tool(self, tool_call: dict[str, Any], *, prefix: str = "") -> str:
+        raw_id = str(tool_call.get("id") or uuid.uuid4())
+        tool_call_id = f"{prefix}{raw_id}"
+        name = str(tool_call.get("name") or "tool")
+        args = _safe_json(tool_call.get("args") or {})
+        if tool_call_id in self._started_tools:
+            return tool_call_id
+        self._started_tools.add(tool_call_id)
+        await self._send(
+            acp.start_tool_call(
+                tool_call_id,
+                name,
+                kind=_tool_kind(name),
+                status="in_progress",
+                raw_input=args,
+            )
+        )
+        return tool_call_id
+
+    async def _finish_tool(self, tool_call_id: str, *, status: schema.ToolCallStatus, output: Any) -> None:
+        if tool_call_id in self._finished_tools:
+            return
+        self._finished_tools.add(tool_call_id)
+        text = _limited_text(output)
+        content = [acp.tool_content(acp.text_block(text))] if text else None
+        await self._send(
+            acp.update_tool_call(
+                tool_call_id,
+                status=status,
+                content=content,
+                raw_output=_safe_json(output),
+            )
+        )
+
+    async def _handle_values(self, data: dict[str, Any]) -> None:
+        title = data.get("title")
+        if isinstance(title, str) and title and title != self._last_title:
+            self._last_title = title
+            self.title = title
+            await self._send(
+                schema.SessionInfoUpdate(
+                    session_update="session_info_update",
+                    title=title,
+                )
+            )
+
+        todos = data.get("todos")
+        if isinstance(todos, list):
+            normalized: list[schema.PlanEntry] = []
+            for todo in todos:
+                if not isinstance(todo, dict):
+                    continue
+                content = todo.get("content") or todo.get("description") or todo.get("title")
+                if not isinstance(content, str) or not content:
+                    continue
+                status = str(todo.get("status") or "pending")
+                if status not in {"pending", "in_progress", "completed"}:
+                    status = "pending"
+                priority = str(todo.get("priority") or "medium")
+                if priority not in {"low", "medium", "high"}:
+                    priority = "medium"
+                normalized.append(
+                    schema.PlanEntry(
+                        content=content,
+                        status=cast(schema.PlanEntryStatus, status),
+                        priority=cast(schema.PlanEntryPriority, priority),
+                    )
+                )
+            signature = json.dumps(
+                [entry.model_dump(mode="json") for entry in normalized],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            if signature != self._last_plan:
+                self._last_plan = signature
+                await self._send(acp.update_plan(normalized))
+
+        artifacts = data.get("artifacts")
+        if isinstance(artifacts, list):
+            for raw in artifacts:
+                if not isinstance(raw, str) or raw in self._seen_artifacts:
+                    continue
+                block = self._artifact_resolver(raw)
+                if block is None:
+                    continue
+                self._seen_artifacts.add(raw)
+                await self._send(
+                    schema.AgentMessageChunk(
+                        session_update="agent_message_chunk",
+                        content=block,
+                        message_id=_message_uuid("artifact", raw),
+                    )
+                )
+
+    async def _handle_live_unlocked(self, data: dict[str, Any]) -> None:
+        event_type = str(data.get("type") or "")
+        if event_type == "llm_failure":
+            self.failure_message = str(data.get("message") or data.get("reason") or "Model request failed")
+            return
+
+        task_id = str(data.get("task_id") or data.get("trace_id") or "")
+        subagent_tool_id = f"subagent:{task_id}" if task_id else ""
+        if event_type in {"task_started", "subagent_started"} and task_id:
+            title = str(data.get("description") or data.get("name") or "Subtask")
+            if subagent_tool_id not in self._started_tools:
+                self._started_tools.add(subagent_tool_id)
+                await self._send(
+                    acp.start_tool_call(
+                        subagent_tool_id,
+                        title,
+                        kind="think",
+                        status="in_progress",
+                        raw_input=_safe_json(data),
+                    )
+                )
+            return
+
+        if event_type in {"token_chunk", "thinking_chunk", "task_running"} and task_id:
+            if subagent_tool_id not in self._started_tools:
+                await self._handle_live_unlocked({**data, "type": "task_started"})
+            if subagent_tool_id in self._finished_tools:
+                return
+            progress = data.get("content") or data.get("thinking") or data.get("message")
+            text = _limited_text(progress)
+            if text:
+                await self._send(
+                    acp.update_tool_call(
+                        subagent_tool_id,
+                        status="in_progress",
+                        content=[acp.tool_content(acp.text_block(text))],
+                    )
+                )
+            return
+
+        if event_type in {"task_completed", "task_failed", "task_cancelled", "task_timed_out"} and task_id:
+            if subagent_tool_id not in self._started_tools:
+                await self._handle_live_unlocked({**data, "type": "task_started"})
+            status: schema.ToolCallStatus = "completed" if event_type == "task_completed" else "failed"
+            await self._finish_tool(
+                subagent_tool_id,
+                status=status,
+                output=data.get("result") if status == "completed" else data.get("error") or event_type,
+            )
+            return
+
+        if event_type == "tool_call_chunk" and task_id:
+            tool_call = data.get("tool_call")
+            if isinstance(tool_call, dict):
+                await self._start_tool(tool_call, prefix=f"subagent:{task_id}:tool:")
+            return
+
+        if event_type == "tool_result_chunk" and task_id:
+            raw_id = str(data.get("tool_call_id") or uuid.uuid4())
+            nested_id = f"subagent:{task_id}:tool:{raw_id}"
+            if nested_id not in self._started_tools:
+                await self._start_tool(
+                    {"id": raw_id, "name": data.get("name") or "tool", "args": {}},
+                    prefix=f"subagent:{task_id}:tool:",
+                )
+            failed = str(data.get("status") or "").lower() in {"error", "failed"}
+            await self._finish_tool(
+                nested_id,
+                status="failed" if failed else "completed",
+                output=data.get("content"),
+            )
+
+    async def close_open_tools(self, *, cancelled: bool) -> None:
+        async with self._lock:
+            for tool_call_id in sorted(self._started_tools - self._finished_tools):
+                await self._finish_tool(
+                    tool_call_id,
+                    status="failed" if cancelled else "completed",
+                    output="Cancelled" if cancelled else "Completed",
+                )
+            self._closed = True

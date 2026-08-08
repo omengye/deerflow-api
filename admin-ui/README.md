@@ -33,7 +33,7 @@ When served by the API process, the API base URL is inferred from the current or
 - `PATCH /api/admin/models/{name}`: safely patch one model; omitted secrets are retained.
 - `DELETE /api/admin/models/{name}`: delete one model and repair the default selection.
 - `GET|PUT /api/admin/title`: read or update automatic title generation.
-- `GET|PUT /api/admin/subagents`: read or update built-in/custom subagent configuration.
+- `GET|PUT /api/admin/subagents`: read or update built-in/custom subagent configuration; responses include built-in agent metadata for the visual model selector.
 - `GET|PUT /api/admin/memory`: read or update global memory configuration.
 - `GET|PUT /api/admin/summarization`: read or update conversation summarization configuration.
 - `GET /api/admin/scheduled-tasks`: list persisted scheduled tasks without internal metadata.

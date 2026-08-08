@@ -71,6 +71,24 @@ class Sandbox(ABC):
         pass
 
     @abstractmethod
+    def delete_path(self, path: str, *, recursive: bool = False) -> None:
+        """Delete a file, symlink, or directory inside the sandbox."""
+
+        pass
+
+    @abstractmethod
+    def move_path(
+        self,
+        source: str,
+        destination: str,
+        *,
+        overwrite: bool = False,
+    ) -> None:
+        """Move or rename a file, symlink, or directory inside the sandbox."""
+
+        pass
+
+    @abstractmethod
     def glob(self, path: str, pattern: str, *, include_dirs: bool = False, max_results: int = 200) -> tuple[list[str], bool]:
         """Find paths that match a glob pattern under a root directory."""
         pass

@@ -12,7 +12,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "redis>=5.0.0",
     # DeerFlow harness (embedded)
-    "agent-client-protocol>=0.4.0",
+    "agent-client-protocol>=0.10,<0.11",
     "agent-sandbox>=0.0.19",
     "dotenv>=0.9.9",
     "httpx>=0.28.0",
@@ -38,6 +38,10 @@ dependencies = [
     # IANA timezone database for Windows and minimal container images.
     "tzdata>=2025.2",
 ]
+
+[project.scripts]
+deerflow-acp = "deerflow.acp.__main__:main"
+deerflow-acpd = "deerflow.acp.daemon:main"
 
 [project.optional-dependencies]
 ollama = ["langchain-ollama>=0.3.0"]

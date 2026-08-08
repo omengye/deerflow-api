@@ -65,17 +65,18 @@ async def test_mcp_discovery_keeps_per_server_source_with_overlapping_names() ->
         return tool
 
     with (
-        patch("deerflow.mcp.tools.ExtensionsConfig.from_file", return_value=config),
+        patch("deerflow.mcp.tools.ExtensionsConfig.from_file") as from_file,
         patch("deerflow.mcp.tools.build_servers_config", return_value=connections),
         patch("deerflow.mcp.tools.get_initial_oauth_headers", new_callable=AsyncMock, return_value={}),
         patch("deerflow.mcp.tools.build_oauth_tool_interceptor", return_value=None),
         patch("langchain_mcp_adapters.client.MultiServerMCPClient", FakeClient),
         patch("deerflow.mcp.tools._make_session_pool_tool", side_effect=wrap),
     ):
-        tools = await get_mcp_tools()
+        tools = await get_mcp_tools(config)
 
     assert {tool.name for tool in tools} == {"web_search", "web_scraper_search"}
     assert routed == [("web_search", "web"), ("web_scraper_search", "web_scraper")]
+    from_file.assert_not_called()
 
 
 @pytest.mark.asyncio

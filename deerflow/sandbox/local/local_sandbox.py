@@ -410,6 +410,87 @@ class LocalSandbox(Sandbox):
             # Re-raise with the original path for clearer error messages, hiding internal resolved paths
             raise type(e)(e.errno, e.strerror, path) from None
 
+    def delete_path(self, path: str, *, recursive: bool = False) -> None:
+        resolved = self._resolve_path_with_mapping(path)
+        if self._is_resolved_path_read_only(resolved):
+            raise OSError(errno.EROFS, "Read-only file system", path)
+
+        target = Path(resolved.path)
+        try:
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                if recursive:
+                    shutil.rmtree(target)
+                else:
+                    target.rmdir()
+            else:
+                raise FileNotFoundError(errno.ENOENT, "Path not found", path)
+            normalized = str(target)
+            self._agent_written_paths = {
+                written
+                for written in self._agent_written_paths
+                if written != normalized and not written.startswith(normalized + os.sep)
+            }
+        except OSError as e:
+            raise type(e)(e.errno, e.strerror, path) from None
+
+    def move_path(
+        self,
+        source: str,
+        destination: str,
+        *,
+        overwrite: bool = False,
+    ) -> None:
+        resolved_source = self._resolve_path_with_mapping(source)
+        resolved_destination = self._resolve_path_with_mapping(destination)
+        if self._is_resolved_path_read_only(resolved_source):
+            raise OSError(errno.EROFS, "Read-only file system", source)
+        if self._is_resolved_path_read_only(resolved_destination):
+            raise OSError(errno.EROFS, "Read-only file system", destination)
+
+        source_path = Path(resolved_source.path)
+        destination_path = Path(resolved_destination.path)
+        try:
+            if not source_path.exists() and not source_path.is_symlink():
+                raise FileNotFoundError(errno.ENOENT, "Path not found", source)
+            if os.path.normcase(os.path.abspath(source_path)) == os.path.normcase(
+                os.path.abspath(destination_path)
+            ):
+                raise FileExistsError(
+                    errno.EEXIST,
+                    "Source and destination are the same path",
+                    destination,
+                )
+            if destination_path.exists() or destination_path.is_symlink():
+                if not overwrite:
+                    raise FileExistsError(errno.EEXIST, "Destination already exists", destination)
+                if destination_path.is_dir() and not destination_path.is_symlink():
+                    raise IsADirectoryError(
+                        errno.EISDIR,
+                        "Refusing to overwrite an existing directory",
+                        destination,
+                    )
+                destination_path.unlink()
+
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source_path), str(destination_path))
+
+            source_prefix = str(source_path)
+            destination_prefix = str(destination_path)
+            updated_paths: set[str] = set()
+            for written in self._agent_written_paths:
+                if written == source_prefix:
+                    updated_paths.add(destination_prefix)
+                elif written.startswith(source_prefix + os.sep):
+                    updated_paths.add(destination_prefix + written[len(source_prefix) :])
+                else:
+                    updated_paths.add(written)
+            self._agent_written_paths = updated_paths
+        except OSError as e:
+            filename = destination if isinstance(e, (FileExistsError, IsADirectoryError)) else source
+            raise type(e)(e.errno, e.strerror, filename) from None
+
     def glob(self, path: str, pattern: str, *, include_dirs: bool = False, max_results: int = 200) -> tuple[list[str], bool]:
         resolved_path = Path(self._resolve_path(path))
         matches, truncated = find_glob_matches(resolved_path, pattern, include_dirs=include_dirs, max_results=max_results)

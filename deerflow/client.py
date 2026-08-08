@@ -169,6 +169,8 @@ class DeerFlowClient:
         agent_name: str | None = None,
         available_skills: set[str] | None = None,
         middlewares: Sequence[AgentMiddleware] | None = None,
+        additional_mcp_tools: Sequence[Any] | None = None,
+        excluded_tool_names: set[str] | None = None,
         recursion_limit: int = 200,
         checkpoint_channel_mode: CheckpointChannelMode | None = None,
         checkpoint_snapshot_frequency: int | None = None,
@@ -190,6 +192,7 @@ class DeerFlowClient:
             agent_name: Name of the agent to use.
             available_skills: Optional set of skill names to make available. If None (default), all scanned skills are available.
             middlewares: Optional list of custom middlewares to inject into the agent.
+            excluded_tool_names: Tool names to omit from this embedded client.
         """
         if config_path is not None:
             reload_app_config(config_path)
@@ -207,6 +210,8 @@ class DeerFlowClient:
         self._agent_name = agent_name
         self._available_skills = set(available_skills) if available_skills is not None else None
         self._middlewares = list(middlewares) if middlewares else []
+        self._additional_mcp_tools = list(additional_mcp_tools or [])
+        self._excluded_tool_names = frozenset(excluded_tool_names or ())
         self._recursion_limit = recursion_limit
         configured_checkpointer = getattr(self._app_config, "checkpointer", None)
         self._checkpoint_channel_mode: CheckpointChannelMode = (
@@ -242,6 +247,12 @@ class DeerFlowClient:
         """
         self._agent = None
         self._agent_config_key = None
+
+    def warmup(self) -> None:
+        """Build the configured agent graph without sending a model request."""
+
+        config = self._get_runnable_config("__deerflow_warmup__")
+        self._ensure_agent(config)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -364,6 +375,7 @@ class DeerFlowClient:
             frozenset(self._available_skills) if self._available_skills is not None else None,
             checkpoint_mode,
             checkpoint_frequency,
+            getattr(self, "_excluded_tool_names", frozenset()),
         )
 
         if self._agent is not None and self._agent_config_key == key:
@@ -425,12 +437,31 @@ class DeerFlowClient:
         self._agent_config_key = key
         logger.info("Agent created: agent_name=%s, model=%s, thinking=%s", self._agent_name, model_name, thinking_enabled)
 
-    @staticmethod
-    def _get_tools(*, model_name: str | None, subagent_enabled: bool):
+    def _get_tools(self, *, model_name: str | None, subagent_enabled: bool):
         """Lazy import to avoid circular dependency at module level."""
         from deerflow.tools import get_available_tools
 
-        return get_available_tools(model_name=model_name, subagent_enabled=subagent_enabled)
+        tools = list(
+            get_available_tools(
+                model_name=model_name,
+                subagent_enabled=subagent_enabled,
+            )
+        )
+        existing_names = {tool.name for tool in tools}
+        for tool in getattr(self, "_additional_mcp_tools", []):
+            if tool.name in existing_names:
+                logger.warning(
+                    "Skipping client MCP tool %r because DeerFlow already exposes that name",
+                    tool.name,
+                )
+                continue
+            tools.append(tool)
+            existing_names.add(tool.name)
+        return [
+            tool
+            for tool in tools
+            if tool.name not in getattr(self, "_excluded_tool_names", frozenset())
+        ]
 
     @staticmethod
     def _serialize_tool_calls(tool_calls) -> list[dict]:
@@ -485,6 +516,7 @@ class DeerFlowClient:
                 "name": msg.name,
                 "tool_call_id": msg.tool_call_id,
                 "id": msg.id,
+                "status": getattr(msg, "status", "success"),
             },
         )
 
@@ -508,6 +540,7 @@ class DeerFlowClient:
                 "name": getattr(msg, "name", None),
                 "tool_call_id": getattr(msg, "tool_call_id", None),
                 "id": getattr(msg, "id", None),
+                "status": getattr(msg, "status", "success"),
             }
         if isinstance(msg, HumanMessage):
             return {"type": "human", "content": msg.content, "id": getattr(msg, "id", None)}
@@ -661,6 +694,8 @@ class DeerFlowClient:
             context["agent_name"] = self._agent_name
         if kwargs.get("user_id") is not None:
             context["user_id"] = str(kwargs["user_id"])
+        if kwargs.get("workspace_path") is not None:
+            context["workspace_path"] = str(kwargs["workspace_path"])
         return config, state, context
 
     @staticmethod
@@ -791,6 +826,7 @@ class DeerFlowClient:
                 "title": chunk.get("title"),
                 "messages": [self._serialize_message(m) for m in messages],
                 "artifacts": chunk.get("artifacts", []),
+                "todos": chunk.get("todos", []),
             },
         )
 
@@ -1048,7 +1084,7 @@ class DeerFlowClient:
 
         Yields:
             StreamEvent with one of:
-            - type="values"          data={"title": str|None, "messages": [...], "artifacts": [...]}
+            - type="values"          data={"title": str|None, "messages": [...], "artifacts": [...], "todos": [...]}
             - type="custom"          data={...}
             - type="messages-tuple"  data={"type": "ai", "content": <delta>, "id": str}
             - type="messages-tuple"  data={"type": "ai", "content": <delta>, "id": str, "usage_metadata": {...}}

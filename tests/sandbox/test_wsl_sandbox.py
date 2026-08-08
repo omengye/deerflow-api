@@ -45,6 +45,8 @@ from deerflow.sandbox.tools import (
         ("E:\\", "/mnt/e/"),
         ("D:\\Tools\\deer-flow with spaces\\x.py", "/mnt/d/Tools/deer-flow with spaces/x.py"),
         ("D:/Foo/bar", "/mnt/d/Foo/bar"),
+        ("\\\\?\\D:\\Tools\\deer-flow\\x.py", "/mnt/d/Tools/deer-flow/x.py"),
+        ("//?/D:/Tools/deer-flow/x.py", "/mnt/d/Tools/deer-flow/x.py"),
     ],
 )
 def test_windows_to_wsl_basic(windows: str, expected: str) -> None:
@@ -56,6 +58,10 @@ def test_windows_to_wsl_rejects_unc() -> None:
         WslSandbox._windows_path_to_wsl("\\\\wsl$\\Ubuntu\\home\\me")
     with pytest.raises(ValueError, match="UNC"):
         WslSandbox._windows_path_to_wsl("//server/share/foo")
+    with pytest.raises(ValueError, match="UNC"):
+        WslSandbox._windows_path_to_wsl("\\\\?\\UNC\\server\\share\\foo")
+    with pytest.raises(ValueError, match="UNC"):
+        WslSandbox._windows_path_to_wsl("//?/UNC/server/share/foo")
 
 
 def test_windows_to_wsl_rejects_relative_or_non_drive() -> None:
@@ -92,6 +98,20 @@ def test_translate_command_basic_drive_path() -> None:
     assert (
         sandbox._translate_windows_paths_in_command("cat D:\\foo\\x.py")
         == "cat /mnt/d/foo/x.py"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"cd '\\?\D:\Tools\deer-flow\workspace' && pwd",
+        "cd '//?/D:/Tools/deer-flow/workspace' && pwd",
+    ],
+)
+def test_translate_command_strips_verbatim_drive_prefix(command: str) -> None:
+    sandbox = _make_sandbox()
+    assert sandbox._translate_windows_paths_in_command(command) == (
+        "cd '/mnt/d/Tools/deer-flow/workspace' && pwd"
     )
 
 
@@ -253,6 +273,15 @@ def test_execute_command_passes_translated_command_to_wsl() -> None:
     argv = mock_run.call_args.args[0]
     # Tail of argv is [shell, -lc, command]
     assert argv[-1] == "cat /mnt/d/foo/x.py"
+
+
+def test_execute_command_passes_translated_verbatim_path_to_wsl() -> None:
+    sandbox = WslSandbox("wsl", distro="Ubuntu-22.04")
+    with patch("subprocess.run", return_value=_run_result(stdout="")) as mock_run:
+        sandbox.execute_command(r"cd '\\?\D:\foo' && pwd")
+
+    argv = mock_run.call_args.args[0]
+    assert argv[-1] == "cd '/mnt/d/foo' && pwd"
 
 
 def test_execute_command_translates_output_back() -> None:

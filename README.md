@@ -186,7 +186,84 @@ Signal 持久化后由单个后台 Worker 异步处理，不阻塞当前用户�
 
 演进状态默认持久化为 `state.json`、`signals/`、`proposals/`、`revisions/` 和 `audit.jsonl`。Signal 虽然做了规则脱敏，但不应视为完整 DLP；候选 Skill、Diff 和扫描内容还可能发送给配置的生成、审核或评估模型。该文件存储实现按**单用户、单写入进程**设计，锁只在进程内协调；多 worker 部署应把 Proposal 审批、发布、回滚和自动 Worker 固定到一个写入进程，或在扩展为跨进程协调存储后再开放并发写入。
 
-## ACP Agent 对接（Codex / Claude Code）
+## 本地 ACP Agent（Zed 等客户端）
+
+项目可作为标准 **ACP v1 Agent** 由 Zed 或其他 ACP client 在本机使用。推荐采用单客户端常驻模式：
+
+```text
+Zed stdio <-> Rust Bridge <-> 127.0.0.1 随机端口 <-> 常驻 deerflow-acpd
+```
+
+- Zed 只启动体积很小的 Rust Bridge；Bridge 不加载 Python、模型、工具或 Sandbox。
+- `deerflow-acpd` 常驻并复用 DeerFlow graph、SQLite checkpointer、会话库和已唤醒的 WSL2。
+- Bridge 默认会在 daemon 不存在时自动启动它，然后透明转发 ACP JSON-RPC。
+- 只允许一个活动 ACP 连接，不做多 Zed 窗口的队列、抢占或多客户端隔离。Zed 断开后 daemon 继续运行，下次可重新连接。
+- 内部端口只监听 loopback，并使用每次启动生成的随机 token；不经过 HTTP/AG-UI，不需要 WSS 或 API Key。
+
+### 构建与 Zed 配置
+
+先构建 Bridge：
+
+```powershell
+cargo build --release --manifest-path D:\Tools\deerflow-api\bridge\Cargo.toml
+```
+
+Zed 的 `settings.json` 可添加一个 custom agent server。Windows 示例（路径按实际项目位置修改）：
+
+```json
+{
+  "agent_servers": {
+    "DeerFlow Local": {
+      "type": "custom",
+      "command": "D:\\Tools\\deerflow-api\\bridge\\target\\release\\deerflow-acp.exe",
+      "args": ["--config", "D:\\Tools\\deerflow-api\\config.yaml"]
+    }
+  }
+}
+```
+
+指定 `--config` 后，Bridge 会优先发现配置文件同目录下的 `.venv\Scripts\python.exe`。打包发行时也可显式添加 `--python <PATH>`，或者通过 `DEER_FLOW_ACP_PYTHON` 指定随包 Python；Bridge 将执行 `python -m deerflow.acp.daemon`。`--daemon <PATH>` 和 `DEER_FLOW_ACP_DAEMON` 仅用于兼容已有的 `deerflow-acpd` console script。
+
+### daemon 生命周期
+
+Zed 第一次连接时会自动启动 daemon。若希望登录 Windows 后提前完成 graph 和 WSL2 预热，可把下面的 `--start-daemon` 命令放入当前用户的登录任务：
+
+```powershell
+$bridge = "D:\Tools\deerflow-api\bridge\target\release\deerflow-acp.exe"
+& $bridge --start-daemon --config "D:\Tools\deerflow-api\config.yaml"
+& $bridge --status --config "D:\Tools\deerflow-api\config.yaml"
+& $bridge --stop-daemon --config "D:\Tools\deerflow-api\config.yaml"
+```
+
+`--status` 和 `--stop-daemon` 不会自动启动 daemon。端点、随机 token 和日志默认保存在当前用户的 `%LOCALAPPDATA%\DeerFlow\acp`；Linux 使用 `XDG_RUNTIME_DIR` 或 `XDG_CACHE_HOME`。可用 `--runtime-dir` 或 `DEER_FLOW_ACP_RUNTIME_DIR` 覆盖。Bridge 默认等待 daemon 预热 120 秒；特别慢的环境可用 `DEER_FLOW_ACP_DAEMON_START_TIMEOUT_MS` 调整。
+
+默认启动会预构建 agent graph，并在配置为 WSL Sandbox 时执行一次无副作用的 `true` 探针。排障时可分别设置 `DEER_FLOW_ACP_DAEMON_WARMUP=0`、`DEER_FLOW_ACP_DAEMON_SANDBOX_WARMUP=0`；调整启动等待时间可设置 `DEER_FLOW_ACP_DAEMON_START_TIMEOUT_MS`。
+
+### 直接 stdio 回退
+
+原有 Python 入口继续保留，适合验证协议或 daemon/Bridge 故障排查，但每次都会重新加载 DeerFlow，不具备热启动优势：
+
+```powershell
+uv run deerflow-acp
+# 等价方式：uv run python -m deerflow.acp
+```
+
+使用直接入口前应先停止常驻 daemon，避免两个本地 Agent 同时操作同一 ACP 会话库。
+
+这个入口定位为本地通用任务 Agent，不提供终端、LSP、代码诊断或 diff 等编码客户端集成：
+
+- 只接受文本 prompt，支持多轮会话、加载历史、会话列表、取消、思考、计划、工具进度和本地产物链接。
+- Zed 通过 `session/new` 传入的绝对 `cwd` 会绑定为该会话的 `/mnt/user-data/workspace`。Agent 可在这个目录内列举、搜索、读取、写入、替换、移动/重命名和删除文件或目录；路径穿越以及通过符号链接或 junction 逃出工作区会被拒绝。
+- `cwd` 必须是已经存在的本地目录，加载会话时必须与创建会话时的目录一致。非空 `additionalDirectories` 会被明确拒绝。
+- 工作区访问直接使用本机路径，不调用 ACP client 的文件系统或终端接口。本地 ACP runtime 不暴露 `bash`、外部 ACP agent 和 DeerFlow subagent 工具，避免绕过工作区文件边界。
+- 该模式要求 `LocalSandboxProvider` 或 `LocalWslProvider`；AIO/Docker sandbox 不会静默回退到 DeerFlow 内部 workspace。
+- client MCP 默认拒绝。受信任的本地客户端可设置 `local_acp.accept_client_mcp_servers: true`，或环境变量 `DEER_FLOW_ACP_ACCEPT_CLIENT_MCP_SERVERS=1`，启用按会话隔离、仅驻留内存的 stdio MCP；HTTP/SSE 仍不接受。该开关会增加外部命令/工具面并退出严格的“仅项目目录文件操作”边界，当前文件模式不应开启。
+- DeerFlow 的 uploads、outputs、ACP 外部 agent workspace 和会话状态仍保存在自己的线程目录中，不会混入客户端项目。
+- ACP 使用独立的 `acp-checkpoints.db` 和 `acp-sessions.db`，可与 HTTP API 同时运行而不共享 SQLite 写热点。
+
+可选配置见 `config.example.yaml` 的 `local_acp:`。也可用 `DEER_FLOW_ACP_CHECKPOINTER_PATH`、`DEER_FLOW_ACP_SESSION_STORE_PATH`、`DEER_FLOW_ACP_MAX_ACTIVE_RUNS` 和 `DEER_FLOW_ACP_RUN_TIMEOUT` 覆盖运行参数。Bridge 的 stdout 只承载 ACP JSON-RPC；daemon 日志写入独立轮转文件。
+
+## 外部 ACP Agent 对接（Codex / Claude Code）
 
 项目支持作为 **ACP client** 调用外部 agent。配置 `config.yaml` 的 `acp_agents:` 后，DeerFlow 会自动暴露内置工具 `invoke_acp_agent`，主 agent 可以把编码、审查、重构等任务交给外部 ACP agent 执行。
 

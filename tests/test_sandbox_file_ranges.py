@@ -94,3 +94,36 @@ def test_aio_directory_helpers_never_pass_nul_in_process_arguments(monkeypatch) 
 
     assert calls
     assert all("\0" not in argument for argv in calls for argument in argv)
+
+
+def test_aio_path_mutations_use_argument_safe_python_helpers(monkeypatch) -> None:
+    sandbox = AioSandbox("probe", "unused")
+    calls: list[tuple[list[str], str | bytes | None]] = []
+
+    def fake_exec(argv, *, input_data=None, text=True):
+        calls.append((argv, input_data))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "_docker_exec", fake_exec)
+
+    sandbox.delete_path("/mnt/user-data/workspace/old file.txt", recursive=False)
+    sandbox.move_path(
+        "/mnt/user-data/workspace/source file.txt",
+        "/mnt/user-data/workspace/archive/final file.txt",
+        overwrite=True,
+    )
+
+    assert calls[0][0] == [
+        "python3",
+        "-",
+        "/mnt/user-data/workspace/old file.txt",
+        "0",
+    ]
+    assert calls[1][0] == [
+        "python3",
+        "-",
+        "/mnt/user-data/workspace/source file.txt",
+        "/mnt/user-data/workspace/archive/final file.txt",
+        "1",
+    ]
+    assert all(isinstance(script, str) and "shutil" in script for _, script in calls)

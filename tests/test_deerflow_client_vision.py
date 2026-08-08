@@ -122,3 +122,17 @@ def test_deerflow_client_explicit_model_overrides_configured_default() -> None:
         client._ensure_agent(config)
 
     assert create_model.call_args.kwargs["name"] == "first-model"
+
+
+def test_deerflow_client_adds_client_mcp_tools_without_overriding_existing() -> None:
+    client = _client()
+    existing = SimpleNamespace(name="deerflow_tool")
+    client._additional_mcp_tools = [
+        SimpleNamespace(name="deerflow_tool"),
+        SimpleNamespace(name="codeg_read_file"),
+    ]
+
+    with patch("deerflow.tools.get_available_tools", return_value=[existing]):
+        tools = client._get_tools(model_name=None, subagent_enabled=False)
+
+    assert tools == [existing, client._additional_mcp_tools[1]]

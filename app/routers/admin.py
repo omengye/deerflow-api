@@ -64,6 +64,7 @@ from deerflow.skills.manager import (
     read_history,
     validate_skill_name,
 )
+from deerflow.subagents.builtins import BUILTIN_SUBAGENTS
 
 logger = logging.getLogger(__name__)
 
@@ -1497,6 +1498,29 @@ def _validate_subagent_models(config_data: dict[str, Any], config: SubagentsAppC
         )
 
 
+def _admin_subagents_response(
+    config: SubagentsAppConfig,
+    *,
+    include_write_metadata: bool = False,
+    reload_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the admin payload with stable metadata for the visual editor."""
+    payload: dict[str, Any] = {
+        "config": config.model_dump(),
+        "builtin_agents": [
+            {
+                "name": name,
+                "description": builtin.description,
+                "default_model": builtin.model,
+            }
+            for name, builtin in BUILTIN_SUBAGENTS.items()
+        ],
+    }
+    if include_write_metadata:
+        payload.update({"success": True, "reload": reload_result})
+    return payload
+
+
 def _validate_context_size(value: ContextSize, *, field: str) -> None:
     if value.type == "fraction":
         if not isinstance(value.value, (int, float)) or not 0 < float(value.value) <= 1:
@@ -1951,7 +1975,7 @@ async def get_admin_subagents():
     """Return validated built-in and custom subagent configuration."""
     config_data = _load_config_data(_config_path())
     config = SubagentsAppConfig.model_validate(config_data.get("subagents") or {})
-    return {"config": config.model_dump()}
+    return _admin_subagents_response(config)
 
 
 @router.put("/subagents")
@@ -1967,7 +1991,7 @@ async def update_admin_subagents(req: AdminSubagentsUpdateRequest = Body()):
     except Exception as exc:
         logger.exception("Admin subagents update wrote config but reload failed")
         raise HTTPException(status_code=500, detail=f"Subagents config saved but reload failed: {exc}") from exc
-    return {"success": True, "config": req.config.model_dump(), "reload": reload_result}
+    return _admin_subagents_response(req.config, include_write_metadata=True, reload_result=reload_result)
 
 
 @router.get("/memory")

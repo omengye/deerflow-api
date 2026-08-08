@@ -575,6 +575,110 @@ button:focus-visible {
   margin-bottom: 0;
 }
 
+.subagent-model-list {
+  display: grid;
+  gap: 10px;
+}
+
+.subagent-model-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 360px);
+  align-items: center;
+  gap: 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfcfb;
+  padding: 14px;
+  transition:
+    border-color 180ms ease,
+    background-color 180ms ease;
+}
+
+.subagent-model-row:hover,
+.subagent-model-row:focus-within {
+  border-color: var(--line-strong);
+  background: var(--surface);
+}
+
+.subagent-identity {
+  min-width: 0;
+}
+
+.subagent-name-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.subagent-name-line strong {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 14px;
+}
+
+.subagent-kind {
+  display: inline-flex;
+  min-height: 22px;
+  align-items: center;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  padding: 0 8px;
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.subagent-kind.custom {
+  background: #edf0fb;
+  color: #495b9a;
+}
+
+.subagent-kind.override {
+  background: var(--warn-soft);
+  color: #76500e;
+}
+
+.subagent-identity p {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.subagent-model-field {
+  min-width: 0;
+}
+
+.subagent-model-field small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-advanced {
+  margin-top: 14px;
+}
+
+.subagent-advanced .section-grid {
+  margin-top: 14px;
+}
+
+.subagent-empty {
+  margin: 0;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  padding: 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
 .panel {
   min-width: 0;
   padding: 18px;
@@ -1165,6 +1269,11 @@ pre {
 
   .memory-form-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .subagent-model-row {
+    grid-template-columns: 1fr;
+    gap: 12px;
   }
 }
 

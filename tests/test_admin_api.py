@@ -388,10 +388,23 @@ tool_groups: []
             },
         )
         self.assertEqual(subagents.status_code, 200)
+        self.assertTrue(subagents.json()["success"])
+        self.assertIsNone(subagents.json()["reload"])
         raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
         self.assertEqual(raw["title"]["max_words"], 8)
         self.assertEqual(raw["subagents"]["agents"]["general-purpose"]["model"], "base")
         self.assertEqual(raw["subagents"]["agents"]["general-purpose"]["description"], "Built-in override")
+
+    def test_get_subagents_includes_builtin_catalog_for_visual_editor(self) -> None:
+        client = self._client()
+
+        response = client.get("/api/admin/subagents", headers=self._auth_headers())
+
+        self.assertEqual(response.status_code, 200)
+        catalog = {agent["name"]: agent for agent in response.json()["builtin_agents"]}
+        self.assertEqual(set(catalog), {"general-purpose", "bash"})
+        self.assertEqual(catalog["general-purpose"]["default_model"], "inherit")
+        self.assertTrue(catalog["bash"]["description"])
 
     def test_title_and_subagents_reject_unknown_models(self) -> None:
         client = self._client()

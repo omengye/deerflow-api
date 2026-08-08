@@ -289,20 +289,26 @@
           <section class="panel">
             <div class="panel-header">
               <div>
-                <h3>Subagent 类型配置</h3>
-                <p>内置覆盖和自定义 Agent 分区编辑；保存前会由后端校验模型引用和字段范围。</p>
+                <h3>Subagent 模型分配</h3>
+                <p>为每个 Subagent 固定模型，或让它跟随主 Agent 当前使用的模型。</p>
               </div>
             </div>
-            <div class="section-grid">
-              <label>
-                <span>agents JSON</span>
-                <textarea id="subagentsAgentsEditor" class="json-editor compact-editor" spellcheck="false"></textarea>
-              </label>
-              <label>
-                <span>custom_agents JSON</span>
-                <textarea id="subagentsCustomEditor" class="json-editor compact-editor" spellcheck="false"></textarea>
-              </label>
-            </div>
+            <div id="subagentModelList" class="subagent-model-list" aria-live="polite"></div>
+            <p id="subagentModelEmpty" class="subagent-empty hidden">暂无可配置的 Subagent。</p>
+            <details class="memory-advanced subagent-advanced">
+              <summary>高级 JSON 配置</summary>
+              <p class="field-help">可继续编辑轮次、超时、工具、Skills、提示词和生成参数；模型下拉与这里的 <code>model</code> 字段会自动同步。</p>
+              <div class="section-grid">
+                <label>
+                  <span>内置 Agent 覆盖（agents）</span>
+                  <textarea id="subagentsAgentsEditor" class="json-editor compact-editor" spellcheck="false"></textarea>
+                </label>
+                <label>
+                  <span>自定义 Agent（custom_agents）</span>
+                  <textarea id="subagentsCustomEditor" class="json-editor compact-editor" spellcheck="false"></textarea>
+                </label>
+              </div>
+            </details>
           </section>
 
           <div class="section-grid">
