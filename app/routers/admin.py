@@ -1169,6 +1169,9 @@ def _admin_config_response(raw_config: dict[str, Any], path: Path) -> dict[str, 
                     # to 600s; an explicit null means "wait indefinitely") so operators
                     # can tell a hung ACP agent from a slow one without reading the file.
                     "timeout_seconds": config.get("timeout_seconds", 600),
+                    "artifact_allow_insecure_http": bool(
+                        config.get("artifact_allow_insecure_http", False)
+                    ),
                     "environment_keys": sorted(str(key) for key in (config.get("env") or {}).keys())
                     if isinstance(config.get("env"), dict)
                     else [],

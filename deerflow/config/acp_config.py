@@ -32,6 +32,32 @@ class ACPAgentConfig(BaseModel):
             "returned to the caller. Set to None to wait indefinitely."
         ),
     )
+    artifact_allowed_hosts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Exact host[:port] values from which ACP resource links may be downloaded. "
+            "An empty list rejects remote artifact downloads."
+        ),
+    )
+    artifact_allow_insecure_http: bool = Field(
+        default=False,
+        description=(
+            "Allow HTTP artifact links from artifact_allowed_hosts. Disabled by default; "
+            "enable only for explicitly trusted private-network storage."
+        ),
+    )
+    artifact_max_file_size_mb: int = Field(
+        default=200,
+        ge=1,
+        le=2048,
+        description="Maximum size of one downloaded ACP artifact in MiB.",
+    )
+    artifact_download_timeout_seconds: float = Field(
+        default=120,
+        gt=0,
+        le=900,
+        description="Timeout for downloading one ACP resource link.",
+    )
 
 
 _acp_agents: dict[str, ACPAgentConfig] = {}

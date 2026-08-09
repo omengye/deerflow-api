@@ -12,6 +12,7 @@ from acp import RequestError, schema
 
 from deerflow.config import get_app_config
 
+from .artifact_publisher import RustFSArtifactPublisher
 from .client_mcp import ClientMCPBinding, normalize_client_mcp_servers
 from .config import LocalACPConfig
 from .event_mapper import ACPEventMapper, _display_text, _message_uuid
@@ -36,6 +37,9 @@ class DeerFlowACPAgent:
         self._active: dict[str, asyncio.Task[Any]] = {}
         self._active_lock = asyncio.Lock()
         self._client_mcp_sessions: set[str] = set()
+        self._artifact_publisher = (
+            RustFSArtifactPublisher(config.artifacts) if config.artifacts is not None else None
+        )
 
     def on_connect(self, conn: Any) -> None:
         self._connection = conn
@@ -388,9 +392,23 @@ class DeerFlowACPAgent:
                 raise RequestError(-32001, "Session already has an active prompt", {"sessionId": session_id})
             self._active[session_id] = task
 
+        artifact_run_id = uuid.uuid4().hex
+        artifact_publisher = self._artifact_publisher
+        artifact_resolver = (
+            (
+                lambda path: artifact_publisher.publish(
+                    session_id,
+                    artifact_run_id,
+                    path,
+                )
+            )
+            if artifact_publisher is not None
+            else None
+        )
         mapper = ACPEventMapper(
             session_id,
             lambda update: self._session_update(session_id, update),
+            artifact_resolver=artifact_resolver,
         )
         cancelled = False
         try:

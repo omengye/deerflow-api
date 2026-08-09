@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import logging
 import mimetypes
 import uuid
 from collections.abc import Awaitable, Callable
@@ -16,7 +18,13 @@ from acp import schema
 from deerflow.config.paths import get_paths
 
 SendUpdate = Callable[[Any], Awaitable[None]]
-ArtifactResolver = Callable[[str], schema.ResourceContentBlock | None]
+ArtifactResolver = Callable[
+    [str],
+    schema.ResourceContentBlock
+    | None
+    | Awaitable[schema.ResourceContentBlock | None],
+]
+logger = logging.getLogger(__name__)
 _MESSAGE_NAMESPACE = uuid.UUID("d0af913a-b872-4e87-9b31-3fc58f03b3f8")
 _OUTPUT_PREFIX = "/mnt/user-data/outputs/"
 _MAX_TOOL_TEXT = 20_000
@@ -295,7 +303,29 @@ class ACPEventMapper:
             for raw in artifacts:
                 if not isinstance(raw, str) or raw in self._seen_artifacts:
                     continue
-                block = self._artifact_resolver(raw)
+                try:
+                    resolved = self._artifact_resolver(raw)
+                    block = (
+                        await cast(
+                            Awaitable[schema.ResourceContentBlock | None],
+                            resolved,
+                        )
+                        if inspect.isawaitable(resolved)
+                        else resolved
+                    )
+                except Exception as exc:
+                    message = f"Failed to publish artifact {raw}: {exc}"
+                    logger.error("ACP artifact publishing failed: %s", message)
+                    self.failure_message = message
+                    self._seen_artifacts.add(raw)
+                    await self._send(
+                        schema.AgentMessageChunk(
+                            session_update="agent_message_chunk",
+                            content=acp.text_block(message),
+                            message_id=_message_uuid("artifact-error", raw),
+                        )
+                    )
+                    continue
                 if block is None:
                     continue
                 self._seen_artifacts.add(raw)

@@ -10,6 +10,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod gateway;
+mod remote;
+
 const HANDSHAKE_VERSION: &str = "DFACP/1";
 const ENDPOINT_FILENAME: &str = "endpoint.json";
 const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -22,13 +25,13 @@ type AnyError = Box<dyn Error + Send + Sync>;
 type Result<T> = std::result::Result<T, AnyError>;
 
 #[derive(Debug, Deserialize)]
-struct Endpoint {
-    host: String,
-    port: u16,
-    token: String,
-    pid: u32,
-    build_id: String,
-    config_path: String,
+pub(crate) struct Endpoint {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) token: String,
+    pub(crate) pid: u32,
+    pub(crate) build_id: String,
+    pub(crate) config_path: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +40,8 @@ enum Mode {
     Status,
     Start,
     Stop,
+    Gateway,
+    Remote,
 }
 
 #[derive(Debug)]
@@ -47,6 +52,11 @@ struct Cli {
     daemon: Option<PathBuf>,
     runtime_dir: Option<PathBuf>,
     auto_start: bool,
+    gateway_listen: String,
+    gateway_workspace: Option<PathBuf>,
+    gateway_path: String,
+    remote_url: Option<String>,
+    token_env: String,
 }
 
 #[derive(Debug)]
@@ -76,12 +86,20 @@ fn print_help() {
         "deerflow-acp - native stdio bridge for the local DeerFlow ACP daemon\n\n\
 Usage:\n  deerflow-acp [--config PATH] [--python PATH] [--daemon PATH] [--no-auto-start]\n  \
 deerflow-acp --status [--config PATH]\n  deerflow-acp --start-daemon [--config PATH]\n  \
-deerflow-acp --stop-daemon [--config PATH]\n\n\
+deerflow-acp --stop-daemon [--config PATH]\n  \
+deerflow-acp --gateway --workspace PATH [--listen ADDR] [--config PATH]\n  \
+deerflow-acp --remote URL [--token-env NAME]\n\n\
 Options:\n  --config PATH       DeerFlow config.yaml used when starting the daemon\n  \
 --python PATH       Python interpreter used to run -m deerflow.acp.daemon\n  \
 --daemon PATH       Explicit deerflow-acpd executable\n  --runtime-dir PATH  Override daemon endpoint directory\n  \
 --no-auto-start      Fail instead of starting a missing daemon\n  --status             Check daemon status\n  \
 --start-daemon       Start the daemon without entering ACP proxy mode\n  --stop-daemon        Stop the daemon\n  \
+--gateway           Expose the local daemon through ACP HTTP + SSE\n  \
+--listen ADDR       Gateway listen address (default 127.0.0.1:8787)\n  \
+--workspace PATH    Fixed local workspace used by remote ACP sessions\n  \
+--gateway-path PATH ACP HTTP endpoint path (default /acp)\n  \
+--remote URL        Bridge stdio to a remote ACP HTTP + SSE endpoint\n  \
+--token-env NAME    Environment variable containing the fixed gateway token\n  \
 -h, --help           Show this help\n  -V, --version        Show bridge version"
     );
 }
@@ -93,6 +111,11 @@ fn parse_cli() -> Result<Cli> {
     let mut daemon = None;
     let mut runtime_dir = None;
     let mut auto_start = true;
+    let mut gateway_listen = "127.0.0.1:8787".to_owned();
+    let mut gateway_workspace = None;
+    let mut gateway_path = "/acp".to_owned();
+    let mut remote_url = None;
+    let mut token_env = "DEER_FLOW_ACP_GATEWAY_TOKEN".to_owned();
     let mut args = env::args_os().skip(1);
     while let Some(raw) = args.next() {
         let value = raw.to_string_lossy();
@@ -121,6 +144,42 @@ fn parse_cli() -> Result<Cli> {
             "--status" => set_mode(&mut mode, Mode::Status)?,
             "--start-daemon" => set_mode(&mut mode, Mode::Start)?,
             "--stop-daemon" => set_mode(&mut mode, Mode::Stop)?,
+            "--gateway" => set_mode(&mut mode, Mode::Gateway)?,
+            "--listen" => {
+                gateway_listen = args
+                    .next()
+                    .ok_or("--listen requires an address")?
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            "--workspace" => {
+                gateway_workspace = Some(PathBuf::from(
+                    args.next().ok_or("--workspace requires a path")?,
+                ));
+            }
+            "--gateway-path" => {
+                gateway_path = args
+                    .next()
+                    .ok_or("--gateway-path requires a path")?
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            "--remote" => {
+                set_mode(&mut mode, Mode::Remote)?;
+                remote_url = Some(
+                    args.next()
+                        .ok_or("--remote requires an ACP endpoint URL")?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--token-env" => {
+                token_env = args
+                    .next()
+                    .ok_or("--token-env requires an environment variable name")?
+                    .to_string_lossy()
+                    .into_owned();
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -139,6 +198,11 @@ fn parse_cli() -> Result<Cli> {
         daemon,
         runtime_dir,
         auto_start,
+        gateway_listen,
+        gateway_workspace,
+        gateway_path,
+        remote_url,
+        token_env,
     })
 }
 
@@ -199,9 +263,20 @@ fn endpoint_path(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join(ENDPOINT_FILENAME)
 }
 
-fn load_endpoint(path: &Path) -> Result<Endpoint> {
+pub(crate) fn load_endpoint(path: &Path) -> Result<Endpoint> {
     let content = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&content)?)
+}
+
+pub(crate) fn gateway_token(name: &str) -> Result<String> {
+    let token = env::var(name).map_err(|_| format!("{name} is not set"))?;
+    if token.len() < 32 {
+        return Err(format!("{name} must contain at least 32 characters").into());
+    }
+    if token.chars().any(char::is_whitespace) {
+        return Err(format!("{name} must not contain whitespace").into());
+    }
+    Ok(token)
 }
 
 fn normalize_path(path: &Path) -> Result<String> {
@@ -649,7 +724,7 @@ fn proxy(mut stream: TcpStream) -> Result<()> {
     Ok(())
 }
 
-fn run() -> Result<()> {
+async fn run() -> Result<()> {
     let mut cli = parse_cli()?;
     if let Some(config) = &cli.config
         && !config.is_file()
@@ -663,14 +738,27 @@ fn run() -> Result<()> {
         // it is not a valid Linux path.
         cli.config = Some(strip_windows_verbatim_prefix(fs::canonicalize(config)?));
     }
-    let runtime_dir = runtime_dir(cli.runtime_dir.as_deref())?;
-    let path = endpoint_path(&runtime_dir);
-
     match cli.mode {
-        Mode::Proxy => proxy(connect_proxy(&cli, &path)?),
+        Mode::Remote => {
+            let url = cli
+                .remote_url
+                .as_deref()
+                .ok_or("--remote requires an ACP endpoint URL")?;
+            remote::run(url, &cli.token_env).await
+        }
+        Mode::Proxy | Mode::Status | Mode::Start | Mode::Stop | Mode::Gateway => {
+            let runtime_dir = runtime_dir(cli.runtime_dir.as_deref())?;
+            let path = endpoint_path(&runtime_dir);
+            run_local_mode(&cli, &path).await
+        }
+    }
+}
+
+async fn run_local_mode(cli: &Cli, path: &Path) -> Result<()> {
+    match cli.mode {
+        Mode::Proxy => proxy(connect_proxy(cli, path)?),
         Mode::Status => {
-            let endpoint =
-                load_endpoint(&path).map_err(|_| "DeerFlow ACP daemon is not running")?;
+            let endpoint = load_endpoint(path).map_err(|_| "DeerFlow ACP daemon is not running")?;
             validate_config(&endpoint, cli.config.as_deref())?;
             let response = status(&endpoint).map_err(|error| error.to_string())?;
             println!(
@@ -680,7 +768,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Mode::Start => {
-            let endpoint = ensure_running(&cli, &path)?;
+            let endpoint = ensure_running(cli, path)?;
             println!(
                 "running pid={} build={} endpoint={}:{}",
                 endpoint.pid, endpoint.build_id, endpoint.host, endpoint.port
@@ -688,8 +776,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Mode::Stop => {
-            let endpoint =
-                load_endpoint(&path).map_err(|_| "DeerFlow ACP daemon is not running")?;
+            let endpoint = load_endpoint(path).map_err(|_| "DeerFlow ACP daemon is not running")?;
             validate_config(&endpoint, cli.config.as_deref())?;
             connect_command(&endpoint, "STOP").map_err(|error| error.to_string())?;
             if !wait_for_process_exit(endpoint.pid, stop_timeout())? {
@@ -706,20 +793,46 @@ fn run() -> Result<()> {
                     .into());
                 }
             }
-            if let Ok(current) = load_endpoint(&path)
+            if let Ok(current) = load_endpoint(path)
                 && current.pid == endpoint.pid
                 && current.token == endpoint.token
             {
-                fs::remove_file(&path)?;
+                fs::remove_file(path)?;
             }
             println!("stopped");
             Ok(())
         }
+        Mode::Gateway => {
+            ensure_running(cli, path)?;
+            let workspace = cli
+                .gateway_workspace
+                .as_deref()
+                .ok_or("--gateway requires --workspace PATH")?;
+            fs::create_dir_all(workspace)?;
+            let workspace = strip_windows_verbatim_prefix(fs::canonicalize(workspace)?);
+            let listen = cli
+                .gateway_listen
+                .parse::<SocketAddr>()
+                .map_err(|error| format!("invalid --listen address: {error}"))?;
+            if !cli.gateway_path.starts_with('/') {
+                return Err("--gateway-path must begin with /".into());
+            }
+            gateway::run(
+                listen,
+                path.to_path_buf(),
+                workspace,
+                gateway_token(&cli.token_env)?,
+                cli.gateway_path.clone(),
+            )
+            .await
+        }
+        Mode::Remote => unreachable!("remote mode is handled before local endpoint discovery"),
     }
 }
 
-fn main() {
-    if let Err(error) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
         eprintln!("deerflow-acp: {error}");
         std::process::exit(1);
     }

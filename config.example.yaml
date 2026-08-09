@@ -124,6 +124,21 @@ local_acp:
   # by the client. Enabling this adds external command, outbound connection, and
   # tool surfaces and therefore opts out of the strict file-only boundary.
   accept_client_mcp_servers: false
+  # Optional remote-artifact publishing. Only files explicitly passed to
+  # present_files are uploaded. Credentials are read from
+  # DEER_FLOW_ACP_ARTIFACT_ACCESS_KEY / DEER_FLOW_ACP_ARTIFACT_SECRET_KEY and
+  # are never exposed to the model.
+  artifacts:
+    enabled: false
+    endpoint_url: https://rustfs.example.com
+    # Trusted private-network alternative: http://192.168.1.190:9000
+    bucket: deerflow-acp
+    region: us-east-1
+    prefix: acp-artifacts
+    addressing_style: path
+    presigned_get_expires_seconds: 900
+    max_file_size_mb: 200
+    verify_ssl: true
 
 stream_bridge:
   # memory: single-process development; redis: cross-process replay for SSE reconnects.
@@ -231,6 +246,31 @@ sandbox:
 #     model: null
 #     auto_approve_permissions: false
 #     timeout_seconds: 600
+#     # Required before ACP resource links are automatically downloaded.
+#     artifact_allowed_hosts:
+#       - rustfs.example.com
+#     # HTTP remains disabled unless this is explicitly true.
+#     artifact_allow_insecure_http: false
+#     artifact_max_file_size_mb: 200
+#     artifact_download_timeout_seconds: 120
+#   remote_deerflow:
+#     # The native bridge remains an ACP stdio agent to this Python process and
+#     # converts the connection to the official ACP HTTP + SSE transport.
+#     command: deerflow-acp
+#     args:
+#       - --remote
+#       - https://local-acp.example.com/acp
+#     env:
+#       DEER_FLOW_ACP_GATEWAY_TOKEN: $DEER_FLOW_ACP_GATEWAY_TOKEN
+#     description: "Remote DeerFlow through the authenticated ACP gateway"
+#     auto_approve_permissions: false
+#     timeout_seconds: 900
+#     artifact_allowed_hosts:
+#       - rustfs.example.com
+#     # Trusted LAN RustFS alternative:
+#     # artifact_allowed_hosts:
+#     #   - 192.168.1.190:9000
+#     # artifact_allow_insecure_http: true
 #   claude_code:
 #     command: claude-agent-acp
 #     args: []

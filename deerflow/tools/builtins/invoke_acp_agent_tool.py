@@ -4,11 +4,15 @@ import asyncio
 import logging
 import os
 import shutil
+import uuid
+from pathlib import Path
 from typing import Annotated, Any
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, InjectedToolArg, StructuredTool
 from pydantic import BaseModel, Field
+
+from .acp_artifact_downloader import ACPArtifactDownloader, DownloadedACPArtifact
 
 logger = logging.getLogger(__name__)
 
@@ -156,13 +160,14 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
         "IMPORTANT: ACP agents operate in their own independent workspace. "
         "Do NOT include /mnt/user-data paths in the prompt. "
         "Give the agent a self-contained task description — it will produce results in its own workspace. "
-        "After the agent completes, its output files are accessible at /mnt/acp-workspace/ (read-only)."
+        "ACP resource links are downloaded into /mnt/acp-workspace/ (read-only) before this tool returns."
     )
 
     # Capture agents in closure so the function can reference it
     _agents = dict(agents)
+    _agent_locks = {name: asyncio.Lock() for name in _agents}
 
-    async def _invoke(agent: str, prompt: str, config: Annotated[RunnableConfig, InjectedToolArg] = None) -> str:
+    async def _invoke_unlocked(agent: str, prompt: str, config: Annotated[RunnableConfig, InjectedToolArg] = None) -> str:
         logger.info("Invoking ACP agent %s (prompt length: %d)", agent, len(prompt))
         logger.debug("Invoking ACP agent %s with prompt: %.200s%s", agent, prompt, "..." if len(prompt) > 200 else "")
         if agent not in _agents:
@@ -171,6 +176,15 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
 
         agent_config = _agents[agent]
         thread_id: str | None = ((config or {}).get("configurable") or {}).get("thread_id")
+        physical_cwd = _get_work_dir(thread_id)
+        artifact_downloader = ACPArtifactDownloader(
+            Path(physical_cwd),
+            uuid.uuid4().hex,
+            allowed_hosts=agent_config.artifact_allowed_hosts,
+            allow_insecure_http=agent_config.artifact_allow_insecure_http,
+            max_bytes=agent_config.artifact_max_file_size_mb * 1024 * 1024,
+            timeout_seconds=agent_config.artifact_download_timeout_seconds,
+        )
 
         try:
             from acp import PROTOCOL_VERSION, Client, text_block
@@ -183,6 +197,8 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
 
             def __init__(self) -> None:
                 self._chunks: list[str] = []
+                self.artifacts: list[DownloadedACPArtifact] = []
+                self.artifact_errors: list[str] = []
 
             @property
             def collected_text(self) -> str:
@@ -190,12 +206,19 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
 
             async def session_update(self, session_id: str, update, **kwargs) -> None:  # type: ignore[override]
                 try:
-                    from acp.schema import TextContentBlock
+                    from acp.schema import ResourceContentBlock, TextContentBlock
 
                     if hasattr(update, "content") and isinstance(update.content, TextContentBlock):
                         self._chunks.append(update.content.text)
-                except Exception:
-                    pass
+                    elif hasattr(update, "content") and isinstance(update.content, ResourceContentBlock):
+                        try:
+                            self.artifacts.append(await artifact_downloader.download(update.content))
+                        except Exception as exc:
+                            self.artifact_errors.append(
+                                f"{update.content.name}: {type(exc).__name__}: {exc}"
+                            )
+                except Exception as exc:
+                    logger.warning("Failed to process ACP session update: %s", exc)
 
             async def request_permission(self, options, session_id: str, tool_call, **kwargs):  # type: ignore[override]
                 response = _build_permission_response(options, auto_approve=agent_config.auto_approve_permissions)
@@ -209,7 +232,6 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
         client = _CollectingClient()
         cmd = agent_config.command
         args = agent_config.args or []
-        physical_cwd = _get_work_dir(thread_id)
         try:
             mcp_servers = _build_acp_mcp_servers()
         except ValueError as exc:
@@ -243,6 +265,19 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
                         prompt=[text_block(prompt)],
                     )
             result = client.collected_text
+            if client.artifact_errors:
+                details = "; ".join(client.artifact_errors)
+                return f"Error invoking ACP agent '{agent}': artifact download failed: {details}"
+            if client.artifacts:
+                artifact_lines = [
+                    f"- {item.virtual_path} ({item.size} bytes, sha256={item.sha256})"
+                    for item in client.artifacts
+                ]
+                result = (
+                    result.rstrip()
+                    + "\n\nACP artifacts downloaded:\n"
+                    + "\n".join(artifact_lines)
+                ).lstrip()
             logger.info("ACP agent '%s' returned %s", agent, result[:1000])
             logger.info("ACP agent '%s' returned %d characters", agent, len(result))
             return result or "(no response)"
@@ -255,6 +290,17 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
         except Exception as e:
             logger.error("ACP agent '%s' invocation failed: %s", agent, e)
             return _format_invocation_error(agent, cmd, e)
+
+    async def _invoke(
+        agent: str,
+        prompt: str,
+        config: Annotated[RunnableConfig, InjectedToolArg] = None,
+    ) -> str:
+        lock = _agent_locks.get(agent)
+        if lock is None:
+            return await _invoke_unlocked(agent, prompt, config)
+        async with lock:
+            return await _invoke_unlocked(agent, prompt, config)
 
     return StructuredTool.from_function(
         name="invoke_acp_agent",

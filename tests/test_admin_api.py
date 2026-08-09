@@ -228,7 +228,12 @@ tool_groups: []
         """
         raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
         raw["acp_agents"] = {
-            "codex": {"command": "codex-acp", "description": "Codex via ACP", "timeout_seconds": 120},
+            "codex": {
+                "command": "codex-acp",
+                "description": "Codex via ACP",
+                "timeout_seconds": 120,
+                "artifact_allow_insecure_http": True,
+            },
             "claude_code": {"command": "claude-agent-acp", "description": "Claude Code via ACP"},
             "unbounded": {"command": "other-acp", "description": "No timeout", "timeout_seconds": None},
         }
@@ -245,6 +250,8 @@ tool_groups: []
         self.assertEqual(agents["claude_code"]["timeout_seconds"], 600)
         # Explicit null means unbounded and must not be reported as the default.
         self.assertIsNone(agents["unbounded"]["timeout_seconds"])
+        self.assertTrue(agents["codex"]["artifact_allow_insecure_http"])
+        self.assertFalse(agents["claude_code"]["artifact_allow_insecure_http"])
 
     def test_update_models_preserves_redacted_existing_secret(self) -> None:
         client = self._client()

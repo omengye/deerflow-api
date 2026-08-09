@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -70,6 +71,22 @@ def _as_bool(value: Any, *, name: str) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalACPArtifactConfig:
+    """S3-compatible artifact publishing settings for remote ACP clients."""
+
+    endpoint_url: str
+    bucket: str
+    access_key: str
+    secret_key: str
+    region: str = "us-east-1"
+    prefix: str = "acp-artifacts"
+    presigned_get_expires_seconds: int = 900
+    max_file_size_bytes: int = 200 * 1024 * 1024
+    addressing_style: str = "path"
+    verify_ssl: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class LocalACPConfig:
     """Resolved settings for one local ACP stdio process."""
 
@@ -93,6 +110,7 @@ class LocalACPConfig:
     agent_name: str | None = None
     enable_bash: bool = False
     accept_client_mcp_servers: bool = False
+    artifacts: LocalACPArtifactConfig | None = None
 
     @classmethod
     def from_file(cls, config_path: str | None = None) -> "LocalACPConfig":
@@ -106,6 +124,9 @@ class LocalACPConfig:
         local = raw.get("local_acp") or {}
         if not isinstance(api, dict) or not isinstance(local, dict):
             raise ValueError("api and local_acp configuration sections must be objects")
+        artifact_raw = local.get("artifacts") or {}
+        if not isinstance(artifact_raw, dict):
+            raise ValueError("local_acp.artifacts must be an object")
 
         base_dir = resolved.parent
         data_dir = _resolve_path(str(_value(api, "data_dir", "./data")), base_dir)
@@ -149,6 +170,84 @@ class LocalACPConfig:
         if recursion_limit < 10:
             raise ValueError("local_acp.recursion_limit must be at least 10")
 
+        artifact_enabled = _as_bool(
+            os.getenv(
+                "DEER_FLOW_ACP_ARTIFACTS_ENABLED",
+                _value(artifact_raw, "enabled", False),
+            ),
+            name="local_acp.artifacts.enabled",
+        )
+        artifact_config: LocalACPArtifactConfig | None = None
+        if artifact_enabled:
+            endpoint_url = str(
+                os.getenv(
+                    "DEER_FLOW_ACP_ARTIFACT_ENDPOINT",
+                    _value(artifact_raw, "endpoint_url", ""),
+                )
+            ).strip().rstrip("/")
+            bucket = str(
+                os.getenv(
+                    "DEER_FLOW_ACP_ARTIFACT_BUCKET",
+                    _value(artifact_raw, "bucket", ""),
+                )
+            ).strip()
+            access_key = os.getenv("DEER_FLOW_ACP_ARTIFACT_ACCESS_KEY", "").strip()
+            secret_key = os.getenv("DEER_FLOW_ACP_ARTIFACT_SECRET_KEY", "").strip()
+            if urlparse(endpoint_url).scheme not in {"http", "https"}:
+                raise ValueError(
+                    "local_acp.artifacts.endpoint_url must be an http(s) URL"
+                )
+            if not bucket:
+                raise ValueError("local_acp.artifacts.bucket must not be empty")
+            if not access_key or not secret_key:
+                raise ValueError(
+                    "DEER_FLOW_ACP_ARTIFACT_ACCESS_KEY and "
+                    "DEER_FLOW_ACP_ARTIFACT_SECRET_KEY are required when artifacts are enabled"
+                )
+            prefix = str(_value(artifact_raw, "prefix", "acp-artifacts")).strip("/")
+            if not prefix or any(part in {"", ".", ".."} for part in prefix.split("/")):
+                raise ValueError("local_acp.artifacts.prefix is invalid")
+            expires = _env_int(
+                "DEER_FLOW_ACP_ARTIFACT_GET_EXPIRES",
+                int(_value(artifact_raw, "presigned_get_expires_seconds", 900)),
+            )
+            max_size_mb = _env_int(
+                "DEER_FLOW_ACP_ARTIFACT_MAX_FILE_SIZE_MB",
+                int(_value(artifact_raw, "max_file_size_mb", 200)),
+            )
+            if not 60 <= expires <= 604_800:
+                raise ValueError(
+                    "local_acp.artifacts.presigned_get_expires_seconds must be between 60 and 604800"
+                )
+            if max_size_mb < 1:
+                raise ValueError("local_acp.artifacts.max_file_size_mb must be at least 1")
+            addressing_style = str(
+                _value(artifact_raw, "addressing_style", "path")
+            ).strip()
+            if addressing_style not in {"path", "virtual", "auto"}:
+                raise ValueError(
+                    "local_acp.artifacts.addressing_style must be path, virtual, or auto"
+                )
+            artifact_config = LocalACPArtifactConfig(
+                endpoint_url=endpoint_url,
+                bucket=bucket,
+                access_key=access_key,
+                secret_key=secret_key,
+                region=str(_value(artifact_raw, "region", "us-east-1")).strip()
+                or "us-east-1",
+                prefix=prefix,
+                presigned_get_expires_seconds=expires,
+                max_file_size_bytes=max_size_mb * 1024 * 1024,
+                addressing_style=addressing_style,
+                verify_ssl=_as_bool(
+                    os.getenv(
+                        "DEER_FLOW_ACP_ARTIFACT_VERIFY_SSL",
+                        _value(artifact_raw, "verify_ssl", True),
+                    ),
+                    name="local_acp.artifacts.verify_ssl",
+                ),
+            )
+
         result = cls(
             config_path=resolved,
             checkpointer_path=_resolve_path(checkpointer_raw, base_dir),
@@ -190,6 +289,7 @@ class LocalACPConfig:
                 ),
                 name="local_acp.accept_client_mcp_servers",
             ),
+            artifacts=artifact_config,
         )
         return result
 

@@ -136,6 +136,37 @@ local_acp:
     assert "DEER_FLOW_CONFIG_PATH" not in os.environ
 
 
+def test_config_loads_optional_rustfs_artifact_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+api:
+  data_dir: ./data
+local_acp:
+  artifacts:
+    enabled: true
+    endpoint_url: https://rustfs.example.test
+    bucket: deerflow-acp
+    prefix: test-artifacts
+    max_file_size_mb: 12
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEER_FLOW_ACP_ARTIFACT_ACCESS_KEY", "access")
+    monkeypatch.setenv("DEER_FLOW_ACP_ARTIFACT_SECRET_KEY", "secret")
+
+    config = LocalACPConfig.from_file(str(config_path))
+
+    assert config.artifacts is not None
+    assert config.artifacts.endpoint_url == "https://rustfs.example.test"
+    assert config.artifacts.bucket == "deerflow-acp"
+    assert config.artifacts.prefix == "test-artifacts"
+    assert config.artifacts.max_file_size_bytes == 12 * 1024 * 1024
+
+
 @pytest.fixture
 def store(tmp_path: Path):
     result = LocalACPSessionStore(tmp_path / "sessions.db")
@@ -686,6 +717,30 @@ async def test_event_mapper_deduplicates_cumulative_reasoning_and_artifacts() ->
     assert thoughts == ["one", " two"]
     assert len(resources) == 1
     assert len(plans) == 1
+
+
+@pytest.mark.asyncio
+async def test_event_mapper_waits_for_async_artifact_publication() -> None:
+    updates: list[Any] = []
+    published: list[str] = []
+
+    async def send(update: Any) -> None:
+        updates.append(update)
+
+    async def resolve(path: str):
+        await asyncio.sleep(0)
+        published.append(path)
+        return acp.resource_link_block("report.txt", "https://rustfs.test/report.txt")
+
+    mapper = ACPEventMapper("session-1", send, artifact_resolver=resolve)
+    await mapper.handle(
+        SimpleNamespace(type="values", data={"artifacts": ["/out"], "todos": []})
+    )
+
+    assert published == ["/out"]
+    resources = [update for update in updates if isinstance(update, schema.AgentMessageChunk)]
+    assert len(resources) == 1
+    assert resources[0].content.uri == "https://rustfs.test/report.txt"
 
 
 @pytest.mark.asyncio
