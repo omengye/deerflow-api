@@ -4,9 +4,11 @@ import asyncio
 import logging
 import os
 import shutil
+import time
 import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, InjectedToolArg, StructuredTool
@@ -15,6 +17,130 @@ from pydantic import BaseModel, Field
 from .acp_artifact_downloader import ACPArtifactDownloader, DownloadedACPArtifact
 
 logger = logging.getLogger(__name__)
+
+_ACP_LIVE_BATCH_DELAY_SECONDS = 0.04
+_ACP_LIVE_BATCH_MAX_CHARS = 128
+_LiveEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+class _ACPProgressEmitter:
+    """Forward ACP chunks to the live run stream without flooding its backend."""
+
+    def __init__(
+        self,
+        callback: _LiveEventCallback | None,
+        *,
+        task_id: str,
+        agent: str,
+    ) -> None:
+        self._callback = callback
+        self._task_id = task_id
+        self._agent = agent
+        self._queue: asyncio.Queue[tuple[str, str] | None] | None = (
+            asyncio.Queue() if callback is not None else None
+        )
+        self._worker: asyncio.Task[None] | None = None
+        self._finished = False
+
+    async def start(self) -> None:
+        if self._callback is None or self._worker is not None:
+            return
+        self._worker = asyncio.create_task(
+            self._run(),
+            name=f"acp-progress-{self._task_id}",
+        )
+        await self._emit(
+            {
+                "type": "subagent_started",
+                "task_id": self._task_id,
+                "name": self._agent,
+                "description": f"ACP agent: {self._agent}",
+            }
+        )
+
+    def add_text(self, event_type: str, text: str) -> None:
+        queue = self._queue
+        if queue is None or self._finished or not text:
+            return
+        queue.put_nowait((event_type, text))
+
+    async def finish(self, event_type: str, **details: Any) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        queue = self._queue
+        if queue is not None:
+            queue.put_nowait(None)
+        if self._worker is not None:
+            await self._worker
+            self._worker = None
+        if self._callback is not None:
+            await self._emit(
+                {
+                    "type": event_type,
+                    "task_id": self._task_id,
+                    "agent": self._agent,
+                    **details,
+                }
+            )
+
+    async def _run(self) -> None:
+        queue = self._queue
+        if queue is None:
+            return
+        loop = asyncio.get_running_loop()
+        stopped = False
+        while not stopped:
+            item = await queue.get()
+            if item is None:
+                return
+
+            event_type, text = item
+            batch: list[tuple[str, str]] = [(event_type, text)]
+            batch_chars = len(text)
+            deadline = loop.time() + _ACP_LIVE_BATCH_DELAY_SECONDS
+            while batch_chars < _ACP_LIVE_BATCH_MAX_CHARS:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except TimeoutError:
+                    break
+                if item is None:
+                    stopped = True
+                    break
+                event_type, text = item
+                batch_chars += len(text)
+                if batch[-1][0] == event_type:
+                    previous_type, previous_text = batch[-1]
+                    batch[-1] = (previous_type, previous_text + text)
+                else:
+                    batch.append((event_type, text))
+
+            for event_type, text in batch:
+                field = "thinking" if event_type == "thinking_chunk" else "content"
+                await self._emit(
+                    {
+                        "type": event_type,
+                        "task_id": self._task_id,
+                        "agent": self._agent,
+                        field: text,
+                    }
+                )
+
+    async def _emit(self, event: dict[str, Any]) -> None:
+        callback = self._callback
+        if callback is None:
+            return
+        try:
+            await callback(event)
+        except Exception:
+            logger.warning(
+                "Failed to publish live ACP progress for agent %s",
+                self._agent,
+                exc_info=True,
+            )
 
 
 class _InvokeACPAgentInput(BaseModel):
@@ -44,7 +170,10 @@ def _get_work_dir(thread_id: str | None) -> str:
         try:
             work_dir = paths.acp_workspace_dir(thread_id)
         except ValueError:
-            logger.warning("Invalid thread_id %r for ACP workspace, falling back to global", thread_id)
+            logger.warning(
+                "Invalid thread_id %r for ACP workspace, falling back to global",
+                thread_id,
+            )
             work_dir = paths.base_dir / "acp-workspace"
     else:
         work_dir = paths.base_dir / "acp-workspace"
@@ -81,17 +210,29 @@ def _build_acp_mcp_servers() -> list[dict[str, Any]]:
 
         if transport_type == "stdio":
             if not server_config.command:
-                raise ValueError(f"MCP server '{name}' with stdio transport requires 'command' field")
+                raise ValueError(
+                    f"MCP server '{name}' with stdio transport requires 'command' field"
+                )
             payload["command"] = server_config.command
             payload["args"] = server_config.args
-            payload["env"] = [{"name": key, "value": value} for key, value in server_config.env.items()]
+            payload["env"] = [
+                {"name": key, "value": value}
+                for key, value in server_config.env.items()
+            ]
         elif transport_type in ("http", "sse"):
             if not server_config.url:
-                raise ValueError(f"MCP server '{name}' with {transport_type} transport requires 'url' field")
+                raise ValueError(
+                    f"MCP server '{name}' with {transport_type} transport requires 'url' field"
+                )
             payload["url"] = server_config.url
-            payload["headers"] = [{"name": key, "value": value} for key, value in server_config.headers.items()]
+            payload["headers"] = [
+                {"name": key, "value": value}
+                for key, value in server_config.headers.items()
+            ]
         else:
-            raise ValueError(f"MCP server '{name}' has unsupported transport type: {transport_type}")
+            raise ValueError(
+                f"MCP server '{name}' has unsupported transport type: {transport_type}"
+            )
 
         mcp_servers.append(payload)
 
@@ -133,7 +274,9 @@ def _format_invocation_error(agent: str, cmd: str, exc: Exception) -> str:
     if not isinstance(exc, FileNotFoundError):
         return f"Error invoking ACP agent '{agent}': {exc}"
 
-    message = f"Error invoking ACP agent '{agent}': Command '{cmd}' was not found on PATH."
+    message = (
+        f"Error invoking ACP agent '{agent}': Command '{cmd}' was not found on PATH."
+    )
     if cmd == "codex-acp" and shutil.which("codex"):
         return f"{message} The installed `codex` CLI does not speak ACP directly. Install a Codex ACP adapter (for example `npx @zed-industries/codex-acp`) or update `acp_agents.codex.command` and `args` in config.yaml."
 
@@ -152,7 +295,9 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
     Returns:
         A LangChain ``BaseTool`` ready to be included in the tool list.
     """
-    agent_lines = "\n".join(f"- {name}: {cfg.description}" for name, cfg in agents.items())
+    agent_lines = "\n".join(
+        f"- {name}: {cfg.description}" for name, cfg in agents.items()
+    )
     description = (
         "Invoke an external ACP-compatible agent and return its final response.\n\n"
         "Available agents:\n"
@@ -167,15 +312,26 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
     _agents = dict(agents)
     _agent_locks = {name: asyncio.Lock() for name in _agents}
 
-    async def _invoke_unlocked(agent: str, prompt: str, config: Annotated[RunnableConfig, InjectedToolArg] = None) -> str:
+    async def _invoke_unlocked(
+        agent: str,
+        prompt: str,
+        config: Annotated[RunnableConfig, InjectedToolArg] = None,
+    ) -> str:
         logger.info("Invoking ACP agent %s (prompt length: %d)", agent, len(prompt))
-        logger.debug("Invoking ACP agent %s with prompt: %.200s%s", agent, prompt, "..." if len(prompt) > 200 else "")
+        logger.debug(
+            "Invoking ACP agent %s with prompt: %.200s%s",
+            agent,
+            prompt,
+            "..." if len(prompt) > 200 else "",
+        )
         if agent not in _agents:
             available = ", ".join(_agents.keys())
             return f"Error: Unknown agent '{agent}'. Available: {available}"
 
         agent_config = _agents[agent]
-        thread_id: str | None = ((config or {}).get("configurable") or {}).get("thread_id")
+        thread_id: str | None = ((config or {}).get("configurable") or {}).get(
+            "thread_id"
+        )
         physical_cwd = _get_work_dir(thread_id)
         artifact_downloader = ACPArtifactDownloader(
             Path(physical_cwd),
@@ -188,9 +344,32 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
 
         try:
             from acp import PROTOCOL_VERSION, Client, text_block
-            from acp.schema import ClientCapabilities, Implementation
+            from acp.schema import (
+                AgentMessageChunk,
+                AgentThoughtChunk,
+                ClientCapabilities,
+                Implementation,
+                ResourceContentBlock,
+                TextContentBlock,
+            )
         except ImportError:
             return "Error: agent-client-protocol package is not installed. Run `uv sync` to install project dependencies."
+
+        metadata = (config or {}).get("metadata") or {}
+        callback_candidate = metadata.get("live_event_callback")
+        live_callback = (
+            cast(_LiveEventCallback, callback_candidate)
+            if callable(callback_candidate)
+            else None
+        )
+        invocation_id = f"acp:{agent}:{uuid.uuid4().hex}"
+        progress = _ACPProgressEmitter(
+            live_callback,
+            task_id=invocation_id,
+            agent=agent,
+        )
+        invocation_started_at = time.monotonic()
+        await progress.start()
 
         class _CollectingClient(Client):
             """Minimal ACP Client that collects streamed text from session updates."""
@@ -199,37 +378,120 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
                 self._chunks: list[str] = []
                 self.artifacts: list[DownloadedACPArtifact] = []
                 self.artifact_errors: list[str] = []
+                self.first_update_at: float | None = None
+                self.chunk_count = 0
+                self._artifact_tasks: list[asyncio.Task[None]] = []
 
             @property
             def collected_text(self) -> str:
                 return "".join(self._chunks)
 
-            async def session_update(self, session_id: str, update, **kwargs) -> None:  # type: ignore[override]
-                try:
-                    from acp.schema import ResourceContentBlock, TextContentBlock
+            def _record_text(self, event_type: str, text: str) -> None:
+                if not text:
+                    return
+                if self.first_update_at is None:
+                    self.first_update_at = time.monotonic()
+                self.chunk_count += 1
+                # Preserve the existing final tool-result behaviour while also
+                # forwarding the correctly typed live event.
+                self._chunks.append(text)
+                progress.add_text(event_type, text)
 
-                    if hasattr(update, "content") and isinstance(update.content, TextContentBlock):
-                        self._chunks.append(update.content.text)
-                    elif hasattr(update, "content") and isinstance(update.content, ResourceContentBlock):
-                        try:
-                            self.artifacts.append(await artifact_downloader.download(update.content))
-                        except Exception as exc:
-                            self.artifact_errors.append(
-                                f"{update.content.name}: {type(exc).__name__}: {exc}"
+            async def _download_artifact(self, resource: ResourceContentBlock) -> None:
+                try:
+                    self.artifacts.append(await artifact_downloader.download(resource))
+                except Exception as exc:  # noqa: BLE001 - isolate downloader failures from ACP notifications
+                    self.artifact_errors.append(
+                        f"{resource.name}: {type(exc).__name__}: {exc}"
+                    )
+
+            async def wait_for_artifacts(self) -> None:
+                if self._artifact_tasks:
+                    await asyncio.gather(*self._artifact_tasks)
+                    self._artifact_tasks.clear()
+
+            async def cancel_artifacts(self) -> None:
+                tasks = list(self._artifact_tasks)
+                self._artifact_tasks.clear()
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+            async def session_update(self, session_id: str, update, **kwargs) -> None:  # type: ignore[override]
+                del session_id, kwargs
+                try:
+                    content = getattr(update, "content", None)
+                    if isinstance(update, AgentMessageChunk):
+                        if isinstance(content, TextContentBlock):
+                            self._record_text("token_chunk", content.text)
+                        elif isinstance(content, ResourceContentBlock):
+                            self._artifact_tasks.append(
+                                asyncio.create_task(
+                                    self._download_artifact(content),
+                                    name=f"acp-artifact-{invocation_id}",
+                                )
                             )
-                except Exception as exc:
+                    elif isinstance(update, AgentThoughtChunk) and isinstance(
+                        content, TextContentBlock
+                    ):
+                        self._record_text("thinking_chunk", content.text)
+                except Exception as exc:  # noqa: BLE001 - malformed client updates must not break the stream
                     logger.warning("Failed to process ACP session update: %s", exc)
 
-            async def request_permission(self, options, session_id: str, tool_call, **kwargs):  # type: ignore[override]
-                response = _build_permission_response(options, auto_approve=agent_config.auto_approve_permissions)
+            async def request_permission(
+                self, options, session_id: str, tool_call, **kwargs
+            ):  # type: ignore[override]
+                response = _build_permission_response(
+                    options, auto_approve=agent_config.auto_approve_permissions
+                )
                 outcome = response.outcome.outcome
                 if outcome == "selected":
-                    logger.info("ACP permission auto-approved for tool call %s in session %s", tool_call.tool_call_id, session_id)
+                    logger.info(
+                        "ACP permission auto-approved for tool call %s in session %s",
+                        tool_call.tool_call_id,
+                        session_id,
+                    )
                 else:
-                    logger.warning("ACP permission denied for tool call %s in session %s (set auto_approve_permissions: true in config.yaml to enable)", tool_call.tool_call_id, session_id)
+                    logger.warning(
+                        "ACP permission denied for tool call %s in session %s (set auto_approve_permissions: true in config.yaml to enable)",
+                        tool_call.tool_call_id,
+                        session_id,
+                    )
                 return response
 
         client = _CollectingClient()
+        prompt_started_at: float | None = None
+        prompt_completed_at: float | None = None
+
+        def _elapsed_ms(start: float | None, end: float | None) -> float | None:
+            if start is None or end is None:
+                return None
+            return max(0.0, (end - start) * 1000)
+
+        def _log_stream_metrics(outcome: str) -> None:
+            now = time.monotonic()
+            first_update_ms = _elapsed_ms(
+                invocation_started_at,
+                client.first_update_at,
+            )
+            prompt_total_ms = _elapsed_ms(
+                prompt_started_at,
+                prompt_completed_at or (now if prompt_started_at is not None else None),
+            )
+            finalization_ms = _elapsed_ms(prompt_completed_at, now)
+            logger.info(
+                "ACP agent '%s' stream metrics: outcome=%s first_update_ms=%s "
+                "chunk_count=%d prompt_total_ms=%s finalization_ms=%s tool_total_ms=%.1f",
+                agent,
+                outcome,
+                f"{first_update_ms:.1f}" if first_update_ms is not None else "none",
+                client.chunk_count,
+                f"{prompt_total_ms:.1f}" if prompt_total_ms is not None else "none",
+                f"{finalization_ms:.1f}" if finalization_ms is not None else "none",
+                (now - invocation_started_at) * 1000,
+            )
+
         cmd = agent_config.command
         args = agent_config.args or []
         try:
@@ -243,31 +505,57 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
             mcp_servers = []
         agent_env: dict[str, str] | None = None
         if agent_config.env:
-            agent_env = {k: (os.environ.get(v[1:], "") if v.startswith("$") else v) for k, v in agent_config.env.items()}
+            agent_env = {
+                k: (os.environ.get(v[1:], "") if v.startswith("$") else v)
+                for k, v in agent_config.env.items()
+            }
 
         try:
             from acp import spawn_agent_process
 
-            async with spawn_agent_process(client, cmd, *args, env=agent_env, cwd=physical_cwd) as (conn, proc):
-                logger.info("Spawning ACP agent '%s' with command '%s' and args %s in cwd %s", agent, cmd, args, physical_cwd)
+            async with spawn_agent_process(
+                client, cmd, *args, env=agent_env, cwd=physical_cwd
+            ) as (conn, _proc):
+                logger.info(
+                    "Spawning ACP agent '%s' with command '%s' and args %s in cwd %s",
+                    agent,
+                    cmd,
+                    args,
+                    physical_cwd,
+                )
                 async with asyncio.timeout(agent_config.timeout_seconds):
                     await conn.initialize(
                         protocol_version=PROTOCOL_VERSION,
                         client_capabilities=ClientCapabilities(),
-                        client_info=Implementation(name="deerflow", title="DeerFlow", version="0.1.0"),
+                        client_info=Implementation(
+                            name="deerflow", title="DeerFlow", version="0.1.0"
+                        ),
                     )
-                    session_kwargs: dict[str, Any] = {"cwd": physical_cwd, "mcp_servers": mcp_servers}
+                    session_kwargs: dict[str, Any] = {
+                        "cwd": physical_cwd,
+                        "mcp_servers": mcp_servers,
+                    }
                     if agent_config.model:
                         session_kwargs["model"] = agent_config.model
                     session = await conn.new_session(**session_kwargs)
+                    prompt_started_at = time.monotonic()
                     await conn.prompt(
                         session_id=session.session_id,
                         prompt=[text_block(prompt)],
                     )
+                    prompt_completed_at = time.monotonic()
+                    # The Python ACP SDK dispatches notifications in background
+                    # tasks. Yield once so notifications received before the
+                    # prompt response can finish their non-blocking collectors.
+                    await asyncio.sleep(0)
+            await client.wait_for_artifacts()
             result = client.collected_text
             if client.artifact_errors:
                 details = "; ".join(client.artifact_errors)
-                return f"Error invoking ACP agent '{agent}': artifact download failed: {details}"
+                message = f"Error invoking ACP agent '{agent}': artifact download failed: {details}"
+                await progress.finish("task_failed", error=message)
+                _log_stream_metrics("artifact_failed")
+                return message
             if client.artifacts:
                 artifact_lines = [
                     f"- {item.virtual_path} ({item.size} bytes, sha256={item.sha256})"
@@ -278,18 +566,37 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
                     + "\n\nACP artifacts downloaded:\n"
                     + "\n".join(artifact_lines)
                 ).lstrip()
+            await progress.finish("task_completed")
+            _log_stream_metrics("completed")
             logger.info("ACP agent '%s' returned %s", agent, result[:1000])
             logger.info("ACP agent '%s' returned %d characters", agent, len(result))
             return result or "(no response)"
+        except asyncio.CancelledError:
+            await client.cancel_artifacts()
+            await progress.finish("task_cancelled", error="ACP invocation cancelled")
+            _log_stream_metrics("cancelled")
+            raise
         except TimeoutError:
-            logger.error("ACP agent '%s' invocation timed out after %s seconds", agent, agent_config.timeout_seconds)
-            return (
+            await client.cancel_artifacts()
+            logger.error(
+                "ACP agent '%s' invocation timed out after %s seconds",
+                agent,
+                agent_config.timeout_seconds,
+            )
+            message = (
                 f"Error invoking ACP agent '{agent}': timed out after {agent_config.timeout_seconds} seconds. "
                 f"Increase `acp_agents.{agent}.timeout_seconds` in config.yaml if the agent needs more time."
             )
-        except Exception as e:
+            await progress.finish("task_timed_out", error=message)
+            _log_stream_metrics("timed_out")
+            return message
+        except Exception as e:  # noqa: BLE001 - return external agent failures as tool results
+            await client.cancel_artifacts()
             logger.error("ACP agent '%s' invocation failed: %s", agent, e)
-            return _format_invocation_error(agent, cmd, e)
+            message = _format_invocation_error(agent, cmd, e)
+            await progress.finish("task_failed", error=message)
+            _log_stream_metrics("failed")
+            return message
 
     async def _invoke(
         agent: str,

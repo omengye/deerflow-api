@@ -17,6 +17,39 @@ from deerflow.tools.builtins.acp_artifact_downloader import DownloadedACPArtifac
 from deerflow.tools.builtins.invoke_acp_agent_tool import build_invoke_acp_agent_tool
 
 
+def _agent_message(text: str):
+    import acp
+    from acp import schema
+
+    return schema.AgentMessageChunk(
+        session_update="agent_message_chunk",
+        content=acp.text_block(text),
+        message_id="11111111-1111-1111-1111-111111111111",
+    )
+
+
+def _agent_thought(text: str):
+    import acp
+    from acp import schema
+
+    return schema.AgentThoughtChunk(
+        session_update="agent_thought_chunk",
+        content=acp.text_block(text),
+        message_id="22222222-2222-2222-2222-222222222222",
+    )
+
+
+def _agent_resource(name: str, uri: str):
+    import acp
+    from acp import schema
+
+    return schema.AgentMessageChunk(
+        session_update="agent_message_chunk",
+        content=acp.resource_link_block(name, uri, size=7),
+        message_id="33333333-3333-3333-3333-333333333333",
+    )
+
+
 class _FakePaths:
     """Stand-in for deerflow.config.paths.Paths that skips real base_dir resolution."""
 
@@ -49,10 +82,10 @@ class _FakeConnection:
             await asyncio.Event().wait()
             return
 
-        from acp.schema import TextContentBlock
-
-        update = SimpleNamespace(content=TextContentBlock(type="text", text=self._response_text))
-        await self._client.session_update(kwargs["session_id"], update)
+        await self._client.session_update(
+            kwargs["session_id"],
+            _agent_message(self._response_text),
+        )
 
 
 def _fake_spawn_agent_process(*, hang: bool, response_text: str = "hello from agent"):
@@ -82,12 +115,20 @@ def _isolated_acp_workspace(tmp_path, monkeypatch):
     monkeypatch.setattr("deerflow.config.paths.get_paths", lambda: _FakePaths(acp_dir))
 
 
-async def _invoke(agent_config: ACPAgentConfig, *, prompt: str = "do the task") -> str:
+async def _invoke(
+    agent_config: ACPAgentConfig,
+    *,
+    prompt: str = "do the task",
+    live_event_callback=None,
+) -> str:
     tool = build_invoke_acp_agent_tool({"fake_agent": agent_config})
+    config = {"configurable": {"thread_id": "thread-1"}}
+    if live_event_callback is not None:
+        config["metadata"] = {"live_event_callback": live_event_callback}
     return await tool.coroutine(
         agent="fake_agent",
         prompt=prompt,
-        config={"configurable": {"thread_id": "thread-1"}},
+        config=config,
     )
 
 
@@ -103,21 +144,39 @@ def test_acp_agent_config_disables_insecure_artifact_http_by_default() -> None:
     assert _agent_config().artifact_allow_insecure_http is False
 
 
-async def test_invoke_acp_agent_returns_timeout_error_instead_of_hanging(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_invoke_acp_agent_returns_timeout_error_instead_of_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr("acp.spawn_agent_process", _fake_spawn_agent_process(hang=True))
     agent_config = _agent_config(timeout_seconds=0.1)
+    live_events: list[dict] = []
+
+    async def live_event_callback(event: dict) -> None:
+        live_events.append(event)
 
     # Bound the test itself so a regression (missing timeout) fails fast
     # instead of hanging the suite.
-    result = await asyncio.wait_for(_invoke(agent_config), timeout=5)
+    result = await asyncio.wait_for(
+        _invoke(agent_config, live_event_callback=live_event_callback),
+        timeout=5,
+    )
 
     assert "fake_agent" in result
     assert "timed out after 0.1 seconds" in result
     assert "timeout_seconds" in result
+    assert [event["type"] for event in live_events] == [
+        "subagent_started",
+        "task_timed_out",
+    ]
 
 
-async def test_invoke_acp_agent_returns_agent_response_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("acp.spawn_agent_process", _fake_spawn_agent_process(hang=False, response_text="42"))
+async def test_invoke_acp_agent_returns_agent_response_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "acp.spawn_agent_process",
+        _fake_spawn_agent_process(hang=False, response_text="42"),
+    )
     agent_config = _agent_config(timeout_seconds=5)
 
     result = await _invoke(agent_config)
@@ -125,8 +184,117 @@ async def test_invoke_acp_agent_returns_agent_response_on_success(monkeypatch: p
     assert result == "42"
 
 
-async def test_invoke_acp_agent_no_timeout_configured_still_completes(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("acp.spawn_agent_process", _fake_spawn_agent_process(hang=False, response_text="ok"))
+async def test_invoke_acp_agent_forwards_live_chunks_before_prompt_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live_events: list[dict] = []
+    first_live_text = asyncio.Event()
+    release_prompt = asyncio.Event()
+
+    async def live_event_callback(event: dict) -> None:
+        live_events.append(event)
+        if event.get("type") == "token_chunk":
+            first_live_text.set()
+
+    class _StreamingConnection(_FakeConnection):
+        async def prompt(self, **kwargs) -> None:
+            self.prompt_calls.append(kwargs)
+            await self._client.session_update(
+                kwargs["session_id"],
+                _agent_thought("thinking"),
+            )
+            await self._client.session_update(
+                kwargs["session_id"],
+                _agent_message("hello"),
+            )
+            await release_prompt.wait()
+            await self._client.session_update(
+                kwargs["session_id"],
+                _agent_message(" world"),
+            )
+
+    @asynccontextmanager
+    async def spawn(client, command, *args, env=None, cwd=None):
+        yield (
+            _StreamingConnection(client, hang=False, response_text=""),
+            SimpleNamespace(pid=1),
+        )
+
+    monkeypatch.setattr("acp.spawn_agent_process", spawn)
+    invocation = asyncio.create_task(
+        _invoke(
+            _agent_config(timeout_seconds=5),
+            live_event_callback=live_event_callback,
+        )
+    )
+
+    await asyncio.wait_for(first_live_text.wait(), timeout=1)
+    assert not invocation.done()
+    assert live_events[0]["type"] == "subagent_started"
+
+    release_prompt.set()
+    result = await asyncio.wait_for(invocation, timeout=5)
+
+    assert result == "thinkinghello world"
+    assert (
+        "".join(
+            event["content"] for event in live_events if event["type"] == "token_chunk"
+        )
+        == "hello world"
+    )
+    assert (
+        "".join(
+            event["thinking"]
+            for event in live_events
+            if event["type"] == "thinking_chunk"
+        )
+        == "thinking"
+    )
+    assert live_events[-1]["type"] == "task_completed"
+    assert len({event["task_id"] for event in live_events}) == 1
+
+
+async def test_invoke_acp_agent_coalesces_burst_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live_events: list[dict] = []
+
+    async def live_event_callback(event: dict) -> None:
+        live_events.append(event)
+
+    class _BurstConnection(_FakeConnection):
+        async def prompt(self, **kwargs) -> None:
+            for text in ("one", " ", "two"):
+                await self._client.session_update(
+                    kwargs["session_id"],
+                    _agent_message(text),
+                )
+
+    @asynccontextmanager
+    async def spawn(client, command, *args, env=None, cwd=None):
+        yield (
+            _BurstConnection(client, hang=False, response_text=""),
+            SimpleNamespace(pid=1),
+        )
+
+    monkeypatch.setattr("acp.spawn_agent_process", spawn)
+    result = await _invoke(
+        _agent_config(timeout_seconds=5),
+        live_event_callback=live_event_callback,
+    )
+
+    assert result == "one two"
+    token_events = [event for event in live_events if event["type"] == "token_chunk"]
+    assert [event["content"] for event in token_events] == ["one two"]
+
+
+async def test_invoke_acp_agent_no_timeout_configured_still_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "acp.spawn_agent_process",
+        _fake_spawn_agent_process(hang=False, response_text="ok"),
+    )
     agent_config = _agent_config(timeout_seconds=None)
 
     result = await asyncio.wait_for(_invoke(agent_config), timeout=5)
@@ -153,7 +321,10 @@ async def test_invoke_acp_agent_serializes_calls_for_one_agent(
 
     @asynccontextmanager
     async def spawn(client, command, *args, env=None, cwd=None):
-        yield _SlowConnection(client, hang=False, response_text="ok"), SimpleNamespace(pid=1)
+        yield (
+            _SlowConnection(client, hang=False, response_text="ok"),
+            SimpleNamespace(pid=1),
+        )
 
     monkeypatch.setattr("acp.spawn_agent_process", spawn)
     tool = build_invoke_acp_agent_tool({"fake_agent": _agent_config(timeout_seconds=5)})
@@ -194,20 +365,20 @@ async def test_invoke_acp_agent_reports_downloaded_resource_links(
 
     class _ResourceConnection(_FakeConnection):
         async def prompt(self, **kwargs) -> None:
-            from acp import resource_link_block
-
-            update = SimpleNamespace(
-                content=resource_link_block(
+            await self._client.session_update(
+                kwargs["session_id"],
+                _agent_resource(
                     "report.txt",
                     "https://rustfs.example.test/report.txt",
-                    size=7,
-                )
+                ),
             )
-            await self._client.session_update(kwargs["session_id"], update)
 
     @asynccontextmanager
     async def spawn(client, command, *args, env=None, cwd=None):
-        yield _ResourceConnection(client, hang=False, response_text=""), SimpleNamespace(pid=1)
+        yield (
+            _ResourceConnection(client, hang=False, response_text=""),
+            SimpleNamespace(pid=1),
+        )
 
     monkeypatch.setattr("acp.spawn_agent_process", spawn)
     monkeypatch.setattr(
@@ -221,3 +392,72 @@ async def test_invoke_acp_agent_reports_downloaded_resource_links(
     assert "/mnt/acp-workspace/invocation/report.txt" in result
     assert "sha256=" + "a" * 64 in result
     assert downloader_options["allow_insecure_http"] is True
+
+
+async def test_artifact_download_does_not_block_live_text_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    download_started = asyncio.Event()
+    release_download = asyncio.Event()
+    live_text_received = asyncio.Event()
+
+    class _SlowDownloader:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def download(self, resource):
+            download_started.set()
+            await release_download.wait()
+            return DownloadedACPArtifact(
+                name=resource.name,
+                virtual_path="/mnt/acp-workspace/invocation/report.txt",
+                size=7,
+                sha256="b" * 64,
+                mime_type="text/plain",
+            )
+
+    class _ResourceThenTextConnection(_FakeConnection):
+        async def prompt(self, **kwargs) -> None:
+            await self._client.session_update(
+                kwargs["session_id"],
+                _agent_resource(
+                    "report.txt",
+                    "https://rustfs.example.test/report.txt",
+                ),
+            )
+            await self._client.session_update(
+                kwargs["session_id"],
+                _agent_message("text after artifact"),
+            )
+
+    @asynccontextmanager
+    async def spawn(client, command, *args, env=None, cwd=None):
+        yield (
+            _ResourceThenTextConnection(client, hang=False, response_text=""),
+            SimpleNamespace(pid=1),
+        )
+
+    async def live_event_callback(event: dict) -> None:
+        if event.get("type") == "token_chunk":
+            live_text_received.set()
+
+    monkeypatch.setattr("acp.spawn_agent_process", spawn)
+    monkeypatch.setattr(
+        "deerflow.tools.builtins.invoke_acp_agent_tool.ACPArtifactDownloader",
+        _SlowDownloader,
+    )
+    invocation = asyncio.create_task(
+        _invoke(
+            _agent_config(timeout_seconds=5, artifact_allow_insecure_http=True),
+            live_event_callback=live_event_callback,
+        )
+    )
+
+    await asyncio.wait_for(download_started.wait(), timeout=1)
+    await asyncio.wait_for(live_text_received.wait(), timeout=1)
+    assert not invocation.done()
+
+    release_download.set()
+    result = await asyncio.wait_for(invocation, timeout=5)
+    assert result.startswith("text after artifact")
+    assert "/mnt/acp-workspace/invocation/report.txt" in result

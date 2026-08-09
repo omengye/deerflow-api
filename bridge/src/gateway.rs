@@ -1,6 +1,9 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use agent_client_protocol::{
@@ -15,10 +18,15 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
-use futures::StreamExt;
+use futures::{
+    StreamExt,
+    channel::oneshot,
+    future::{AbortHandle, AbortRegistration, Abortable},
+};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::{HANDSHAKE_VERSION, Result, load_endpoint};
@@ -32,22 +40,150 @@ struct AuthState {
 struct DaemonTransport {
     endpoint_path: Arc<PathBuf>,
     workspace: Arc<str>,
+    supervisor: ConnectionSupervisor,
+}
+
+#[derive(Clone, Default)]
+struct ConnectionSupervisor {
+    inner: Arc<ConnectionSupervisorInner>,
+}
+
+#[derive(Default)]
+struct ConnectionSupervisorInner {
+    next_id: AtomicU64,
+    replacement: Mutex<()>,
+    active: Mutex<Option<ActiveConnection>>,
+}
+
+struct ActiveConnection {
+    id: u64,
+    abort: AbortHandle,
+    done: oneshot::Receiver<()>,
+}
+
+struct ConnectionLease {
+    id: u64,
+    supervisor: ConnectionSupervisor,
+    done: Option<oneshot::Sender<()>>,
+}
+
+impl ConnectionSupervisor {
+    async fn begin(&self) -> (ConnectionLease, AbortRegistration) {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!("deerflow-acp: gateway external connection #{id} started");
+
+        // Only one replacement may run at a time. A new initialize supersedes
+        // the previous transport because the local daemon accepts one ACP client.
+        let _replacement = self.inner.replacement.lock().await;
+        let previous = {
+            let mut active = self.inner.active.lock().await;
+            active.take()
+        };
+        if let Some(previous) = previous {
+            eprintln!(
+                "deerflow-acp: gateway external connection #{id} superseding connection #{}",
+                previous.id
+            );
+            previous.abort.abort();
+            let _ = previous.done.await;
+        }
+
+        let (abort, registration) = AbortHandle::new_pair();
+        let (done, done_receiver) = oneshot::channel();
+        *self.inner.active.lock().await = Some(ActiveConnection {
+            id,
+            abort,
+            done: done_receiver,
+        });
+
+        (
+            ConnectionLease {
+                id,
+                supervisor: self.clone(),
+                done: Some(done),
+            },
+            registration,
+        )
+    }
+
+    async fn finish(&self, id: u64) {
+        let mut active = self.inner.active.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|connection| connection.id == id)
+        {
+            active.take();
+        }
+    }
+}
+
+impl ConnectionLease {
+    async fn finish(mut self) {
+        self.supervisor.finish(self.id).await;
+        if let Some(done) = self.done.take() {
+            let _ = done.send(());
+        }
+    }
+}
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        // This path is used when the SDK aborts its task (for example after an
+        // explicit DELETE). Dropping the transport already closes the daemon
+        // TCP stream; notifying a pending replacement keeps it from stalling.
+        if let Some(done) = self.done.take() {
+            eprintln!(
+                "deerflow-acp: gateway external connection #{} transport dropped",
+                self.id
+            );
+            let supervisor = self.supervisor.clone();
+            let id = self.id;
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                drop(runtime.spawn(async move { supervisor.finish(id).await }));
+            }
+            let _ = done.send(());
+        }
+    }
 }
 
 impl ConnectTo<Client> for DaemonTransport {
     async fn connect_to(self, client: impl ConnectTo<Agent>) -> agent_client_protocol::Result<()> {
-        let stream = connect_daemon(&self.endpoint_path)
-            .await
-            .map_err(internal_error)?;
-        let (reader, writer) = stream.into_split();
-        let daemon_stream = ByteStreams::new(writer.compat_write(), reader.compat());
-        let (daemon, daemon_future) =
-            <ByteStreams<_, _> as ConnectTo<Client>>::into_channel_and_future(daemon_stream);
-        let (external, external_future) = client.into_channel_and_future();
+        let (lease, cancellation) = self.supervisor.begin().await;
+        let id = lease.id;
+        let endpoint_path = self.endpoint_path;
+        let workspace = self.workspace;
+        let connection = async move {
+            let stream = connect_daemon(&endpoint_path)
+                .await
+                .map_err(internal_error)?;
+            eprintln!("deerflow-acp: gateway connection #{id} connected to local daemon");
+            let (reader, writer) = stream.into_split();
+            let daemon_stream = ByteStreams::new(writer.compat_write(), reader.compat());
+            let (daemon, daemon_future) =
+                <ByteStreams<_, _> as ConnectTo<Client>>::into_channel_and_future(daemon_stream);
+            let (external, external_future) = client.into_channel_and_future();
 
-        let bridge = bridge_with_workspace(external, daemon, self.workspace);
-        let ((), (), ()) = futures::try_join!(bridge, daemon_future, external_future)?;
-        Ok(())
+            let bridge = bridge_with_workspace(external, daemon, workspace);
+            let ((), (), ()) = futures::try_join!(bridge, daemon_future, external_future)?;
+            Ok(())
+        };
+
+        let result = match Abortable::new(connection, cancellation).await {
+            Ok(Ok(())) => {
+                eprintln!("deerflow-acp: gateway connection #{id} closed");
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                eprintln!("deerflow-acp: gateway connection #{id} failed: {error}");
+                Err(error)
+            }
+            Err(_) => {
+                eprintln!("deerflow-acp: gateway connection #{id} cancelled by replacement");
+                Ok(())
+            }
+        };
+        lease.finish().await;
+        result
     }
 }
 
@@ -173,6 +309,11 @@ async fn authorize(State(state): State<AuthState>, request: Request<Body>, next:
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|candidate| candidate.as_bytes().ct_eq(state.token.as_bytes()).into());
     if !authorized {
+        eprintln!(
+            "deerflow-acp: gateway authorization rejected for {} {}",
+            request.method(),
+            request.uri().path()
+        );
         return (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Bearer")],
@@ -197,6 +338,7 @@ pub(crate) async fn run(
     let transport = DaemonTransport {
         endpoint_path: Arc::new(endpoint_path),
         workspace: Arc::from(workspace),
+        supervisor: ConnectionSupervisor::default(),
     };
     let router = AcpHttpServer::new(move || transport.clone())
         .with_options(ServerOptions {
@@ -308,5 +450,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_new_connection_cancels_the_previous_transport() {
+        let supervisor = ConnectionSupervisor::default();
+        let (first_lease, first_cancellation) = supervisor.begin().await;
+        let first = tokio::spawn(async move {
+            let result = Abortable::new(std::future::pending::<()>(), first_cancellation).await;
+            first_lease.finish().await;
+            result
+        });
+
+        let (second_lease, _second_cancellation) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), supervisor.begin())
+                .await
+                .expect("replacement should not wait indefinitely");
+
+        assert!(first.await.unwrap().is_err());
+        second_lease.finish().await;
+        assert!(supervisor.inner.active.lock().await.is_none());
     }
 }
