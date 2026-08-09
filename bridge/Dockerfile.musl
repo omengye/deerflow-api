@@ -1,0 +1,50 @@
+FROM rust:1.95-alpine AS builder
+
+RUN apk add --no-cache \
+    binutils \
+    build-base \
+    ca-certificates \
+    clang \
+    clang-dev \
+    cmake \
+    file \
+    linux-headers \
+    llvm-dev \
+    musl-dev \
+    ninja \
+    perl \
+    pkgconf
+
+WORKDIR /build
+
+COPY bridge/Cargo.toml bridge/Cargo.lock ./
+COPY bridge/src ./src
+
+RUN rustup target add x86_64-unknown-linux-musl
+
+# Alpine's native C/C++ toolchain links against musl. Force bundled AWS-LC so
+# the final executable does not accidentally discover a dynamic system copy.
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+    CC_x86_64_unknown_linux_musl=cc \
+    CXX_x86_64_unknown_linux_musl=c++ \
+    AWS_LC_SYS_USE_SYSTEM=0 \
+    RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64"
+
+RUN cargo build \
+    --locked \
+    --release \
+    --target x86_64-unknown-linux-musl
+
+RUN install -Dm755 \
+    target/x86_64-unknown-linux-musl/release/deerflow-acp \
+    /out/deerflow-acp-bridge
+
+# A static musl executable has neither an ELF interpreter nor DT_NEEDED
+# entries. Fail the image build if a future dependency reintroduces either.
+RUN file /out/deerflow-acp-bridge \
+    && ! readelf -l /out/deerflow-acp-bridge | grep -q "Requesting program interpreter" \
+    && ! readelf -d /out/deerflow-acp-bridge | grep -q "(NEEDED)"
+
+FROM scratch AS artifact
+
+COPY --from=builder /out/deerflow-acp-bridge /deerflow-acp-bridge

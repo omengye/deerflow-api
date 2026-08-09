@@ -49,6 +49,7 @@ Thumbs.db
 .env
 .env.*
 config.yaml
+start-acp-gateway.local.ps1
 data/checkpoints.db
 data/checkpoints.db-shm
 data/checkpoints.db-wal
