@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 _HANDSHAKE_VERSION = "DFACP/1"
 _HANDSHAKE_LIMIT = 4096
 _HANDSHAKE_TIMEOUT_SECONDS = 3.0
+_WRITER_CLOSE_TIMEOUT_SECONDS = 1.0
+_ACTIVE_TASK_CLOSE_TIMEOUT_SECONDS = 3.0
 
 
 def _build_id() -> str:
@@ -53,10 +55,26 @@ def _env_enabled(name: str, default: bool = True) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _abort_writer(writer: asyncio.StreamWriter) -> None:
+    """Abort a socket transport without waiting for the peer to cooperate."""
+
+    transport = getattr(writer, "transport", None)
+    abort = getattr(transport, "abort", None)
+    if callable(abort):
+        abort()
+    else:
+        writer.close()
+
+
 async def _close_writer(writer: asyncio.StreamWriter) -> None:
     writer.close()
     try:
-        await writer.wait_closed()
+        await asyncio.wait_for(
+            writer.wait_closed(), timeout=_WRITER_CLOSE_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        logger.debug("Timed out waiting for ACP socket peer to close; aborting transport")
+        _abort_writer(writer)
     except (ConnectionError, OSError, RuntimeError):
         pass
 
@@ -86,6 +104,7 @@ class ACPDaemon:
         self._state_lock = asyncio.Lock()
         self._active = False
         self._active_task: asyncio.Task[Any] | None = None
+        self._active_writer: asyncio.StreamWriter | None = None
         self._stop_requested = asyncio.Event()
         self._closed = False
 
@@ -127,11 +146,32 @@ class ACPDaemon:
         self._server = None
         if server is not None:
             server.close()
-            await server.wait_closed()
         task = self._active_task
+        active_writer = self._active_writer
+        if active_writer is not None:
+            # On Windows, StreamWriter.wait_closed() may wait indefinitely for
+            # the native bridge, while the bridge simultaneously waits for the
+            # daemon socket to reach EOF. Abort first to break that cycle.
+            _abort_writer(active_writer)
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(task, return_exceptions=True),
+                    timeout=_ACTIVE_TASK_CLOSE_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Timed out waiting for the active ACP connection to close"
+                )
+        if server is not None:
+            try:
+                await asyncio.wait_for(
+                    server.wait_closed(),
+                    timeout=_ACTIVE_TASK_CLOSE_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.warning("Timed out waiting for the ACP listener to close")
         try:
             current = DaemonEndpoint.load(self.endpoint_path)
         except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -147,7 +187,7 @@ class ACPDaemon:
             raw = await asyncio.wait_for(
                 reader.readline(), timeout=_HANDSHAKE_TIMEOUT_SECONDS
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
         if not raw or len(raw) > _HANDSHAKE_LIMIT:
             return None
@@ -193,6 +233,7 @@ class ACPDaemon:
                 return
             self._active = True
             self._active_task = asyncio.current_task()
+            self._active_writer = writer
 
         await self._reply(writer, "OK")
         agent = self.agent_factory(self.config, self.store, self.runtime)
@@ -210,6 +251,7 @@ class ACPDaemon:
             async with self._state_lock:
                 self._active = False
                 self._active_task = None
+                self._active_writer = None
             await _close_writer(writer)
 
 

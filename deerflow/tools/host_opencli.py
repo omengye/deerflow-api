@@ -11,8 +11,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 
 from langchain_core.tools import tool
+
+from deerflow.config import get_app_config
 
 ALLOWED_SITES = frozenset({"web", "twitter", "xiaohongshu", "xiaoyuzhou", "weixin", "douyin", "bilibili"})
 
@@ -21,8 +24,31 @@ _MAX_STDOUT_CHARS = 1_000_000
 _MAX_STDERR_CHARS = 100_000
 
 
+def _get_opencli_executable() -> str:
+    """Return the configured host OpenCLI executable.
+
+    ``OPENCLI_BIN`` remains available as a process-level override.  The tool
+    configuration is preferable for long-running ACP daemons, especially on
+    Windows where ``opencli`` may resolve to a ``.cmd`` shim that
+    ``create_subprocess_exec`` cannot discover by its extensionless name.
+    """
+    environment_override = os.environ.get("OPENCLI_BIN")
+    if environment_override and environment_override.strip():
+        return environment_override.strip()
+
+    tool_config = get_app_config().get_tool_config("host_opencli")
+    if tool_config is not None:
+        configured = (tool_config.model_extra or {}).get("executable")
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+
+    # Resolve PATHEXT here instead of relying on CreateProcess to turn
+    # ``opencli`` into ``opencli.cmd`` on Windows.
+    return shutil.which("opencli") or shutil.which("opencli.cmd") or "opencli"
+
+
 def _opencli_argv(site: str, command: str, arguments: list[str] | None) -> list[str]:
-    argv = [os.environ.get("OPENCLI_BIN", "opencli"), site, command, *(arguments or [])]
+    argv = [_get_opencli_executable(), site, command, *(arguments or [])]
     if not any(arg == "-f" or arg == "--format" or arg.startswith("--format=") for arg in argv[3:]):
         argv.extend(["--format", "json"])
     return argv

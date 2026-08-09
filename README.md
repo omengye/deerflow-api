@@ -237,6 +237,8 @@ $bridge = "D:\Tools\deerflow-api\bridge\target\release\deerflow-acp.exe"
 
 `--status` 和 `--stop-daemon` 不会自动启动 daemon。端点、随机 token 和日志默认保存在当前用户的 `%LOCALAPPDATA%\DeerFlow\acp`；Linux 使用 `XDG_RUNTIME_DIR` 或 `XDG_CACHE_HOME`。可用 `--runtime-dir` 或 `DEER_FLOW_ACP_RUNTIME_DIR` 覆盖。Bridge 默认等待 daemon 预热 120 秒；特别慢的环境可用 `DEER_FLOW_ACP_DAEMON_START_TIMEOUT_MS` 调整。
 
+`--stop-daemon` 会先请求优雅关闭，并等待 endpoint 中记录的 daemon PID 真正退出；默认等待 10 秒，超时后会强制终止已通过 token 验证的旧进程。可用 `DEER_FLOW_ACP_DAEMON_STOP_TIMEOUT_MS` 调整优雅关闭等待时间。
+
 默认启动会预构建 agent graph，并在配置为 WSL Sandbox 时执行一次无副作用的 `true` 探针。排障时可分别设置 `DEER_FLOW_ACP_DAEMON_WARMUP=0`、`DEER_FLOW_ACP_DAEMON_SANDBOX_WARMUP=0`；调整启动等待时间可设置 `DEER_FLOW_ACP_DAEMON_START_TIMEOUT_MS`。
 
 ### 直接 stdio 回退
@@ -253,15 +255,16 @@ uv run deerflow-acp
 这个入口定位为本地通用任务 Agent，不提供终端、LSP、代码诊断或 diff 等编码客户端集成：
 
 - 只接受文本 prompt，支持多轮会话、加载历史、会话列表、取消、思考、计划、工具进度和本地产物链接。
+- 新建或加载会话时，会通过稳定版 ACP `configOptions` 暴露 `models:` 中配置的模型；支持该能力的客户端可为当前会话选择模型。选择结果会持久化，且只能在会话没有正在执行的 prompt 时切换。
 - Zed 通过 `session/new` 传入的绝对 `cwd` 会绑定为该会话的 `/mnt/user-data/workspace`。Agent 可在这个目录内列举、搜索、读取、写入、替换、移动/重命名和删除文件或目录；路径穿越以及通过符号链接或 junction 逃出工作区会被拒绝。
 - `cwd` 必须是已经存在的本地目录，加载会话时必须与创建会话时的目录一致。非空 `additionalDirectories` 会被明确拒绝。
-- 工作区访问直接使用本机路径，不调用 ACP client 的文件系统或终端接口。本地 ACP runtime 不暴露 `bash`、外部 ACP agent 和 DeerFlow subagent 工具，避免绕过工作区文件边界。
+- 工作区访问直接使用本机路径，不调用 ACP client 的文件系统或终端接口。默认不暴露 `bash`；受信任的本地客户端可设置 `local_acp.enable_bash: true`，或环境变量 `DEER_FLOW_ACP_ENABLE_BASH=1`，通过配置的 Sandbox 启用。Bash 可访问网络及 Sandbox 可见的文件系统；WSL 的 Windows 挂载盘不构成严格的项目隔离边界。外部 ACP agent 和 DeerFlow subagent 工具仍不暴露。
 - 该模式要求 `LocalSandboxProvider` 或 `LocalWslProvider`；AIO/Docker sandbox 不会静默回退到 DeerFlow 内部 workspace。
-- client MCP 默认拒绝。受信任的本地客户端可设置 `local_acp.accept_client_mcp_servers: true`，或环境变量 `DEER_FLOW_ACP_ACCEPT_CLIENT_MCP_SERVERS=1`，启用按会话隔离、仅驻留内存的 stdio MCP；HTTP/SSE 仍不接受。该开关会增加外部命令/工具面并退出严格的“仅项目目录文件操作”边界，当前文件模式不应开启。
+- client MCP 默认拒绝。受信任的本地客户端可设置 `local_acp.accept_client_mcp_servers: true`，或环境变量 `DEER_FLOW_ACP_ACCEPT_CLIENT_MCP_SERVERS=1`，启用按会话隔离、仅驻留内存的 stdio、SSE 和 HTTP（Streamable HTTP）MCP。远程 MCP URL 和 Header 均由客户端提供。该开关会增加外部命令、出站连接和工具面，并退出严格的“仅项目目录文件操作”边界，当前文件模式不应开启。
 - DeerFlow 的 uploads、outputs、ACP 外部 agent workspace 和会话状态仍保存在自己的线程目录中，不会混入客户端项目。
 - ACP 使用独立的 `acp-checkpoints.db` 和 `acp-sessions.db`，可与 HTTP API 同时运行而不共享 SQLite 写热点。
 
-可选配置见 `config.example.yaml` 的 `local_acp:`。也可用 `DEER_FLOW_ACP_CHECKPOINTER_PATH`、`DEER_FLOW_ACP_SESSION_STORE_PATH`、`DEER_FLOW_ACP_MAX_ACTIVE_RUNS` 和 `DEER_FLOW_ACP_RUN_TIMEOUT` 覆盖运行参数。Bridge 的 stdout 只承载 ACP JSON-RPC；daemon 日志写入独立轮转文件。
+可选配置见 `config.example.yaml` 的 `local_acp:`。也可用 `DEER_FLOW_ACP_CHECKPOINTER_PATH`、`DEER_FLOW_ACP_SESSION_STORE_PATH`、`DEER_FLOW_ACP_MAX_ACTIVE_RUNS`、`DEER_FLOW_ACP_RUN_TIMEOUT`、`DEER_FLOW_ACP_ENABLE_BASH` 和 `DEER_FLOW_ACP_ACCEPT_CLIENT_MCP_SERVERS` 覆盖运行参数。Bridge 的 stdout 只承载 ACP JSON-RPC；daemon 日志写入独立轮转文件。
 
 ## 外部 ACP Agent 对接（Codex / Claude Code）
 

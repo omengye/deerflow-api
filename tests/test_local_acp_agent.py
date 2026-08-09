@@ -71,6 +71,32 @@ def make_config(tmp_path: Path, **overrides: Any) -> LocalACPConfig:
     return LocalACPConfig(**values)
 
 
+@pytest.fixture(autouse=True)
+def configured_models(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    models = [
+        SimpleNamespace(
+            name="model-a",
+            display_name="Model A",
+            description="First test model",
+        ),
+        SimpleNamespace(
+            name="model-b",
+            display_name=None,
+            description=None,
+        ),
+    ]
+    app_config = SimpleNamespace(
+        models=models,
+        get_default_model_name=lambda: "model-b",
+        get_model_config=lambda name: next(
+            (model for model in models if model.name == name),
+            None,
+        ),
+    )
+    monkeypatch.setattr("deerflow.acp.agent.get_app_config", lambda: app_config)
+    return app_config
+
+
 def test_config_paths_do_not_depend_on_client_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -87,6 +113,7 @@ local_acp:
   checkpointer_path: ./state/checkpoints.db
   session_store_path: ./state/sessions.db
   thinking_enabled: false
+  enable_bash: true
   accept_client_mcp_servers: true
 """,
         encoding="utf-8",
@@ -96,6 +123,7 @@ local_acp:
     monkeypatch.chdir(client_workspace)
     monkeypatch.delenv("DEER_FLOW_CONFIG_PATH", raising=False)
     monkeypatch.delenv("DEER_FLOW_HOME", raising=False)
+    monkeypatch.delenv("DEER_FLOW_ACP_ENABLE_BASH", raising=False)
 
     config = LocalACPConfig.from_file(str(config_path))
 
@@ -103,6 +131,7 @@ local_acp:
     assert config.session_store_path == config_dir / "state" / "sessions.db"
     assert config.deerflow_home == config_dir / "state" / "home"
     assert config.thinking_enabled is False
+    assert config.enable_bash is True
     assert config.accept_client_mcp_servers is True
     assert "DEER_FLOW_CONFIG_PATH" not in os.environ
 
@@ -140,6 +169,23 @@ async def test_initialize_advertises_text_only_stable_capabilities(
 
 
 @pytest.mark.asyncio
+async def test_initialize_advertises_remote_transports_when_client_mcp_is_enabled(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    agent = DeerFlowACPAgent(
+        make_config(tmp_path, accept_client_mcp_servers=True),
+        store,
+        FakeRuntime(),
+    )
+
+    response = await agent.initialize(protocol_version=1)
+
+    assert response.agent_capabilities.mcp_capabilities.http is True
+    assert response.agent_capabilities.mcp_capabilities.sse is True
+
+
+@pytest.mark.asyncio
 async def test_new_session_rejects_client_directories_and_mcp(
     tmp_path: Path,
     store: LocalACPSessionStore,
@@ -160,13 +206,24 @@ async def test_new_session_rejects_client_directories_and_mcp(
     assert session.cwd == str(tmp_path)
     assert response.modes.current_mode_id == "plan"
     assert {option.id for option in response.config_options or []} == {
+        "model",
         "thinking_enabled",
     }
     assert all(option.type == "select" for option in response.config_options or [])
-    assert all(
-        {item.value for item in option.options} == {"on", "off"}
-        for option in response.config_options or []
+    model_option = next(
+        option for option in response.config_options or [] if option.id == "model"
     )
+    assert model_option.current_value == "model-b"
+    assert [(item.name, item.value) for item in model_option.options] == [
+        ("Model A", "model-a"),
+        ("model-b", "model-b"),
+    ]
+    thinking_option = next(
+        option
+        for option in response.config_options or []
+        if option.id == "thinking_enabled"
+    )
+    assert {item.value for item in thinking_option.options} == {"on", "off"}
 
 
 @pytest.mark.asyncio
@@ -282,27 +339,157 @@ async def test_trusted_stdio_client_mcp_is_session_scoped_and_released(
 
 
 @pytest.mark.asyncio
-async def test_trusted_client_mcp_rejects_non_stdio_transport(
+async def test_trusted_sse_client_mcp_is_session_scoped_and_preserves_headers(
     tmp_path: Path,
     store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    agent = DeerFlowACPAgent(
+        make_config(tmp_path, accept_client_mcp_servers=True),
+        store,
+        runtime,
+    )
+    server = schema.SseMcpServer(
+        type="sse",
+        name="remote",
+        url="https://example.test/mcp/sse",
+        headers=[schema.HttpHeader(name="Authorization", value="Bearer test-token")],
+    )
+
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[server])
+
+    binding = runtime.client_mcp_bindings[created.session_id]
+    config = binding.extensions_config.mcp_servers["remote"]
+    assert config.type == "sse"
+    assert config.url == "https://example.test/mcp/sse"
+    assert config.headers == {"Authorization": "Bearer test-token"}
+    assert config.tool_name_prefix is True
+
+    await agent.shutdown()
+    assert created.session_id not in runtime.client_mcp_bindings
+    assert runtime.released_client_mcp == [created.session_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server",
+    [
+        schema.McpServerStdio(
+            name="local",
+            command="example-mcp",
+            args=[],
+            env=[],
+        ),
+        schema.SseMcpServer(
+            type="sse",
+            name="sse-remote",
+            url="https://example.test/mcp/sse",
+            headers=[],
+        ),
+        schema.HttpMcpServer(
+            type="http",
+            name="http-remote",
+            url="https://example.test/mcp",
+            headers=[],
+        ),
+    ],
+    ids=["stdio", "sse", "http"],
+)
+async def test_client_mcp_transports_require_master_switch(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+    server: Any,
+) -> None:
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, FakeRuntime())
+
+    with pytest.raises(RequestError) as error:
+        await agent.new_session(cwd=str(tmp_path), mcp_servers=[server])
+
+    assert error.value.code == -32602
+    assert "accept_client_mcp_servers" in str(error.value.data)
+
+
+@pytest.mark.asyncio
+async def test_trusted_http_client_mcp_is_session_scoped_and_preserves_headers(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    agent = DeerFlowACPAgent(
+        make_config(tmp_path, accept_client_mcp_servers=True),
+        store,
+        runtime,
+    )
+    server = schema.HttpMcpServer(
+        type="http",
+        name="remote",
+        url="https://example.test/mcp",
+        headers=[schema.HttpHeader(name="Authorization", value="Bearer test-token")],
+    )
+
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[server])
+
+    binding = runtime.client_mcp_bindings[created.session_id]
+    config = binding.extensions_config.mcp_servers["remote"]
+    assert config.type == "http"
+    assert config.url == "https://example.test/mcp"
+    assert config.headers == {"Authorization": "Bearer test-token"}
+    assert config.tool_name_prefix is True
+
+    await agent.shutdown()
+    assert created.session_id not in runtime.client_mcp_bindings
+    assert runtime.released_client_mcp == [created.session_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["sse", "http"])
+@pytest.mark.parametrize(
+    ("url", "headers", "message"),
+    [
+        ("file:///tmp/mcp", [], "valid http(s) URL"),
+        (
+            "https://example.test/mcp/sse",
+            [
+                schema.HttpHeader(name="Authorization", value="one"),
+                schema.HttpHeader(name="authorization", value="two"),
+            ],
+            "duplicate HTTP header",
+        ),
+    ],
+)
+async def test_trusted_remote_client_mcp_rejects_invalid_config(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+    transport: str,
+    url: str,
+    headers: list[schema.HttpHeader],
+    message: str,
 ) -> None:
     agent = DeerFlowACPAgent(
         make_config(tmp_path, accept_client_mcp_servers=True),
         store,
         FakeRuntime(),
     )
-    server = schema.HttpMcpServer(
-        type="http",
-        name="remote",
-        url="https://example.test/mcp",
-        headers=[],
-    )
+    if transport == "sse":
+        server: Any = schema.SseMcpServer(
+            type="sse",
+            name="remote",
+            url=url,
+            headers=headers,
+        )
+    else:
+        server = schema.HttpMcpServer(
+            type="http",
+            name="remote",
+            url=url,
+            headers=headers,
+        )
 
     with pytest.raises(RequestError) as error:
         await agent.new_session(cwd=str(tmp_path), mcp_servers=[server])
 
     assert error.value.code == -32602
-    assert "only stdio" in str(error.value.data)
+    assert message in str(error.value.data)
 
 
 @pytest.mark.asyncio
@@ -333,6 +520,18 @@ async def test_session_modes_config_list_and_load_history(
         ).current_value
         == "off"
     )
+    options = await agent.set_config_option("model", created.session_id, "model-a")
+    assert (
+        next(
+            option for option in options.config_options if option.id == "model"
+        ).current_value
+        == "model-a"
+    )
+    stored = await store.get(created.session_id)
+    assert stored is not None and stored.model_name == "model-a"
+    with pytest.raises(RequestError) as model_error:
+        await agent.set_config_option("model", created.session_id, "missing-model")
+    assert model_error.value.code == -32602
     with pytest.raises(RequestError):
         await agent.set_config_option("subagent_enabled", created.session_id, "on")
 
@@ -345,6 +544,12 @@ async def test_session_modes_config_list_and_load_history(
         mcp_servers=[],
     )
     assert loaded.modes.current_mode_id == "default"
+    assert (
+        next(
+            option for option in loaded.config_options or [] if option.id == "model"
+        ).current_value
+        == "model-a"
+    )
     assert [type(update) for _, update in connection.updates] == [
         schema.UserMessageChunk,
         schema.AgentThoughtChunk,
@@ -434,6 +639,9 @@ async def test_prompt_is_text_only_and_one_active_prompt_per_session(
     with pytest.raises(RequestError) as busy_error:
         await agent.prompt([acp.text_block("second")], created.session_id)
     assert busy_error.value.code == -32001
+    with pytest.raises(RequestError) as model_busy_error:
+        await agent.set_config_option("model", created.session_id, "model-a")
+    assert model_busy_error.value.code == -32001
 
     await agent.cancel(created.session_id)
     response = await first

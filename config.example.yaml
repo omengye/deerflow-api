@@ -101,7 +101,10 @@ local_acp:
   max_active_runs: 2
   run_timeout_seconds: 600
   session_page_size: 50
-  # null inherits api.model_name (and ultimately default_model).
+  # null inherits api.model_name (and ultimately default_model). ACP clients
+  # that support stable configOptions can override this per session by choosing
+  # from the top-level models list; the selected model is persisted with the
+  # ACP session.
   model_name: null
   thinking_enabled: true
   plan_mode: true
@@ -109,12 +112,17 @@ local_acp:
   agent_name: null
   # session/new.cwd is mounted as /mnt/user-data/workspace for this local
   # Agent. This requires LocalSandboxProvider or LocalWslProvider. The local
-  # ACP runtime omits bash, external ACP-agent, and subagent tools so project
-  # access stays inside cwd; read/write/move/delete use structured file tools.
-  # Trusted local clients only. When enabled, ACP stdio mcpServers are launched
-  # per session, kept in memory, and cleaned up when the client disconnects.
-  # Enabling this adds an external command/tool surface and therefore opts out
-  # of the strict file-only boundary described above.
+  # ACP runtime omits bash by default. Trusted local clients may opt in; Bash
+  # then runs through the configured sandbox and can access the network and any
+  # filesystem locations visible to that sandbox. WSL is not a strict project
+  # boundary because mounted Windows drives remain reachable.
+  enable_bash: false
+  # External ACP-agent and subagent tools remain unavailable in either mode.
+  # Trusted local clients only. When enabled, ACP stdio, SSE, and HTTP
+  # (Streamable HTTP) mcpServers are attached per session, kept in memory, and
+  # cleaned up when the client disconnects. Remote URLs and headers are supplied
+  # by the client. Enabling this adds external command, outbound connection, and
+  # tool surfaces and therefore opts out of the strict file-only boundary.
   accept_client_mcp_servers: false
 
 stream_bridge:
@@ -459,6 +467,8 @@ tools:
   - name: host_opencli
     group: host:opencli
     use: deerflow.tools.host_opencli:host_opencli_tool
+    # Optional. Useful on Windows when OpenCLI is installed as a .cmd shim.
+    # executable: 'C:\Users\YOUR_USER\AppData\Local\Microsoft\WindowsApps\opencli.cmd'
   - name: bash
     group: bash
     use: deerflow.sandbox.tools:bash_tool

@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 const HANDSHAKE_VERSION: &str = "DFACP/1";
 const ENDPOINT_FILENAME: &str = "endpoint.json";
 const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const FORCED_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -459,6 +461,137 @@ fn start_timeout() -> Duration {
         .unwrap_or(DEFAULT_START_TIMEOUT)
 }
 
+fn stop_timeout() -> Duration {
+    env::var("DEER_FLOW_ACP_DAEMON_STOP_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_STOP_TIMEOUT)
+}
+
+#[cfg(windows)]
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> io::Result<bool> {
+    use std::ffi::c_void;
+
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0x0000_0000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    const WAIT_FAILED: u32 = 0xffff_ffff;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(ERROR_INVALID_PARAMETER) => Ok(true),
+            _ => Err(error),
+        };
+    }
+    let milliseconds = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+    let result = unsafe { WaitForSingleObject(handle, milliseconds) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    match result {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        value => Err(io::Error::other(format!(
+            "unexpected process wait result: {value}"
+        ))),
+    }
+}
+
+#[cfg(windows)]
+fn force_terminate_process(pid: u32) -> io::Result<()> {
+    use std::ffi::c_void;
+
+    const PROCESS_TERMINATE: u32 = 0x0000_0001;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(ERROR_INVALID_PARAMETER) => Ok(()),
+            _ => Err(error),
+        };
+    }
+    let terminated = unsafe { TerminateProcess(handle, 1) };
+    let error = if terminated == 0 {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe {
+        CloseHandle(handle);
+    }
+    match error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> io::Result<bool> {
+    const ESRCH: i32 = 3;
+
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    if unsafe { kill(pid as i32, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(ESRCH) => Ok(false),
+        _ => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    while process_is_running(pid)? && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(!process_is_running(pid)?)
+}
+
+#[cfg(unix)]
+fn force_terminate_process(pid: u32) -> io::Result<()> {
+    const ESRCH: i32 = 3;
+    const SIGKILL: i32 = 9;
+
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    if unsafe { kill(pid as i32, SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(ESRCH) => Ok(()),
+        _ => Err(error),
+    }
+}
+
 fn wait_for_status(cli: &Cli, path: &Path) -> Result<Endpoint> {
     let deadline = Instant::now() + start_timeout();
     let mut last_error = String::from("endpoint has not been published");
@@ -478,11 +611,11 @@ fn wait_for_status(cli: &Cli, path: &Path) -> Result<Endpoint> {
 }
 
 fn ensure_running(cli: &Cli, path: &Path) -> Result<Endpoint> {
-    if let Ok(endpoint) = load_endpoint(path) {
-        if endpoint_is_live(&endpoint) {
-            validate_config(&endpoint, cli.config.as_deref())?;
-            return Ok(endpoint);
-        }
+    if let Ok(endpoint) = load_endpoint(path)
+        && endpoint_is_live(&endpoint)
+    {
+        validate_config(&endpoint, cli.config.as_deref())?;
+        return Ok(endpoint);
     }
     if !cli.auto_start && cli.mode != Mode::Start {
         return Err("DeerFlow ACP daemon is not running".into());
@@ -559,12 +692,25 @@ fn run() -> Result<()> {
                 load_endpoint(&path).map_err(|_| "DeerFlow ACP daemon is not running")?;
             validate_config(&endpoint, cli.config.as_deref())?;
             connect_command(&endpoint, "STOP").map_err(|error| error.to_string())?;
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while path.exists() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(50));
+            if !wait_for_process_exit(endpoint.pid, stop_timeout())? {
+                eprintln!(
+                    "deerflow-acp: daemon pid={} did not exit after STOP; forcing termination",
+                    endpoint.pid
+                );
+                force_terminate_process(endpoint.pid)?;
+                if !wait_for_process_exit(endpoint.pid, FORCED_STOP_TIMEOUT)? {
+                    return Err(format!(
+                        "daemon pid={} did not exit after forced termination",
+                        endpoint.pid
+                    )
+                    .into());
+                }
             }
-            if path.exists() {
-                return Err("daemon accepted stop request but did not exit in time".into());
+            if let Ok(current) = load_endpoint(&path)
+                && current.pid == endpoint.pid
+                && current.token == endpoint.token
+            {
+                fs::remove_file(&path)?;
             }
             println!("stopped");
             Ok(())
@@ -576,6 +722,16 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("deerflow-acp: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    #[test]
+    fn current_process_is_not_reported_as_exited() {
+        assert!(!wait_for_process_exit(std::process::id(), Duration::ZERO).unwrap());
     }
 }
 

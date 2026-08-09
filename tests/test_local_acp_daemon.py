@@ -160,3 +160,28 @@ async def test_daemon_rejects_bad_token(tmp_path: Path) -> None:
     await writer.wait_closed()
     await daemon.close()
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_daemon_close_aborts_an_active_acp_bridge(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    store = LocalACPSessionStore(config.session_store_path)
+    store.setup()
+    daemon = ACPDaemon(config, store, FakeRuntime(), tmp_path / "runtime", token="test-token")  # type: ignore[arg-type]
+    endpoint = await daemon.start()
+
+    reader, writer, response = await connect(endpoint, "ACP")
+    assert response == "OK"
+
+    await asyncio.wait_for(daemon.close(), timeout=1)
+
+    try:
+        assert await asyncio.wait_for(reader.read(), timeout=1) == b""
+    except ConnectionResetError:
+        pass
+    writer.close()
+    store.close()
+    assert daemon._active is False
+    assert daemon._active_task is None
+    assert daemon._active_writer is None
+    assert not daemon.endpoint_path.exists()

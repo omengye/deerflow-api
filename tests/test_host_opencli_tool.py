@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +26,18 @@ def test_host_opencli_schema_exposes_arguments_without_pydantic_varargs() -> Non
     arguments_schema = schema["properties"]["arguments"]
     assert {"items": {"type": "string"}, "type": "array"} in arguments_schema["anyOf"]
     assert "v__args" not in schema["properties"]
+
+
+def test_host_opencli_executable_can_be_set_in_tool_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    app_config = SimpleNamespace(
+        get_tool_config=lambda _name: SimpleNamespace(
+            model_extra={"executable": r"C:\Users\example\WindowsApps\opencli.cmd"}
+        )
+    )
+    monkeypatch.delenv("OPENCLI_BIN", raising=False)
+    monkeypatch.setattr(host_opencli_module, "get_app_config", lambda: app_config)
+
+    assert host_opencli_module._get_opencli_executable() == r"C:\Users\example\WindowsApps\opencli.cmd"
 
 
 @pytest.mark.asyncio
@@ -64,6 +77,7 @@ async def test_host_opencli_allows_an_entire_site(monkeypatch: pytest.MonkeyPatc
         return _FakeProcess()
 
     monkeypatch.setattr(host_opencli_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(host_opencli_module, "_get_opencli_executable", lambda: "opencli")
 
     result = await host_opencli_module._run_host_opencli("twitter", "search", ["openai", "--limit", "5"])
 

@@ -91,6 +91,7 @@ class LocalACPConfig:
     max_concurrent_subagents: int = 1
     recursion_limit: int = 200
     agent_name: str | None = None
+    enable_bash: bool = False
     accept_client_mcp_servers: bool = False
 
     @classmethod
@@ -175,6 +176,13 @@ class LocalACPConfig:
             max_concurrent_subagents=1,
             recursion_limit=recursion_limit,
             agent_name=_value(local, "agent_name", api.get("agent_name")),
+            enable_bash=_as_bool(
+                os.getenv(
+                    "DEER_FLOW_ACP_ENABLE_BASH",
+                    _value(local, "enable_bash", False),
+                ),
+                name="local_acp.enable_bash",
+            ),
             accept_client_mcp_servers=_as_bool(
                 os.getenv(
                     "DEER_FLOW_ACP_ACCEPT_CLIENT_MCP_SERVERS",

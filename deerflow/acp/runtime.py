@@ -25,6 +25,13 @@ _LOCAL_ACP_EXCLUDED_TOOLS = {
 }
 
 
+def _excluded_tool_names(config: LocalACPConfig) -> set[str]:
+    excluded = set(_LOCAL_ACP_EXCLUDED_TOOLS)
+    if config.enable_bash:
+        excluded.discard("bash")
+    return excluded
+
+
 class LocalACPRuntime:
     """Owns the ACP-only checkpointer and embedded DeerFlow clients."""
 
@@ -108,7 +115,7 @@ class LocalACPRuntime:
                     "recursion_limit": session.recursion_limit,
                     "agent_name": session.agent_name,
                     "checkpoint_channel_mode": "full",
-                    "excluded_tool_names": _LOCAL_ACP_EXCLUDED_TOOLS,
+                    "excluded_tool_names": _excluded_tool_names(self.config),
                 }
                 if binding is not None:
                     from deerflow.mcp.tools import get_mcp_tools

@@ -118,6 +118,8 @@ local_acp:
   checkpointer_path: ./data/checkpoints.db
   session_store_path: ./data/sessions.db
   accept_client_mcp_servers: true
+sandbox:
+  use: deerflow.sandbox.local:LocalSandboxProvider
 """.strip()
         + "\n",
         encoding="utf-8",

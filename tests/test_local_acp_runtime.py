@@ -68,6 +68,82 @@ async def test_runtime_warmup_builds_and_reuses_default_client(
 
 
 @pytest.mark.asyncio
+async def test_runtime_builds_a_new_client_after_session_model_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instances: list[FakeClient] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            instances.append(self)
+
+    monkeypatch.setattr(runtime_module, "DeerFlowClient", FakeClient)
+    config = LocalACPConfig(
+        config_path=tmp_path / "config.yaml",
+        checkpointer_path=tmp_path / "checkpoints.db",
+        session_store_path=tmp_path / "sessions.db",
+    )
+    runtime = LocalACPRuntime(config)
+    runtime._checkpointer = object()
+    session = LocalACPSession(
+        session_id="model-switch-session",
+        cwd=str(tmp_path),
+        title=None,
+        updated_at="",
+        model_name="model-a",
+        thinking_enabled=True,
+        subagent_enabled=False,
+        plan_mode=True,
+        max_concurrent_subagents=1,
+        recursion_limit=200,
+    )
+
+    first = await runtime._client_for(session)
+    session.model_name = "model-b"
+    second = await runtime._client_for(session)
+
+    assert first is not second
+    assert [instance.kwargs["model_name"] for instance in instances] == [
+        "model-a",
+        "model-b",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_includes_bash_only_when_explicitly_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instances: list[FakeClient] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            instances.append(self)
+
+        def warmup(self) -> None:
+            pass
+
+    monkeypatch.setattr(runtime_module, "DeerFlowClient", FakeClient)
+    config = LocalACPConfig(
+        config_path=tmp_path / "config.yaml",
+        checkpointer_path=tmp_path / "checkpoints.db",
+        session_store_path=tmp_path / "sessions.db",
+        enable_bash=True,
+    )
+    runtime = LocalACPRuntime(config)
+    runtime._checkpointer = object()
+
+    await runtime.warmup()
+
+    assert instances[0].kwargs["excluded_tool_names"] == {
+        "invoke_acp_agent",
+        "task",
+        "task_status",
+    }
+
+
+@pytest.mark.asyncio
 async def test_runtime_injects_client_mcp_tools_into_a_session_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -10,6 +10,8 @@ from typing import Any
 import acp
 from acp import RequestError, schema
 
+from deerflow.config import get_app_config
+
 from .client_mcp import ClientMCPBinding, normalize_client_mcp_servers
 from .config import LocalACPConfig
 from .event_mapper import ACPEventMapper, _display_text, _message_uuid
@@ -57,7 +59,10 @@ class DeerFlowACPAgent:
             protocol_version=acp.PROTOCOL_VERSION,
             agent_capabilities=schema.AgentCapabilities(
                 load_session=True,
-                mcp_capabilities=schema.McpCapabilities(http=False, sse=False),
+                mcp_capabilities=schema.McpCapabilities(
+                    http=self.config.accept_client_mcp_servers,
+                    sse=self.config.accept_client_mcp_servers,
+                ),
                 prompt_capabilities=schema.PromptCapabilities(
                     audio=False,
                     embedded_context=False,
@@ -139,7 +144,33 @@ class DeerFlowACPAgent:
                 value="off",
             ),
         ]
-        return [
+        options: list[
+            schema.SessionConfigOptionSelect | schema.SessionConfigOptionBoolean
+        ] = []
+        app_config = get_app_config()
+        if app_config.models:
+            available_models = {model.name: model for model in app_config.models}
+            current_model = session.model_name
+            if current_model not in available_models:
+                current_model = app_config.get_default_model_name()
+            options.append(
+                schema.SessionConfigOptionSelect(
+                    type="select",
+                    id="model",
+                    name="Model",
+                    description="Choose the configured model for this session.",
+                    current_value=current_model,
+                    options=[
+                        schema.SessionConfigSelectOption(
+                            name=model.display_name or model.name,
+                            value=model.name,
+                            description=model.description,
+                        )
+                        for model in available_models.values()
+                    ],
+                )
+            )
+        options.append(
             schema.SessionConfigOptionSelect(
                 type="select",
                 id="thinking_enabled",
@@ -147,8 +178,9 @@ class DeerFlowACPAgent:
                 description="Show model reasoning updates when available.",
                 current_value="on" if session.thinking_enabled else "off",
                 options=enabled_options,
-            ),
-        ]
+            )
+        )
+        return options
 
     async def new_session(
         self,
@@ -300,20 +332,28 @@ class DeerFlowACPAgent:
         **kwargs: Any,
     ) -> acp.SetSessionConfigOptionResponse:
         del kwargs
-        if config_id != "thinking_enabled":
+        if config_id == "model":
+            if not isinstance(value, str) or get_app_config().get_model_config(value) is None:
+                raise RequestError.invalid_params(
+                    {"details": f"Unknown configured model: {value}"}
+                )
+            session = await self._require_idle_session(session_id)
+            session.model_name = value
+        elif config_id == "thinking_enabled":
+            if isinstance(value, bool):
+                enabled = value
+            elif value in {"on", "off"}:
+                enabled = value == "on"
+            else:
+                raise RequestError.invalid_params(
+                    {"details": f"Unsupported value for config option {config_id}: {value}"}
+                )
+            session = await self._require_idle_session(session_id)
+            session.thinking_enabled = enabled
+        else:
             raise RequestError.invalid_params(
                 {"details": f"Unsupported config option: {config_id}"}
             )
-        if isinstance(value, bool):
-            enabled = value
-        elif value in {"on", "off"}:
-            enabled = value == "on"
-        else:
-            raise RequestError.invalid_params(
-                {"details": f"Unsupported value for config option {config_id}: {value}"}
-            )
-        session = await self._require_idle_session(session_id)
-        setattr(session, config_id, enabled)
         await self.store.save(session)
         return acp.SetSessionConfigOptionResponse(
             config_options=self._config_options(session)
