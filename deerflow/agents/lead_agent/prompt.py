@@ -196,7 +196,10 @@ def _build_available_subagents_description(available_names: list[str], bash_avai
     return "\n".join(lines)
 
 
-def _build_subagent_section(max_concurrent: int) -> str:
+def _build_subagent_section(
+    max_concurrent: int,
+    available_tool_names: set[str] | None = None,
+) -> str:
     """Build the subagent system prompt section with dynamic concurrency limit.
 
     Args:
@@ -223,11 +226,20 @@ def _build_subagent_section(max_concurrent: int) -> str:
     # Dynamically build subagent type descriptions from registry (aligned with Codex's
     # agent_type_description pattern where all registered roles are listed in the tool spec).
     available_subagents = _build_available_subagents_description(available_names, bash_available)
-    direct_tool_examples = "bash, ls, read_file, web_search, etc." if bash_available else "ls, read_file, web_search, etc."
+    direct_candidates = [
+        name
+        for name in ("bash", "ls", "read_file", "web_search", "web_fetch")
+        if available_tool_names is None or name in available_tool_names
+    ]
+    direct_tool_examples = ", ".join(direct_candidates) or "your available direct tools"
     direct_execution_example = (
         '# User asks: "Run the tests"\n# Thinking: Cannot decompose into parallel sub-tasks\n# → Execute directly\n\nbash("npm test")  # Direct execution, not task()'
-        if bash_available
-        else '# User asks: "Read the README"\n# Thinking: Single straightforward file read\n# → Execute directly\n\nread_file("/mnt/user-data/workspace/README.md")  # Direct execution, not task()'
+        if "bash" in direct_candidates
+        else (
+            '# User asks: "Read the README"\n# Thinking: Single straightforward file read\n# → Execute directly\n\nread_file("/mnt/user-data/workspace/README.md")  # Direct execution, not task()'
+            if "read_file" in direct_candidates
+            else "# Use an available direct tool or answer directly; do not wrap a single operation in task()."
+        )
     )
     return f"""<subagent_system>
 **🚀 SUBAGENT MODE ACTIVE - DECOMPOSE, DELEGATE, SYNTHESIZE**
@@ -694,8 +706,10 @@ def get_deferred_tools_prompt_section() -> str:
     return _get_section()
 
 
-def _build_acp_section() -> str:
+def _build_acp_section(available_tool_names: set[str] | None = None) -> str:
     """Build the ACP agent prompt section, only if ACP agents are configured."""
+    if available_tool_names is not None and "invoke_acp_agent" not in available_tool_names:
+        return ""
     try:
         from deerflow.config.acp_config import get_acp_agents
 
@@ -736,13 +750,25 @@ def _build_custom_mounts_section() -> str:
     return f"\n**Custom Mounted Directories:**\n{mounts_list}\n- If the user needs files outside `/mnt/user-data`, use these absolute container paths directly when they match the requested directory"
 
 
-def apply_prompt_template(subagent_enabled: bool = False, max_concurrent_subagents: int = 3, *, agent_name: str | None = None, available_skills: set[str] | None = None) -> str:
+def apply_prompt_template(
+    subagent_enabled: bool = False,
+    max_concurrent_subagents: int = 3,
+    *,
+    agent_name: str | None = None,
+    available_skills: set[str] | None = None,
+    available_tool_names: set[str] | None = None,
+    system_prompt_overlay: str | None = None,
+) -> str:
     # Get memory context
     memory_context = _get_memory_context(agent_name)
 
     # Include subagent section only if enabled (from runtime parameter)
     n = max_concurrent_subagents
-    subagent_section = _build_subagent_section(n) if subagent_enabled else ""
+    subagent_section = (
+        _build_subagent_section(n, available_tool_names)
+        if subagent_enabled
+        else ""
+    )
 
     # Add subagent reminder to critical_reminders if enabled
     subagent_reminder = (
@@ -763,13 +789,21 @@ def apply_prompt_template(subagent_enabled: bool = False, max_concurrent_subagen
     )
 
     # Get skills section
-    skills_section = get_skills_prompt_section(available_skills)
+    skills_section = (
+        get_skills_prompt_section(available_skills)
+        if available_tool_names is None or "read_file" in available_tool_names
+        else ""
+    )
 
     # Get deferred tools section (tool_search)
-    deferred_tools_section = get_deferred_tools_prompt_section()
+    deferred_tools_section = (
+        get_deferred_tools_prompt_section()
+        if available_tool_names is None or "tool_search" in available_tool_names
+        else ""
+    )
 
     # Build ACP agent section only if ACP agents are configured
-    acp_section = _build_acp_section()
+    acp_section = _build_acp_section(available_tool_names)
     custom_mounts_section = _build_custom_mounts_section()
     acp_and_mounts_section = "\n".join(section for section in (acp_section, custom_mounts_section) if section)
 
@@ -786,4 +820,48 @@ def apply_prompt_template(subagent_enabled: bool = False, max_concurrent_subagen
         acp_section=acp_and_mounts_section,
     )
 
+    if available_tool_names is not None:
+        if "ask_clarification" not in available_tool_names:
+            start = prompt.find("<clarification_system>")
+            end = prompt.find("</clarification_system>")
+            if start >= 0 and end >= start:
+                prompt = prompt[:start] + prompt[end + len("</clarification_system>") :]
+        if "list_uploaded_files" not in available_tool_names:
+            prompt = prompt.replace(
+                "- Files uploaded earlier in the conversation are listed there by name only — call `list_uploaded_files` for their paths, then call it again with a `filename` to get that file's document outline\n",
+                "",
+            )
+        if "read_file" not in available_tool_names:
+            prompt = prompt.replace(
+                "- Use `read_file` tool to read uploaded files using their paths from the list\n",
+                "",
+            )
+        if "present_files" not in available_tool_names:
+            prompt = prompt.replace(
+                "- Final deliverables must be copied to `/mnt/user-data/outputs` and presented using `present_files` tool\n",
+                "- Return final results directly unless another available tool provides a deliverable link\n",
+            )
+        if not skills_section:
+            prompt = prompt.replace(
+                "- Skill First: Always load the relevant skill before starting **complex** tasks.\n",
+                "",
+            ).replace(
+                "- Progressive Loading: Load resources incrementally as referenced in skills\n",
+                "",
+            )
+        research_tools = [
+            name for name in ("web_search", "web_fetch") if name in available_tool_names
+        ]
+        if not research_tools:
+            prompt = prompt.replace(
+                "- **When to Use**: MANDATORY after web_search, web_fetch, or any external information source",
+                "- **When to Use**: MANDATORY after using any external information source",
+            ).replace(
+                "1. Use web_search to find sources → Extract {title, url, snippet} from results",
+                "1. Use available research tools to find sources → Extract {title, url, snippet} from results",
+            )
+
+    overlay = (system_prompt_overlay or "").strip()
+    if overlay:
+        prompt += f"\n\n{overlay}"
     return prompt + f"\n<current_date>{datetime.now().strftime('%Y-%m-%d, %A')}</current_date>"

@@ -10,9 +10,10 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
 from langchain.tools import BaseTool
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -135,6 +136,7 @@ class SubagentExecutor:
         trace_id: str | None = None,
         thinking_enabled: bool = False,
         deferred_registry: "DeferredToolRegistry | None" = None,
+        middlewares: list[AgentMiddleware] | None = None,
     ):
         """Initialize the executor.
 
@@ -154,6 +156,7 @@ class SubagentExecutor:
         self.thread_id = thread_id
         self.thinking_enabled = thinking_enabled
         self.deferred_registry = deferred_registry
+        self.middlewares = list(middlewares or [])
         # Generate trace_id if not provided (for top-level calls)
         self.trace_id = trace_id or str(uuid.uuid4())[:8]
 
@@ -216,6 +219,7 @@ class SubagentExecutor:
         # so TokenUsageMiddleware and LoopDetectionMiddleware can push events in the
         # isolated subagent thread (where get_stream_writer() is not available).
         middlewares = build_subagent_runtime_middlewares(lazy_init=True, stream_callback=stream_callback)
+        middlewares.extend(self.middlewares)
         if self.deferred_registry is not None:
             from deerflow.agents.middlewares.deferred_tool_filter_middleware import DeferredToolFilterMiddleware
 
@@ -238,7 +242,7 @@ class SubagentExecutor:
         agent = create_agent(
             model=model,
             tools=self.tools,
-            middleware=middlewares,
+            middleware=cast(Any, middlewares),
             system_prompt=self.config.system_prompt,
             state_schema=ThreadState,
             context_schema=AgentContext,

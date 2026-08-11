@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from typing import Any
@@ -13,23 +15,14 @@ from deerflow.client import DeerFlowClient, StreamEvent
 
 from .client_mcp import ClientMCPBinding
 from .config import LocalACPConfig
+from .permission import ACPPermissionBroker, ACPPermissionMiddleware, PermissionHandler
+from .policy import LocalACPCapabilityPolicy
+from .session_coordinator import ACPSessionCoordinator
 from .session_store import LocalACPSession
 
 LiveEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
-_LOCAL_ACP_EXCLUDED_TOOLS = {
-    "bash",
-    "invoke_acp_agent",
-    "task",
-    "task_status",
-}
-
-
-def _excluded_tool_names(config: LocalACPConfig) -> set[str]:
-    excluded = set(_LOCAL_ACP_EXCLUDED_TOOLS)
-    if config.enable_bash:
-        excluded.discard("bash")
-    return excluded
+logger = logging.getLogger(__name__)
 
 
 class LocalACPRuntime:
@@ -37,12 +30,27 @@ class LocalACPRuntime:
 
     def __init__(self, config: LocalACPConfig):
         self.config = config
+        self.policy = LocalACPCapabilityPolicy.from_config(config)
+        self.session_coordinator = ACPSessionCoordinator()
+        self.permission_broker = ACPPermissionBroker(
+            self.policy,
+            session_owner=self.session_coordinator.owner,
+        )
+        self.permission_middleware = ACPPermissionMiddleware(self.permission_broker)
         self._checkpointer_cm: AbstractAsyncContextManager[Any] | None = None
         self._checkpointer: Any = None
         self._clients: dict[tuple[Any, ...], DeerFlowClient] = {}
         self._client_mcp_bindings: dict[str, ClientMCPBinding] = {}
         self._client_lock = asyncio.Lock()
         self._run_slots = asyncio.Semaphore(config.max_active_runs)
+
+    def bind_permission_handler(
+        self, connection_id: str, handler: PermissionHandler
+    ) -> None:
+        self.permission_broker.bind(handler, connection_id)
+
+    def unbind_permission_handler(self, connection_id: str) -> None:
+        self.permission_broker.unbind(connection_id)
 
     async def open(self) -> None:
         if self._checkpointer is not None:
@@ -59,14 +67,52 @@ class LocalACPRuntime:
 
     async def close(self) -> None:
         client_mcp_sessions = list(self._client_mcp_bindings)
-        for session_id in client_mcp_sessions:
-            await self.release_client_mcp(session_id)
+        if client_mcp_sessions:
+            results = await asyncio.gather(
+                *(
+                    self.release_client_mcp(session_id)
+                    for session_id in client_mcp_sessions
+                ),
+                return_exceptions=True,
+            )
+            for session_id, result in zip(client_mcp_sessions, results, strict=True):
+                if isinstance(result, BaseException):
+                    logger.warning(
+                        "Failed to release client MCP while closing ACP runtime for session %s",
+                        session_id,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
         self._clients.clear()
         cm = self._checkpointer_cm
         self._checkpointer_cm = None
         self._checkpointer = None
-        if cm is not None:
-            await cm.__aexit__(None, None, None)
+        try:
+            if cm is not None:
+                await cm.__aexit__(None, None, None)
+        finally:
+            await self._flush_memory()
+
+    async def _flush_memory(self) -> None:
+        try:
+            from deerflow.agents.memory import get_memory_manager, reset_memory_manager
+            from deerflow.config.memory_config import get_memory_config
+
+            memory_config = get_memory_config()
+            if not memory_config.enabled:
+                return
+            manager = get_memory_manager()
+            flushed = await asyncio.wait_for(
+                asyncio.to_thread(manager.shutdown_flush),
+                timeout=memory_config.shutdown_flush_timeout_seconds + 1.0,
+            )
+            if flushed is not False:
+                await asyncio.to_thread(reset_memory_manager)
+            else:
+                logger.warning("ACP memory queue did not drain during shutdown")
+        except TimeoutError:
+            logger.warning("ACP memory shutdown flush timed out")
+        except Exception:
+            logger.warning("ACP memory shutdown flush failed", exc_info=True)
 
     async def warmup(self) -> None:
         """Build and cache the default DeerFlow client graph without calling a model."""
@@ -78,9 +124,9 @@ class LocalACPRuntime:
             updated_at="",
             model_name=self.config.model_name,
             thinking_enabled=self.config.thinking_enabled,
-            subagent_enabled=False,
+            subagent_enabled=self.config.subagent_enabled,
             plan_mode=self.config.plan_mode,
-            max_concurrent_subagents=1,
+            max_concurrent_subagents=self.config.max_concurrent_subagents,
             recursion_limit=self.config.recursion_limit,
             agent_name=self.config.agent_name,
         )
@@ -104,18 +150,36 @@ class LocalACPRuntime:
         async with self._client_lock:
             client = self._clients.get(key)
             if client is None:
+                effective_subagents = (
+                    session.subagent_enabled and self.policy.subagents_enabled
+                )
                 kwargs: dict[str, Any] = {
                     "config_path": str(self.config.config_path),
                     "checkpointer": self._checkpointer,
                     "model_name": session.model_name,
                     "thinking_enabled": session.thinking_enabled,
-                    "subagent_enabled": False,
+                    "subagent_enabled": effective_subagents,
                     "plan_mode": session.plan_mode,
-                    "max_concurrent_subagents": 1,
+                    "max_concurrent_subagents": (
+                        session.max_concurrent_subagents if effective_subagents else 1
+                    ),
                     "recursion_limit": session.recursion_limit,
                     "agent_name": session.agent_name,
                     "checkpoint_channel_mode": "full",
-                    "excluded_tool_names": _excluded_tool_names(self.config),
+                    "excluded_tool_names": self.policy.excluded_tool_names(
+                        enable_bash=self.config.enable_bash
+                    ),
+                    "allowed_tool_names": (
+                        set(self.policy.tool_allowlist)
+                        if self.policy.tool_allowlist is not None
+                        else None
+                    ),
+                    "system_prompt_overlay": self.policy.prompt_overlay(),
+                    "subagent_system_prompt_overlay": self.policy.prompt_overlay(
+                        for_subagent=True
+                    ),
+                    "middlewares": [self.permission_middleware],
+                    "subagent_middlewares": [self.permission_middleware],
                 }
                 if binding is not None:
                     from deerflow.mcp.tools import get_mcp_tools
@@ -135,9 +199,12 @@ class LocalACPRuntime:
         """Attach an in-memory client MCP definition to one ACP session."""
 
         current = self._client_mcp_bindings.get(session_id)
-        if current is not None and binding is not None:
-            if current.fingerprint == binding.fingerprint:
-                return
+        if (
+            current is not None
+            and binding is not None
+            and current.fingerprint == binding.fingerprint
+        ):
+            return
         if current is not None:
             await self.release_client_mcp(session_id)
         if binding is not None:
@@ -146,7 +213,6 @@ class LocalACPRuntime:
     async def release_client_mcp(self, session_id: str) -> None:
         """Forget a session's client MCP config and close its MCP processes."""
 
-        self._client_mcp_bindings.pop(session_id, None)
         async with self._client_lock:
             stale_keys = [
                 key
@@ -159,6 +225,39 @@ class LocalACPRuntime:
         from deerflow.mcp.session_pool import get_session_pool
 
         await get_session_pool().close_scope(session_id)
+        # Keep the binding as a retry marker if close_scope raises. A later
+        # session load or daemon shutdown will attempt the cleanup again.
+        self._client_mcp_bindings.pop(session_id, None)
+
+    async def release_session(self, session_id: str) -> None:
+        try:
+            await self.release_client_mcp(session_id)
+        finally:
+            self.permission_broker.clear_session(session_id)
+
+    async def purge_checkpoints(self, session_ids: list[str]) -> None:
+        checkpointer = self._checkpointer
+        if checkpointer is None:
+            return
+        for session_id in session_ids:
+            try:
+                await checkpointer.adelete_thread(session_id)
+            except Exception:
+                logger.warning(
+                    "Failed to purge ACP checkpoints for session %s",
+                    session_id,
+                    exc_info=True,
+                )
+
+    def _memory_user_id(
+        self, session: LocalACPSession, workspace_path: str
+    ) -> str | None:
+        if self.config.memory_scope == "global":
+            return None
+        if self.config.memory_scope == "session":
+            return f"acp-session:{session.session_id}"
+        digest = hashlib.sha256(workspace_path.encode("utf-8")).hexdigest()[:24]
+        return f"acp-workspace:{digest}"
 
     async def astream(
         self,
@@ -195,6 +294,7 @@ class LocalACPRuntime:
                 thread_id=session.session_id,
                 live_event_callback=live_event_callback,
                 workspace_path=workspace_path,
+                user_id=self._memory_user_id(session, workspace_path),
             ):
                 yield event
 
@@ -217,3 +317,29 @@ class LocalACPRuntime:
             for message in messages
             if hasattr(message, "content") or isinstance(message, dict)
         ]
+
+    async def history_state(self, session_id: str) -> dict[str, Any]:
+        """Return replayable messages plus plan, artifact, and title state."""
+
+        checkpointer = self._checkpointer
+        if checkpointer is None:
+            raise RuntimeError("Local ACP runtime is not open")
+        checkpoint = await checkpointer.aget_tuple(
+            {"configurable": {"thread_id": session_id, "checkpoint_ns": ""}}
+        )
+        if checkpoint is None:
+            return {"messages": [], "todos": [], "artifacts": []}
+        values = checkpoint.checkpoint.get("channel_values", {})
+        messages = values.get("messages", [])
+        return {
+            "messages": [
+                DeerFlowClient._serialize_message(message)
+                if hasattr(message, "content")
+                else dict(message)
+                for message in messages
+                if hasattr(message, "content") or isinstance(message, dict)
+            ],
+            "todos": values.get("todos", []),
+            "artifacts": values.get("artifacts", []),
+            "title": values.get("title"),
+        }

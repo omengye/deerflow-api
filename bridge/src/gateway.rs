@@ -72,8 +72,8 @@ impl ConnectionSupervisor {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         eprintln!("deerflow-acp: gateway external connection #{id} started");
 
-        // Only one replacement may run at a time. A new initialize supersedes
-        // the previous transport because the local daemon accepts one ACP client.
+        // The gateway intentionally exposes one logical external transport at
+        // a time. Local stdio bridges can connect to the daemon independently.
         let _replacement = self.inner.replacement.lock().await;
         let previous = {
             let mut active = self.inner.active.lock().await;
@@ -212,7 +212,7 @@ async fn connect_daemon(path: &Path) -> Result<TcpStream> {
     let response = response.trim();
     if response != "OK" && !response.starts_with("OK ") {
         return Err(match response {
-            "BUSY" => "the local ACP daemon already has an active client".into(),
+            "BUSY" => "the local ACP daemon has reached its connection limit".into(),
             "UNAUTHORIZED" => "the local ACP daemon rejected its internal token".into(),
             "" => "the local ACP daemon closed during handshake".into(),
             value => format!("the local ACP daemon rejected the connection: {value}").into(),

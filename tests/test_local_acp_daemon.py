@@ -78,11 +78,15 @@ def test_endpoint_roundtrip_runtime_override_and_single_instance_lock(
 
 
 @pytest.mark.asyncio
-async def test_daemon_initialize_busy_status_stop_and_reconnect(tmp_path: Path) -> None:
+async def test_daemon_accepts_multiple_clients_status_stop_and_reconnect(
+    tmp_path: Path,
+) -> None:
     config = make_config(tmp_path)
     store = LocalACPSessionStore(config.session_store_path)
     store.setup()
-    daemon = ACPDaemon(config, store, FakeRuntime(), tmp_path / "runtime", token="test-token")  # type: ignore[arg-type]
+    daemon = ACPDaemon(
+        config, store, FakeRuntime(), tmp_path / "runtime", token="test-token"
+    )  # type: ignore[arg-type]
     endpoint = await daemon.start()
     assert DaemonEndpoint.load(daemon.endpoint_path) == endpoint
 
@@ -113,25 +117,50 @@ async def test_daemon_initialize_busy_status_stop_and_reconnect(tmp_path: Path) 
     initialized = json.loads(await first_reader.readline())
     assert initialized["result"]["protocolVersion"] == 1
 
-    busy_reader, busy_writer, busy = await connect(endpoint, "ACP")
-    assert busy == "BUSY"
-    assert await busy_reader.read() == b""
-    busy_writer.close()
-    await busy_writer.wait_closed()
+    second_reader, second_writer, second = await connect(endpoint, "ACP")
+    assert second == "OK"
+    second_writer.write(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name": "test-2", "version": "1"},
+                },
+            }
+        ).encode()
+        + b"\n"
+    )
+    await second_writer.drain()
+    second_initialized = json.loads(await second_reader.readline())
+    assert second_initialized["result"]["protocolVersion"] == 1
+
+    count_reader, count_writer, count_status = await connect(endpoint, "STATUS")
+    assert "connections=2" in count_status
+    assert await count_reader.read() == b""
+    count_writer.close()
+    await count_writer.wait_closed()
 
     first_writer.close()
     await first_writer.wait_closed()
     for _ in range(100):
-        if not daemon._active:
+        if len(daemon._connections) == 1:
             break
         await asyncio.sleep(0.01)
-    assert daemon._active is False
+    assert len(daemon._connections) == 1
 
     reconnect_reader, reconnect_writer, reconnect = await connect(endpoint, "ACP")
     assert reconnect == "OK"
     reconnect_writer.close()
     await reconnect_writer.wait_closed()
     await reconnect_reader.read()
+
+    second_writer.close()
+    await second_writer.wait_closed()
+    await second_reader.read()
 
     stop_reader, stop_writer, stopped = await connect(endpoint, "STOP")
     assert stopped == "OK"
@@ -146,11 +175,52 @@ async def test_daemon_initialize_busy_status_stop_and_reconnect(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_daemon_enforces_connection_capacity_without_blocking_control_commands(
+    tmp_path: Path,
+) -> None:
+    config = LocalACPConfig(
+        config_path=tmp_path / "config.yaml",
+        checkpointer_path=tmp_path / "checkpoints.db",
+        session_store_path=tmp_path / "sessions.db",
+        max_active_connections=1,
+    )
+    store = LocalACPSessionStore(config.session_store_path)
+    store.setup()
+    daemon = ACPDaemon(
+        config, store, FakeRuntime(), tmp_path / "runtime", token="test-token"
+    )  # type: ignore[arg-type]
+    endpoint = await daemon.start()
+
+    first_reader, first_writer, first = await connect(endpoint, "ACP")
+    assert first == "OK"
+
+    busy_reader, busy_writer, busy = await connect(endpoint, "ACP")
+    assert busy == "BUSY"
+    assert await busy_reader.read() == b""
+    busy_writer.close()
+    await busy_writer.wait_closed()
+
+    status_reader, status_writer, status = await connect(endpoint, "STATUS")
+    assert "connections=1" in status
+    assert await status_reader.read() == b""
+    status_writer.close()
+    await status_writer.wait_closed()
+
+    first_writer.close()
+    await first_writer.wait_closed()
+    await first_reader.read()
+    await daemon.close()
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_daemon_rejects_bad_token(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     store = LocalACPSessionStore(config.session_store_path)
     store.setup()
-    daemon = ACPDaemon(config, store, FakeRuntime(), tmp_path / "runtime", token="right")  # type: ignore[arg-type]
+    daemon = ACPDaemon(
+        config, store, FakeRuntime(), tmp_path / "runtime", token="right"
+    )  # type: ignore[arg-type]
     endpoint = await daemon.start()
     reader, writer = await asyncio.open_connection(endpoint.host, endpoint.port)
     writer.write(b"DFACP/1 wrong STATUS\n")
@@ -167,7 +237,9 @@ async def test_daemon_close_aborts_an_active_acp_bridge(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     store = LocalACPSessionStore(config.session_store_path)
     store.setup()
-    daemon = ACPDaemon(config, store, FakeRuntime(), tmp_path / "runtime", token="test-token")  # type: ignore[arg-type]
+    daemon = ACPDaemon(
+        config, store, FakeRuntime(), tmp_path / "runtime", token="test-token"
+    )  # type: ignore[arg-type]
     endpoint = await daemon.start()
 
     reader, writer, response = await connect(endpoint, "ACP")
@@ -181,7 +253,6 @@ async def test_daemon_close_aborts_an_active_acp_bridge(tmp_path: Path) -> None:
         pass
     writer.close()
     store.close()
-    assert daemon._active is False
-    assert daemon._active_task is None
-    assert daemon._active_writer is None
+    assert daemon._connections == {}
+    assert daemon._handlers == {}
     assert not daemon.endpoint_path.exists()

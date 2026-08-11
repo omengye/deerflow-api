@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -39,7 +40,7 @@ async def test_runtime_warmup_builds_and_reuses_default_client(
         thinking_enabled=False,
         subagent_enabled=True,
         plan_mode=False,
-        max_concurrent_subagents=7,
+        max_concurrent_subagents=3,
         recursion_limit=25,
         agent_name="test-agent",
     )
@@ -52,19 +53,23 @@ async def test_runtime_warmup_builds_and_reuses_default_client(
 
     assert len(instances) == 1
     assert instances[0].warmup_calls == 2
-    assert instances[0].kwargs == {
-        "config_path": str(config.config_path),
-        "checkpointer": checkpointer,
-        "model_name": "test-model",
-        "thinking_enabled": False,
-        "subagent_enabled": False,
-        "plan_mode": False,
-        "max_concurrent_subagents": 1,
-        "recursion_limit": 25,
-        "agent_name": "test-agent",
-        "checkpoint_channel_mode": "full",
-        "excluded_tool_names": {"bash", "invoke_acp_agent", "task", "task_status"},
-    }
+    kwargs = instances[0].kwargs
+    assert kwargs["config_path"] == str(config.config_path)
+    assert kwargs["checkpointer"] is checkpointer
+    assert kwargs["model_name"] == "test-model"
+    assert kwargs["thinking_enabled"] is False
+    assert kwargs["subagent_enabled"] is True
+    assert kwargs["max_concurrent_subagents"] == 3
+    assert kwargs["agent_name"] == "test-agent"
+    assert "task" not in kwargs["excluded_tool_names"]
+    assert "invoke_acp_agent" in kwargs["excluded_tool_names"]
+    assert "create_scheduled_task" in kwargs["excluded_tool_names"]
+    assert kwargs["system_prompt_overlay"]
+    assert (
+        "further delegation is unavailable" in kwargs["subagent_system_prompt_overlay"]
+    )
+    assert len(kwargs["middlewares"]) == 1
+    assert kwargs["subagent_middlewares"] == kwargs["middlewares"]
 
 
 @pytest.mark.asyncio
@@ -140,6 +145,11 @@ async def test_runtime_includes_bash_only_when_explicitly_enabled(
         "invoke_acp_agent",
         "task",
         "task_status",
+        "create_scheduled_task",
+        "list_scheduled_tasks",
+        "set_scheduled_task_enabled",
+        "delete_scheduled_task",
+        "list_scheduled_task_runs",
     }
 
 
@@ -210,6 +220,46 @@ async def test_runtime_injects_client_mcp_tools_into_a_session_only(
 
 
 @pytest.mark.asyncio
+async def test_runtime_retries_failed_client_mcp_scope_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[str] = []
+
+    class FakeSessionPool:
+        async def close_scope(self, session_id: str) -> None:
+            attempts.append(session_id)
+            if len(attempts) == 1:
+                raise RuntimeError("temporary cleanup failure")
+
+    monkeypatch.setattr(
+        "deerflow.mcp.session_pool.get_session_pool", lambda: FakeSessionPool()
+    )
+    runtime = LocalACPRuntime(
+        LocalACPConfig(
+            config_path=tmp_path / "config.yaml",
+            checkpointer_path=tmp_path / "checkpoints.db",
+            session_store_path=tmp_path / "sessions.db",
+            accept_client_mcp_servers=True,
+        )
+    )
+    binding = normalize_client_mcp_servers(
+        [schema.McpServerStdio(name="retry-mcp", command="retry-mcp", args=[], env=[])],
+        enabled=True,
+    )
+    assert binding is not None
+    session_id = "cleanup-retry-session"
+    await runtime.bind_client_mcp(session_id, binding)
+
+    with pytest.raises(RuntimeError, match="temporary cleanup failure"):
+        await runtime.release_client_mcp(session_id)
+    assert session_id in runtime._client_mcp_bindings
+
+    await runtime.release_client_mcp(session_id)
+    assert attempts == [session_id, session_id]
+    assert session_id not in runtime._client_mcp_bindings
+
+
+@pytest.mark.asyncio
 async def test_runtime_passes_session_cwd_as_workspace_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -273,8 +323,86 @@ async def test_runtime_passes_session_cwd_as_workspace_path(
             "message": "inspect files",
             "thread_id": "workspace-session",
             "workspace_path": str(tmp_path),
+            "user_id": runtime._memory_user_id(session, str(tmp_path)),
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_queues_distinct_sessions_and_cancels_waiter_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class FakeClient:
+        async def astream(self, message: str, **kwargs: Any):
+            del kwargs
+            started.append(message)
+            if message == "first":
+                first_started.set()
+                await release_first.wait()
+            if False:
+                yield None
+
+    monkeypatch.setattr(
+        "deerflow.config.get_app_config",
+        lambda: SimpleNamespace(
+            sandbox=SimpleNamespace(use="deerflow.sandbox.local:LocalSandboxProvider")
+        ),
+    )
+    runtime = LocalACPRuntime(
+        LocalACPConfig(
+            config_path=tmp_path / "config.yaml",
+            checkpointer_path=tmp_path / "checkpoints.db",
+            session_store_path=tmp_path / "sessions.db",
+            max_active_runs=1,
+        )
+    )
+    fake_client = FakeClient()
+
+    async def client_for(_session: LocalACPSession) -> FakeClient:
+        return fake_client
+
+    monkeypatch.setattr(runtime, "_client_for", client_for)
+
+    def session(session_id: str) -> LocalACPSession:
+        return LocalACPSession(
+            session_id=session_id,
+            cwd=str(tmp_path),
+            title=None,
+            updated_at="",
+            model_name=None,
+            thinking_enabled=True,
+            subagent_enabled=False,
+            plan_mode=False,
+            max_concurrent_subagents=1,
+            recursion_limit=100,
+        )
+
+    async def consume(target: LocalACPSession, message: str) -> None:
+        async for _ in runtime.astream(
+            target,
+            message,
+            live_event_callback=lambda _event: None,  # type: ignore[arg-type]
+        ):
+            pass
+
+    first = asyncio.create_task(consume(session("session-a"), "first"))
+    await first_started.wait()
+    waiting = asyncio.create_task(consume(session("session-b"), "second"))
+    await asyncio.sleep(0)
+    assert started == ["first"]
+
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert not first.done()
+
+    release_first.set()
+    await first
+    assert started == ["first"]
 
 
 @pytest.mark.asyncio
@@ -316,7 +444,9 @@ async def test_runtime_rejects_container_provider_for_client_cwd(
         recursion_limit=100,
     )
 
-    with pytest.raises(RuntimeError, match="require LocalSandboxProvider or LocalWslProvider"):
+    with pytest.raises(
+        RuntimeError, match="require LocalSandboxProvider or LocalWslProvider"
+    ):
         async for _ in runtime.astream(
             session,
             "inspect files",
@@ -343,6 +473,8 @@ def test_embedded_client_excludes_unsafe_local_acp_tools(
     client._excluded_tool_names = frozenset(
         {"bash", "task", "task_status", "invoke_acp_agent"}
     )
+    client._tool_groups = None
+    client._allowed_tool_names = None
 
     tools = client._get_tools(model_name=None, subagent_enabled=True)
 

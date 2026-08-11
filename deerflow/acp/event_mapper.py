@@ -17,6 +17,8 @@ from acp import schema
 
 from deerflow.config.paths import get_paths
 
+from .policy import tool_kind as _tool_kind
+
 SendUpdate = Callable[[Any], Awaitable[None]]
 ArtifactResolver = Callable[
     [str],
@@ -68,25 +70,6 @@ def _limited_text(value: Any) -> str:
     return text[:_MAX_TOOL_TEXT] + "\n… (truncated)"
 
 
-def _tool_kind(name: str) -> schema.ToolKind:
-    lowered = name.lower()
-    if any(part in lowered for part in ("read", "view", "list_file")):
-        return "read"
-    if any(part in lowered for part in ("write", "edit", "patch", "create_file")):
-        return "edit"
-    if any(part in lowered for part in ("delete", "remove")):
-        return "delete"
-    if any(part in lowered for part in ("search", "query", "grep", "find")):
-        return "search"
-    if any(part in lowered for part in ("fetch", "web", "http", "browser")):
-        return "fetch"
-    if any(part in lowered for part in ("bash", "shell", "execute", "run_command")):
-        return "execute"
-    if any(part in lowered for part in ("think", "task", "subagent")):
-        return "think"
-    return "other"
-
-
 class ACPEventMapper:
     """Stateful, per-prompt ACP event mapper."""
 
@@ -113,6 +96,8 @@ class ACPEventMapper:
             "output_tokens": 0,
             "total_tokens": 0,
         }
+        self._lead_usage = dict(self.usage)
+        self._subagent_usage = dict(self.usage)
         self.failure_message: str | None = None
         self._closed = False
 
@@ -155,11 +140,12 @@ class ACPEventMapper:
             elif event_type == "end":
                 usage = data.get("usage")
                 if isinstance(usage, dict):
-                    self.usage = {
+                    self._lead_usage = {
                         "input_tokens": max(0, int(usage.get("input_tokens", 0) or 0)),
                         "output_tokens": max(0, int(usage.get("output_tokens", 0) or 0)),
                         "total_tokens": max(0, int(usage.get("total_tokens", 0) or 0)),
                     }
+                    self._refresh_usage()
             else:
                 await self._handle_live_unlocked({"type": event_type, **data})
 
@@ -344,6 +330,11 @@ class ACPEventMapper:
             return
 
         task_id = str(data.get("task_id") or data.get("trace_id") or "")
+        if event_type == "token_usage" and task_id:
+            for key in ("input_tokens", "output_tokens", "total_tokens"):
+                self._subagent_usage[key] += max(0, int(data.get(key, 0) or 0))
+            self._refresh_usage()
+            return
         subagent_tool_id = f"subagent:{task_id}" if task_id else ""
         if event_type in {"task_started", "subagent_started"} and task_id:
             title = str(data.get("description") or data.get("name") or "Subtask")
@@ -408,6 +399,12 @@ class ACPEventMapper:
                 status="failed" if failed else "completed",
                 output=data.get("content"),
             )
+
+    def _refresh_usage(self) -> None:
+        self.usage = {
+            key: self._lead_usage[key] + self._subagent_usage[key]
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+        }
 
     async def close_open_tools(self, *, cancelled: bool) -> None:
         async with self._lock:

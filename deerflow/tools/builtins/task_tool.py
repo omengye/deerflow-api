@@ -132,6 +132,13 @@ async def _task_tool_impl(
     if overrides:
         config = replace(config, **overrides)
 
+    prompt_overlay = metadata.get("subagent_system_prompt_overlay")
+    if isinstance(prompt_overlay, str) and prompt_overlay.strip():
+        config = replace(
+            config,
+            system_prompt=f"{config.system_prompt}\n\n{prompt_overlay.strip()}",
+        )
+
     # Get available tools (excluding task tool to prevent nesting)
     # Lazy import to avoid circular dependency
     from deerflow.tools import get_available_tools
@@ -141,11 +148,25 @@ async def _task_tool_impl(
 
     # Subagents should not have subagent tools enabled (prevent recursive nesting)
     tools = get_available_tools(model_name=parent_model, groups=parent_tool_groups, subagent_enabled=False)
+    excluded_tool_names = set(metadata.get("subagent_excluded_tool_names") or [])
+    # Never rely solely on the global registry honoring subagent_enabled=False:
+    # recursive delegation is a hard boundary for internal ACP subagents.
+    excluded_tool_names.update({"task", "task_status"})
+    allowed_tool_names_raw = metadata.get("subagent_allowed_tool_names")
+    allowed_tool_names = (
+        set(allowed_tool_names_raw) if allowed_tool_names_raw is not None else None
+    )
+    tools = [tool for tool in tools if tool.name not in excluded_tool_names]
+    if allowed_tool_names is not None:
+        tools = [tool for tool in tools if tool.name in allowed_tool_names]
     deferred_registry = None
     try:
         from deerflow.tools.builtins.tool_search import clone_deferred_registry_for_tools, get_deferred_registry
 
-        deferred_registry = clone_deferred_registry_for_tools(get_deferred_registry(), tools)
+        if any(tool.name == "tool_search" for tool in tools):
+            deferred_registry = clone_deferred_registry_for_tools(
+                get_deferred_registry(), tools
+            )
     except Exception:
         logger.debug("Failed to clone deferred registry for subagent", exc_info=True)
 
@@ -160,6 +181,7 @@ async def _task_tool_impl(
         trace_id=trace_id,
         thinking_enabled=parent_thinking_enabled,
         deferred_registry=deferred_registry,
+        middlewares=list(metadata.get("subagent_middlewares") or []),
     )
 
     # Resolve the live_event_callback from config metadata.
@@ -191,9 +213,10 @@ async def _task_tool_impl(
         loop = _main_loop
         try:
             if loop.is_running():
-                loop.call_soon_threadsafe(
-                    lambda e=event: loop.create_task(cb(e))
-                )
+                def schedule_event() -> None:
+                    loop.create_task(cb(event))
+
+                loop.call_soon_threadsafe(schedule_event)
         except Exception:
             pass
 

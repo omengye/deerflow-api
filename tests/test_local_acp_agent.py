@@ -32,6 +32,7 @@ class FakeRuntime:
         self.block = False
         self.client_mcp_bindings: dict[str, Any] = {}
         self.released_client_mcp: list[str] = []
+        self.prompt_messages: list[str] = []
 
     async def bind_client_mcp(self, session_id: str, binding: Any) -> None:
         if binding is None:
@@ -44,7 +45,8 @@ class FakeRuntime:
         self.released_client_mcp.append(session_id)
 
     async def astream(self, session: Any, message: str, *, live_event_callback: Any):
-        del session, message
+        del session
+        self.prompt_messages.append(message)
         self.started.set()
         if self.block:
             await asyncio.Event().wait()
@@ -112,7 +114,17 @@ api:
 local_acp:
   checkpointer_path: ./state/checkpoints.db
   session_store_path: ./state/sessions.db
+  max_active_connections: 7
   thinking_enabled: false
+  subagent_enabled: true
+  max_concurrent_subagents: 2
+  permission_mode: all
+  tool_allowlist: [read_file, task]
+  tool_denylist: [web_fetch]
+  memory_scope: session
+  prompt_overlay: Server-owned instruction
+  resource_link_max_size_mb: 7
+  closed_session_retention_days: 0
   enable_bash: true
   accept_client_mcp_servers: true
 """,
@@ -129,11 +141,36 @@ local_acp:
 
     assert config.checkpointer_path == config_dir / "state" / "checkpoints.db"
     assert config.session_store_path == config_dir / "state" / "sessions.db"
+    assert config.max_active_connections == 7
     assert config.deerflow_home == config_dir / "state" / "home"
     assert config.thinking_enabled is False
+    assert config.subagent_enabled is True
+    assert config.max_concurrent_subagents == 2
+    assert config.permission_mode == "all"
+    assert config.tool_allowlist == ("read_file", "task")
+    assert config.tool_denylist == ("web_fetch",)
+    assert config.memory_scope == "session"
+    assert config.prompt_overlay == "Server-owned instruction"
+    assert config.resource_link_max_size_bytes == 7 * 1024 * 1024
+    assert config.closed_session_retention_days == 0
     assert config.enable_bash is True
     assert config.accept_client_mcp_servers is True
     assert "DEER_FLOW_CONFIG_PATH" not in os.environ
+
+
+def test_config_accepts_unquoted_yaml_off_permission_mode(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+local_acp:
+  permission_mode: off
+""",
+        encoding="utf-8",
+    )
+
+    config = LocalACPConfig.from_file(str(config_path))
+
+    assert config.permission_mode == "off"
 
 
 def test_config_loads_optional_rustfs_artifact_settings(
@@ -167,6 +204,36 @@ local_acp:
     assert config.artifacts.max_file_size_bytes == 12 * 1024 * 1024
 
 
+def test_config_loads_artifact_credentials_from_sibling_dotenv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+local_acp:
+  artifacts:
+    enabled: true
+    endpoint_url: https://rustfs.example.test
+    bucket: deerflow-acp
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "DEER_FLOW_ACP_ARTIFACT_ACCESS_KEY=dotenv-access\n"
+        "DEER_FLOW_ACP_ARTIFACT_SECRET_KEY=dotenv-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("DEER_FLOW_ACP_ARTIFACT_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("DEER_FLOW_ACP_ARTIFACT_SECRET_KEY", raising=False)
+
+    config = LocalACPConfig.from_file(str(config_path))
+
+    assert config.artifacts is not None
+    assert config.artifacts.access_key == "dotenv-access"
+    assert config.artifacts.secret_key == "dotenv-secret"
+
+
 @pytest.fixture
 def store(tmp_path: Path):
     result = LocalACPSessionStore(tmp_path / "sessions.db")
@@ -188,6 +255,7 @@ async def test_initialize_advertises_text_only_stable_capabilities(
 
     assert response.protocol_version == 1
     assert response.agent_capabilities.load_session is True
+    assert response.agent_capabilities.session_capabilities.close is not None
     assert response.agent_capabilities.prompt_capabilities.image is False
     assert response.agent_capabilities.prompt_capabilities.audio is False
     assert response.agent_capabilities.prompt_capabilities.embedded_context is False
@@ -224,7 +292,9 @@ async def test_new_session_rejects_client_directories_and_mcp(
     agent = DeerFlowACPAgent(make_config(tmp_path), store, FakeRuntime())
 
     with pytest.raises(RequestError) as directories_error:
-        await agent.new_session(cwd=str(tmp_path), additional_directories=[str(tmp_path / "other")])
+        await agent.new_session(
+            cwd=str(tmp_path), additional_directories=[str(tmp_path / "other")]
+        )
     assert directories_error.value.code == -32602
 
     with pytest.raises(RequestError) as mcp_error:
@@ -531,7 +601,12 @@ async def test_session_modes_config_list_and_load_history(
     runtime = FakeRuntime()
     runtime.history_messages = [
         {"type": "human", "id": "user-1", "content": "question"},
-        {"type": "ai", "id": "agent-1", "content": "answer", "reasoning_content": "thought"},
+        {
+            "type": "ai",
+            "id": "agent-1",
+            "content": "answer",
+            "reasoning_content": "thought",
+        },
         {"type": "tool", "id": "tool-1", "content": "hidden"},
     ]
     connection = FakeConnection()
@@ -585,6 +660,8 @@ async def test_session_modes_config_list_and_load_history(
         schema.UserMessageChunk,
         schema.AgentThoughtChunk,
         schema.AgentMessageChunk,
+        schema.ToolCallStart,
+        schema.ToolCallProgress,
     ]
 
 
@@ -596,7 +673,12 @@ async def test_prompt_maps_events_usage_and_title(
     events = [
         SimpleNamespace(
             type="messages-tuple",
-            data={"type": "ai", "id": "msg-1", "content": "hello", "reasoning_content": "think"},
+            data={
+                "type": "ai",
+                "id": "msg-1",
+                "content": "hello",
+                "reasoning_content": "think",
+            },
         ),
         SimpleNamespace(
             type="messages-tuple",
@@ -604,12 +686,19 @@ async def test_prompt_maps_events_usage_and_title(
                 "type": "ai",
                 "id": "msg-1",
                 "content": "",
-                "tool_calls": [{"id": "call-1", "name": "web_search", "args": {"q": "x"}}],
+                "tool_calls": [
+                    {"id": "call-1", "name": "web_search", "args": {"q": "x"}}
+                ],
             },
         ),
         SimpleNamespace(
             type="messages-tuple",
-            data={"type": "tool", "tool_call_id": "call-1", "name": "web_search", "content": "result"},
+            data={
+                "type": "tool",
+                "tool_call_id": "call-1",
+                "name": "web_search",
+                "content": "result",
+            },
         ),
         SimpleNamespace(
             type="values",
@@ -619,9 +708,22 @@ async def test_prompt_maps_events_usage_and_title(
                 "artifacts": [],
             },
         ),
-        {"live": True, "data": {"type": "task_started", "task_id": "sub-1", "description": "Summarize"}},
-        {"live": True, "data": {"type": "token_chunk", "task_id": "sub-1", "content": "working"}},
-        {"live": True, "data": {"type": "task_completed", "task_id": "sub-1", "result": "done"}},
+        {
+            "live": True,
+            "data": {
+                "type": "task_started",
+                "task_id": "sub-1",
+                "description": "Summarize",
+            },
+        },
+        {
+            "live": True,
+            "data": {"type": "token_chunk", "task_id": "sub-1", "content": "working"},
+        },
+        {
+            "live": True,
+            "data": {"type": "task_completed", "task_id": "sub-1", "result": "done"},
+        },
         SimpleNamespace(
             type="end",
             data={"usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}},
@@ -654,7 +756,7 @@ async def test_prompt_maps_events_usage_and_title(
 
 
 @pytest.mark.asyncio
-async def test_prompt_is_text_only_and_one_active_prompt_per_session(
+async def test_prompt_rejects_outside_resources_and_one_active_prompt_per_session(
     tmp_path: Path,
     store: LocalACPSessionStore,
 ) -> None:
@@ -665,7 +767,9 @@ async def test_prompt_is_text_only_and_one_active_prompt_per_session(
     agent.on_connect(connection)
     created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
 
-    first = asyncio.create_task(agent.prompt([acp.text_block("wait")], created.session_id))
+    first = asyncio.create_task(
+        agent.prompt([acp.text_block("wait")], created.session_id)
+    )
     await runtime.started.wait()
     with pytest.raises(RequestError) as busy_error:
         await agent.prompt([acp.text_block("second")], created.session_id)
@@ -687,14 +791,235 @@ async def test_prompt_is_text_only_and_one_active_prompt_per_session(
 
 
 @pytest.mark.asyncio
+async def test_prompt_keeps_session_busy_until_final_save_completes(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = FakeRuntime()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    agent.on_connect(FakeConnection())
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+    original_save = store.save
+    save_started = asyncio.Event()
+    allow_save = asyncio.Event()
+
+    async def blocking_save(session: Any) -> None:
+        save_started.set()
+        await allow_save.wait()
+        await original_save(session)
+
+    monkeypatch.setattr(store, "save", blocking_save)
+    prompt_task = asyncio.create_task(
+        agent.prompt([acp.text_block("finish")], created.session_id)
+    )
+    await save_started.wait()
+
+    with pytest.raises(RequestError) as config_busy_error:
+        await agent.set_config_option("model", created.session_id, "model-a")
+    assert config_busy_error.value.code == -32001
+    with pytest.raises(RequestError) as close_busy_error:
+        await agent.close_session(created.session_id)
+    assert close_busy_error.value.code == -32001
+
+    allow_save.set()
+    response = await prompt_task
+    assert response.stop_reason == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_two_connections_lease_distinct_sessions_and_cancel_independently(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    runtime.block = True
+    first_connection = FakeConnection()
+    second_connection = FakeConnection()
+    first_agent = DeerFlowACPAgent(
+        make_config(tmp_path), store, runtime, connection_id="connection-a"
+    )
+    second_agent = DeerFlowACPAgent(
+        make_config(tmp_path), store, runtime, connection_id="connection-b"
+    )
+    first_agent.on_connect(first_connection)
+    second_agent.on_connect(second_connection)
+    first_session = await first_agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+    second_session = await second_agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    first_prompt = asyncio.create_task(
+        first_agent.prompt([acp.text_block("first")], first_session.session_id)
+    )
+    second_prompt = asyncio.create_task(
+        second_agent.prompt([acp.text_block("second")], second_session.session_id)
+    )
+    for _ in range(100):
+        if len(runtime.prompt_messages) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert runtime.prompt_messages == ["first", "second"]
+
+    await first_agent.cancel(first_session.session_id)
+    first_response = await first_prompt
+    assert first_response.stop_reason == "cancelled"
+    assert not second_prompt.done()
+
+    await second_agent.cancel(second_session.session_id)
+    second_response = await second_prompt
+    assert second_response.stop_reason == "cancelled"
+    await first_agent.shutdown()
+    await second_agent.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_session_lease_blocks_other_connection_until_disconnect(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    first_agent = DeerFlowACPAgent(
+        make_config(tmp_path), store, runtime, connection_id="connection-a"
+    )
+    second_agent = DeerFlowACPAgent(
+        make_config(tmp_path), store, runtime, connection_id="connection-b"
+    )
+    second_agent.on_connect(FakeConnection())
+    created = await first_agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    with pytest.raises(RequestError, match="attached to another ACP client"):
+        await second_agent.load_session(
+            cwd=str(tmp_path), session_id=created.session_id, mcp_servers=[]
+        )
+    with pytest.raises(RequestError, match="attached"):
+        await second_agent.prompt([acp.text_block("wrong owner")], created.session_id)
+
+    await first_agent.shutdown()
+    loaded = await second_agent.load_session(
+        cwd=str(tmp_path), session_id=created.session_id, mcp_servers=[]
+    )
+    assert loaded.modes.current_mode_id == "plan"
+    assert runtime.session_coordinator.owner(created.session_id) == "connection-b"
+    await second_agent.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_releases_only_its_client_mcp_sessions(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    config = make_config(tmp_path, accept_client_mcp_servers=True)
+    first_agent = DeerFlowACPAgent(config, store, runtime, connection_id="connection-a")
+    second_agent = DeerFlowACPAgent(
+        config, store, runtime, connection_id="connection-b"
+    )
+    first = await first_agent.new_session(
+        cwd=str(tmp_path),
+        mcp_servers=[
+            schema.McpServerStdio(
+                name="first-mcp", command="first-mcp", args=[], env=[]
+            )
+        ],
+    )
+    second = await second_agent.new_session(
+        cwd=str(tmp_path),
+        mcp_servers=[
+            schema.McpServerStdio(
+                name="second-mcp", command="second-mcp", args=[], env=[]
+            )
+        ],
+    )
+
+    await first_agent.shutdown()
+
+    assert first.session_id not in runtime.client_mcp_bindings
+    assert second.session_id in runtime.client_mcp_bindings
+    assert runtime.released_client_mcp == [first.session_id]
+    await second_agent.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_prompt_accepts_workspace_resource_links(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    resource = tmp_path / "input.txt"
+    resource.write_text("hello", encoding="utf-8")
+    runtime = FakeRuntime()
+    connection = FakeConnection()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    agent.on_connect(connection)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    response = await agent.prompt(
+        [acp.resource_link_block("input.txt", resource.as_uri(), size=5)],
+        created.session_id,
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert (
+        '"workspace_path": "/mnt/user-data/workspace/input.txt"'
+        in runtime.prompt_messages[0]
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_session_marks_it_unavailable_and_releases_resources(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    response = await agent.close_session(created.session_id)
+
+    assert isinstance(response, schema.CloseSessionResponse)
+    assert await store.get(created.session_id) is None
+    with pytest.raises(RequestError):
+        await agent.load_session(
+            cwd=str(tmp_path), session_id=created.session_id, mcp_servers=[]
+        )
+
+
+@pytest.mark.asyncio
+async def test_close_session_succeeds_after_durable_close_when_cleanup_fails(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = FakeRuntime()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    async def fail_cleanup(session_id: str) -> None:
+        del session_id
+        raise RuntimeError("cleanup failed")
+
+    runtime.release_client_mcp = fail_cleanup  # type: ignore[method-assign]
+    response = await agent.close_session(created.session_id)
+
+    assert isinstance(response, schema.CloseSessionResponse)
+    assert await store.get(created.session_id) is None
+    assert runtime.session_coordinator.owner(created.session_id) is None
+    assert "resource cleanup failed" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_event_mapper_deduplicates_cumulative_reasoning_and_artifacts() -> None:
     updates: list[Any] = []
 
     async def send(update: Any) -> None:
         updates.append(update)
 
-    block = acp.resource_link_block("report.txt", "file:///tmp/report.txt", mime_type="text/plain")
-    mapper = ACPEventMapper("session-1", send, artifact_resolver=lambda path: block if path == "/out" else None)
+    block = acp.resource_link_block(
+        "report.txt", "file:///tmp/report.txt", mime_type="text/plain"
+    )
+    mapper = ACPEventMapper(
+        "session-1",
+        send,
+        artifact_resolver=lambda path: block if path == "/out" else None,
+    )
     await mapper.handle(
         SimpleNamespace(
             type="messages-tuple",
@@ -704,15 +1029,28 @@ async def test_event_mapper_deduplicates_cumulative_reasoning_and_artifacts() ->
     await mapper.handle(
         SimpleNamespace(
             type="messages-tuple",
-            data={"type": "ai", "id": "x", "content": "", "reasoning_content": "one two"},
+            data={
+                "type": "ai",
+                "id": "x",
+                "content": "",
+                "reasoning_content": "one two",
+            },
         )
     )
-    values = SimpleNamespace(type="values", data={"artifacts": ["/out", "/out"], "todos": []})
+    values = SimpleNamespace(
+        type="values", data={"artifacts": ["/out", "/out"], "todos": []}
+    )
     await mapper.handle(values)
     await mapper.handle(values)
 
-    thoughts = [update.content.text for update in updates if isinstance(update, schema.AgentThoughtChunk)]
-    resources = [update for update in updates if isinstance(update, schema.AgentMessageChunk)]
+    thoughts = [
+        update.content.text
+        for update in updates
+        if isinstance(update, schema.AgentThoughtChunk)
+    ]
+    resources = [
+        update for update in updates if isinstance(update, schema.AgentMessageChunk)
+    ]
     plans = [update for update in updates if isinstance(update, schema.AgentPlanUpdate)]
     assert thoughts == ["one", " two"]
     assert len(resources) == 1
@@ -738,13 +1076,17 @@ async def test_event_mapper_waits_for_async_artifact_publication() -> None:
     )
 
     assert published == ["/out"]
-    resources = [update for update in updates if isinstance(update, schema.AgentMessageChunk)]
+    resources = [
+        update for update in updates if isinstance(update, schema.AgentMessageChunk)
+    ]
     assert len(resources) == 1
     assert resources[0].content.uri == "https://rustfs.test/report.txt"
 
 
 @pytest.mark.asyncio
-async def test_event_mapper_can_start_subagent_from_progress_or_terminal_event() -> None:
+async def test_event_mapper_can_start_subagent_from_progress_or_terminal_event() -> (
+    None
+):
     updates: list[Any] = []
 
     async def send(update: Any) -> None:
@@ -763,8 +1105,37 @@ async def test_event_mapper_can_start_subagent_from_progress_or_terminal_event()
     )
 
     assert sum(isinstance(update, schema.ToolCallStart) for update in updates) == 1
-    progress = [update for update in updates if isinstance(update, schema.ToolCallProgress)]
+    progress = [
+        update for update in updates if isinstance(update, schema.ToolCallProgress)
+    ]
     assert [update.status for update in progress] == ["in_progress", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_event_mapper_adds_subagent_usage_to_prompt_usage() -> None:
+    updates: list[Any] = []
+
+    async def send(update: Any) -> None:
+        updates.append(update)
+
+    mapper = ACPEventMapper("session-1", send)
+    await mapper.handle_live(
+        {
+            "type": "token_usage",
+            "task_id": "sub-1",
+            "input_tokens": 5,
+            "output_tokens": 7,
+            "total_tokens": 12,
+        }
+    )
+    await mapper.handle(
+        SimpleNamespace(
+            type="end",
+            data={"usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}},
+        )
+    )
+
+    assert mapper.usage == {"input_tokens": 8, "output_tokens": 11, "total_tokens": 19}
 
 
 @pytest.mark.asyncio
@@ -795,3 +1166,26 @@ async def test_session_store_persists_and_pages(tmp_path: Path) -> None:
     loaded = await reopened.get(one.session_id)
     assert loaded is not None and loaded.cwd == str(tmp_path)
     reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_session_store_purges_closed_metadata(tmp_path: Path) -> None:
+    store = LocalACPSessionStore(tmp_path / "sessions.db")
+    store.setup()
+    defaults = {
+        "model_name": None,
+        "thinking_enabled": True,
+        "subagent_enabled": False,
+        "plan_mode": False,
+        "max_concurrent_subagents": 2,
+        "recursion_limit": 100,
+        "agent_name": None,
+    }
+    session = await store.create(cwd=str(tmp_path), defaults=defaults)
+    assert await store.mark_closed(session.session_id)
+
+    purged = await store.purge_closed(retention_days=0)
+
+    assert purged == [session.session_id]
+    assert await store.get(session.session_id, include_closed=True) is None
+    store.close()

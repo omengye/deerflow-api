@@ -704,7 +704,7 @@ fn connect_proxy(cli: &Cli, path: &Path) -> Result<TcpStream> {
     match connect_command(&endpoint, "ACP") {
         Ok((stream, _)) => Ok(stream),
         Err(ConnectError::Rejected(message)) if message == "BUSY" => {
-            Err("DeerFlow ACP daemon is already connected to another client".into())
+            Err("DeerFlow ACP daemon has reached its connection limit".into())
         }
         Err(error) => Err(format!("failed to connect to DeerFlow ACP daemon: {error}").into()),
     }

@@ -39,6 +39,10 @@ async def _run(config_path: str | None) -> None:
     store.setup()
     runtime = LocalACPRuntime(config)
     await runtime.open()
+    purged = await store.purge_closed(
+        retention_days=config.closed_session_retention_days
+    )
+    await runtime.purge_checkpoints(purged)
     agent = DeerFlowACPAgent(config, store, runtime)
     try:
         # Keep the wire surface on stable ACP v1. Experimental workspace,

@@ -13,6 +13,7 @@ import secrets
 import signal
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,14 @@ _HANDSHAKE_LIMIT = 4096
 _HANDSHAKE_TIMEOUT_SECONDS = 3.0
 _WRITER_CLOSE_TIMEOUT_SECONDS = 1.0
 _ACTIVE_TASK_CLOSE_TIMEOUT_SECONDS = 3.0
+
+
+@dataclass(slots=True)
+class _ACPConnectionState:
+    connection_id: str
+    task: asyncio.Task[Any]
+    writer: asyncio.StreamWriter
+    agent: DeerFlowACPAgent | None = None
 
 
 def _build_id() -> str:
@@ -73,14 +82,16 @@ async def _close_writer(writer: asyncio.StreamWriter) -> None:
             writer.wait_closed(), timeout=_WRITER_CLOSE_TIMEOUT_SECONDS
         )
     except TimeoutError:
-        logger.debug("Timed out waiting for ACP socket peer to close; aborting transport")
+        logger.debug(
+            "Timed out waiting for ACP socket peer to close; aborting transport"
+        )
         _abort_writer(writer)
     except (ConnectionError, OSError, RuntimeError):
         pass
 
 
 class ACPDaemon:
-    """Serve one ACP client at a time while reusing the expensive runtime."""
+    """Serve multiple local ACP clients while reusing the expensive runtime."""
 
     def __init__(
         self,
@@ -102,9 +113,10 @@ class ACPDaemon:
         self.endpoint: DaemonEndpoint | None = None
         self._server: asyncio.Server | None = None
         self._state_lock = asyncio.Lock()
-        self._active = False
-        self._active_task: asyncio.Task[Any] | None = None
-        self._active_writer: asyncio.StreamWriter | None = None
+        self._close_lock = asyncio.Lock()
+        self._handlers: dict[asyncio.Task[Any], asyncio.StreamWriter] = {}
+        self._connections: dict[str, _ACPConnectionState] = {}
+        self._next_connection_id = 0
         self._stop_requested = asyncio.Event()
         self._closed = False
 
@@ -119,7 +131,9 @@ class ACPDaemon:
         if self._server is not None:
             assert self.endpoint is not None
             return self.endpoint
-        self._server = await asyncio.start_server(self._handle_connection, "127.0.0.1", 0)
+        self._server = await asyncio.start_server(
+            self._handle_connection, "127.0.0.1", 0
+        )
         socket = self._server.sockets[0]
         host, port = socket.getsockname()[:2]
         endpoint = DaemonEndpoint(
@@ -139,46 +153,66 @@ class ACPDaemon:
         await self._stop_requested.wait()
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        server = self._server
-        self._server = None
-        if server is not None:
-            server.close()
-        task = self._active_task
-        active_writer = self._active_writer
-        if active_writer is not None:
+        async with self._close_lock:
+            async with self._state_lock:
+                if self._closed:
+                    return
+                self._closed = True
+                server = self._server
+                self._server = None
+                handlers = [
+                    task
+                    for task in self._handlers
+                    if task is not asyncio.current_task() and not task.done()
+                ]
+                writers = list(
+                    {id(writer): writer for writer in self._handlers.values()}.values()
+                )
+
+            if server is not None:
+                server.close()
             # On Windows, StreamWriter.wait_closed() may wait indefinitely for
-            # the native bridge, while the bridge simultaneously waits for the
-            # daemon socket to reach EOF. Abort first to break that cycle.
-            _abort_writer(active_writer)
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
+            # native bridges that are simultaneously waiting for daemon EOF.
+            for writer in writers:
+                _abort_writer(writer)
+            for task in handlers:
+                task.cancel()
+            if handlers:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*handlers, return_exceptions=True),
+                        timeout=_ACTIVE_TASK_CLOSE_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "Timed out waiting for %d ACP connection handler(s) to close",
+                        len(handlers),
+                    )
+            if server is not None:
+                try:
+                    await asyncio.wait_for(
+                        server.wait_closed(),
+                        timeout=_ACTIVE_TASK_CLOSE_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    logger.warning("Timed out waiting for the ACP listener to close")
             try:
-                await asyncio.wait_for(
-                    asyncio.gather(task, return_exceptions=True),
-                    timeout=_ACTIVE_TASK_CLOSE_TIMEOUT_SECONDS,
-                )
-            except TimeoutError:
-                logger.warning(
-                    "Timed out waiting for the active ACP connection to close"
-                )
-        if server is not None:
-            try:
-                await asyncio.wait_for(
-                    server.wait_closed(),
-                    timeout=_ACTIVE_TASK_CLOSE_TIMEOUT_SECONDS,
-                )
-            except TimeoutError:
-                logger.warning("Timed out waiting for the ACP listener to close")
-        try:
-            current = DaemonEndpoint.load(self.endpoint_path)
-        except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            current = None
-        if current is not None and current.pid == os.getpid() and current.token == self.token:
-            self.endpoint_path.unlink(missing_ok=True)
-        logger.info("ACP daemon stopped")
+                current = DaemonEndpoint.load(self.endpoint_path)
+            except (
+                FileNotFoundError,
+                KeyError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                current = None
+            if (
+                current is not None
+                and current.pid == os.getpid()
+                and current.token == self.token
+            ):
+                self.endpoint_path.unlink(missing_ok=True)
+            logger.info("ACP daemon stopped")
 
     async def _read_handshake(
         self, reader: asyncio.StreamReader
@@ -206,52 +240,101 @@ class ACPDaemon:
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        handshake = await self._read_handshake(reader)
-        if handshake is None:
-            await self._reply(writer, "UNAUTHORIZED")
+        task = asyncio.current_task()
+        if task is None:
             await _close_writer(writer)
             return
-        command, _token = handshake
-        if command == "STATUS":
-            await self._reply(writer, f"OK {os.getpid()} {_build_id()}")
-            await _close_writer(writer)
-            return
-        if command == "STOP":
-            await self._reply(writer, "OK")
-            self.request_stop()
-            await _close_writer(writer)
-            return
-        if command != "ACP":
-            await self._reply(writer, "ERROR unsupported-command")
-            await _close_writer(writer)
-            return
-
         async with self._state_lock:
-            if self._active:
-                await self._reply(writer, "BUSY")
-                await _close_writer(writer)
-                return
-            self._active = True
-            self._active_task = asyncio.current_task()
-            self._active_writer = writer
+            if self._closed:
+                rejected_during_close = True
+            else:
+                rejected_during_close = False
+                self._handlers[task] = writer
+        if rejected_during_close:
+            await _close_writer(writer)
+            return
 
-        await self._reply(writer, "OK")
-        agent = self.agent_factory(self.config, self.store, self.runtime)
         try:
-            await acp.run_agent(
-                agent,
-                input_stream=writer,
-                output_stream=reader,
-                use_unstable_protocol=False,
-            )
-        except (ConnectionError, asyncio.IncompleteReadError):
-            logger.debug("ACP bridge disconnected")
-        finally:
-            await agent.shutdown()
+            handshake = await self._read_handshake(reader)
+            if handshake is None:
+                await self._reply(writer, "UNAUTHORIZED")
+                return
+            command, _token = handshake
+            if command == "STATUS":
+                async with self._state_lock:
+                    active_count = len(self._connections)
+                await self._reply(
+                    writer,
+                    f"OK {os.getpid()} {_build_id()} connections={active_count}",
+                )
+                return
+            if command == "STOP":
+                await self._reply(writer, "OK")
+                self.request_stop()
+                return
+            if command != "ACP":
+                await self._reply(writer, "ERROR unsupported-command")
+                return
+
+            connection: _ACPConnectionState | None = None
             async with self._state_lock:
-                self._active = False
-                self._active_task = None
-                self._active_writer = None
+                if self._closed:
+                    rejection = "STOPPING"
+                elif len(self._connections) >= self.config.max_active_connections:
+                    rejection = "BUSY"
+                else:
+                    rejection = None
+                    self._next_connection_id += 1
+                    connection_id = f"acp-{self._next_connection_id}"
+                    connection = _ACPConnectionState(connection_id, task, writer)
+                    self._connections[connection_id] = connection
+            if rejection is not None:
+                await self._reply(writer, rejection)
+                return
+
+            assert connection is not None
+            agent: DeerFlowACPAgent | None = None
+            try:
+                agent = self.agent_factory(
+                    self.config,
+                    self.store,
+                    self.runtime,
+                    connection_id=connection.connection_id,
+                )
+                connection.agent = agent
+                await self._reply(writer, "OK")
+                async with self._state_lock:
+                    active_count = len(self._connections)
+                logger.info(
+                    "ACP connection %s opened (%d/%d)",
+                    connection.connection_id,
+                    active_count,
+                    self.config.max_active_connections,
+                )
+                await acp.run_agent(
+                    agent,
+                    input_stream=writer,
+                    output_stream=reader,
+                    use_unstable_protocol=False,
+                )
+            except (ConnectionError, asyncio.IncompleteReadError):
+                logger.debug("ACP bridge %s disconnected", connection.connection_id)
+            finally:
+                try:
+                    if agent is not None:
+                        await agent.shutdown()
+                finally:
+                    async with self._state_lock:
+                        self._connections.pop(connection.connection_id, None)
+                        remaining = len(self._connections)
+                    logger.info(
+                        "ACP connection %s closed (%d remaining)",
+                        connection.connection_id,
+                        remaining,
+                    )
+        finally:
+            async with self._state_lock:
+                self._handlers.pop(task, None)
             await _close_writer(writer)
 
 
@@ -263,7 +346,10 @@ async def _warm_wsl_sandbox() -> None:
     )
 
     app_config = get_app_config()
-    if normalize_sandbox_provider_path(app_config.sandbox.use) != WSL_SANDBOX_PROVIDER_PATH:
+    if (
+        normalize_sandbox_provider_path(app_config.sandbox.use)
+        != WSL_SANDBOX_PROVIDER_PATH
+    ):
         return
     from deerflow.sandbox.sandbox_provider import get_sandbox_provider
 
@@ -302,6 +388,12 @@ async def _run_daemon(
     daemon = ACPDaemon(config, store, runtime, runtime_dir)
     try:
         await runtime.open()
+        purged = await store.purge_closed(
+            retention_days=config.closed_session_retention_days
+        )
+        await runtime.purge_checkpoints(purged)
+        if purged:
+            logger.info("Purged %d closed ACP session(s)", len(purged))
         if warmup:
             logger.info("Warming DeerFlow agent graph")
             await runtime.warmup()
@@ -325,9 +417,7 @@ async def _run_daemon(
 
 def _configure_logging(runtime_dir: Path, level: str) -> None:
     numeric_level = getattr(logging, level.upper(), logging.INFO)
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     root = logging.getLogger()
     root.setLevel(numeric_level)
     stderr_handler = logging.StreamHandler(sys.stderr)
@@ -345,10 +435,16 @@ def _configure_logging(runtime_dir: Path, level: str) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the long-lived local DeerFlow ACP daemon")
+    parser = argparse.ArgumentParser(
+        description="Run the long-lived local DeerFlow ACP daemon"
+    )
     parser.add_argument("--config", help="Path to DeerFlow config.yaml")
-    parser.add_argument("--runtime-dir", help="Override the per-user daemon discovery directory")
-    parser.add_argument("--no-warmup", action="store_true", help="Skip agent graph warmup")
+    parser.add_argument(
+        "--runtime-dir", help="Override the per-user daemon discovery directory"
+    )
+    parser.add_argument(
+        "--no-warmup", action="store_true", help="Skip agent graph warmup"
+    )
     parser.add_argument(
         "--no-sandbox-warmup",
         action="store_true",
@@ -361,10 +457,13 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _parser().parse_args()
     runtime_dir = ensure_runtime_dir(get_runtime_dir(args.runtime_dir))
-    _configure_logging(runtime_dir, args.log_level)
     lock = SingleInstanceLock(runtime_dir / LOCK_FILENAME)
     try:
         with lock:
+            # Acquire the cross-process lock before opening the rotating log;
+            # simultaneous editor startups may briefly spawn multiple daemon
+            # candidates, but only the winner should own daemon.log.
+            _configure_logging(runtime_dir, args.log_level)
             # Holding the lock proves that a pre-existing endpoint is stale.
             (runtime_dir / ENDPOINT_FILENAME).unlink(missing_ok=True)
             asyncio.run(

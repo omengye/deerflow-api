@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import builtins
 import json
 import sqlite3
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -189,6 +190,27 @@ class LocalACPSessionStore:
             )
             connection.commit()
             return cursor.rowcount > 0
+
+    async def purge_closed(self, *, retention_days: int) -> builtins.list[str]:
+        """Delete closed session metadata older than the configured retention."""
+
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        async with self._lock:
+            connection = self._conn()
+            rows = connection.execute(
+                "SELECT session_id FROM acp_sessions WHERE closed = 1 AND updated_at <= ?",
+                (cutoff,),
+            ).fetchall()
+            session_ids = [str(row["session_id"]) for row in rows]
+            if session_ids:
+                connection.executemany(
+                    "DELETE FROM acp_sessions WHERE session_id = ?",
+                    ((session_id,) for session_id in session_ids),
+                )
+                connection.commit()
+        return session_ids
 
     @staticmethod
     def encode_cursor(offset: int) -> str:

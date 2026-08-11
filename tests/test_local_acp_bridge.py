@@ -31,12 +31,12 @@ def _wait_for(path: Path, process: subprocess.Popen[str], timeout: float = 20) -
     pytest.fail(f"Timed out waiting for {path}")
 
 
-def _run_bridge_session(
+def _open_bridge(
     bridge: Path,
     config: Path,
     runtime_dir: Path,
     cwd: Path,
-) -> str:
+) -> subprocess.Popen[str]:
     process = subprocess.Popen(
         [
             str(bridge),
@@ -56,58 +56,42 @@ def _run_bridge_session(
     )
     assert process.stdin is not None
     assert process.stdout is not None
+    return process
 
-    def request(request_id: int, method: str, params: dict[str, object]):
-        process.stdin.write(
-            json.dumps(
-                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-            )
-            + "\n"
+
+def _request(
+    process: subprocess.Popen[str],
+    request_id: int,
+    method: str,
+    params: dict[str, object],
+) -> dict[str, object]:
+    assert process.stdin is not None
+    assert process.stdout is not None
+    process.stdin.write(
+        json.dumps(
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         )
-        process.stdin.flush()
-        return json.loads(process.stdout.readline())
-
-    initialized = request(
-        1,
-        "initialize",
-        {
-            "protocolVersion": 1,
-            "clientCapabilities": {},
-            "clientInfo": {"name": "bridge-test", "version": "1"},
-        },
+        + "\n"
     )
-    assert initialized["result"]["protocolVersion"] == 1
-    created = request(
-        2,
-        "session/new",
-        {
-            "cwd": str(cwd),
-            "mcpServers": [
-                {
-                    "name": "codeg",
-                    "command": "codeg-mcp-test-not-started",
-                    "args": [],
-                    "env": [],
-                }
-            ],
-        },
-    )
-    session_id = created["result"]["sessionId"]
-    listed = request(3, "session/list", {"cwd": str(cwd)})
-    assert session_id in {item["sessionId"] for item in listed["result"]["sessions"]}
+    process.stdin.flush()
+    return json.loads(process.stdout.readline())
 
+
+def _close_bridge(process: subprocess.Popen[str]) -> None:
+    assert process.stdin is not None
     process.stdin.close()
     return_code = process.wait(timeout=20)
     stderr = process.stderr.read() if process.stderr is not None else ""
     assert return_code == 0, stderr
-    return str(session_id)
 
 
-def test_native_bridge_real_acp_roundtrip_and_reconnect(tmp_path: Path) -> None:
+def test_native_bridge_real_acp_roundtrip_with_two_live_clients(tmp_path: Path) -> None:
     project_root = Path(__file__).resolve().parents[1]
     bridge = _bridge_binary(project_root)
     if not bridge.is_file():
-        pytest.skip("Build bridge/Cargo.toml in release mode to run the native bridge test")
+        pytest.skip(
+            "Build bridge/Cargo.toml in release mode to run the native bridge test"
+        )
 
     config = tmp_path / "config.yaml"
     config.write_text(
@@ -151,10 +135,32 @@ sandbox:
         encoding="utf-8",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
+    bridges: list[subprocess.Popen[str]] = []
     try:
         _wait_for(endpoint, daemon)
-        first_session = _run_bridge_session(bridge, config, runtime_dir, tmp_path)
-        second_session = _run_bridge_session(bridge, config, runtime_dir, tmp_path)
+        first = _open_bridge(bridge, config, runtime_dir, tmp_path)
+        second = _open_bridge(bridge, config, runtime_dir, tmp_path)
+        bridges.extend((first, second))
+        for request_id, process in enumerate((first, second), start=1):
+            initialized = _request(
+                process,
+                request_id,
+                "initialize",
+                {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name": f"bridge-test-{request_id}", "version": "1"},
+                },
+            )
+            assert initialized["result"]["protocolVersion"] == 1  # type: ignore[index]
+        first_created = _request(
+            first, 10, "session/new", {"cwd": str(tmp_path), "mcpServers": []}
+        )
+        second_created = _request(
+            second, 11, "session/new", {"cwd": str(tmp_path), "mcpServers": []}
+        )
+        first_session = first_created["result"]["sessionId"]  # type: ignore[index]
+        second_session = second_created["result"]["sessionId"]  # type: ignore[index]
         assert first_session != second_session
 
         status = subprocess.run(
@@ -174,6 +180,19 @@ sandbox:
         )
         assert status.returncode == 0, status.stderr
         assert "running pid=" in status.stdout
+        assert "connections=2" in status.stdout
+
+        _close_bridge(first)
+        bridges.remove(first)
+        listed = _request(second, 12, "session/list", {"cwd": str(tmp_path)})
+        listed_ids = {
+            item["sessionId"]  # type: ignore[index]
+            for item in listed["result"]["sessions"]  # type: ignore[index]
+        }
+        assert {first_session, second_session} <= listed_ids
+
+        _close_bridge(second)
+        bridges.remove(second)
 
         stopped = subprocess.run(
             [
@@ -195,6 +214,10 @@ sandbox:
         assert daemon.wait(timeout=20) == 0
         assert not endpoint.exists()
     finally:
+        for process in bridges:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
         if daemon.poll() is None:
             daemon.terminate()
             try:
@@ -242,6 +265,75 @@ def test_native_bridge_auto_starts_and_stops_daemon(tmp_path: Path) -> None:
     try:
         assert started.returncode == 0, started.stderr
         assert "running pid=" in started.stdout
+    finally:
+        stopped = subprocess.run(
+            [
+                str(bridge),
+                "--stop-daemon",
+                "--config",
+                str(config),
+                "--runtime-dir",
+                str(runtime_dir),
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=20,
+            check=False,
+        )
+        assert stopped.returncode == 0, stopped.stderr
+
+
+def test_native_bridge_concurrent_auto_start_converges_on_one_daemon(
+    tmp_path: Path,
+) -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    bridge = _bridge_binary(project_root)
+    if not bridge.is_file():
+        pytest.skip("Native bridge binary is required")
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "api:\n  data_dir: ./data\nlocal_acp:\n  session_store_path: ./data/sessions.db\n",
+        encoding="utf-8",
+    )
+    runtime_dir = tmp_path / "runtime"
+    environment = os.environ.copy()
+    environment["DEER_FLOW_ACP_DAEMON_WARMUP"] = "0"
+    environment["DEER_FLOW_ACP_DAEMON_SANDBOX_WARMUP"] = "0"
+    environment["DEER_FLOW_ACP_DAEMON_START_TIMEOUT_MS"] = "20000"
+    command = [
+        str(bridge),
+        "--start-daemon",
+        "--python",
+        sys.executable,
+        "--config",
+        str(config),
+        "--runtime-dir",
+        str(runtime_dir),
+    ]
+    starters = [
+        subprocess.Popen(
+            command,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        for _ in range(2)
+    ]
+    try:
+        outputs = [process.communicate(timeout=30) for process in starters]
+        for process, (stdout, stderr) in zip(starters, outputs, strict=True):
+            assert process.returncode == 0, stderr
+            assert "running pid=" in stdout
+        endpoint = json.loads(
+            (runtime_dir / "endpoint.json").read_text(encoding="utf-8")
+        )
+        assert all(f"pid={endpoint['pid']}" in stdout for stdout, _stderr in outputs)
     finally:
         stopped = subprocess.run(
             [

@@ -43,7 +43,7 @@ from deerflow.agents.thread_state import (
     get_thread_state_schema,
     normalize_middleware_state_schemas,
 )
-from deerflow.config.agents_config import AGENT_NAME_PATTERN
+from deerflow.config.agents_config import AGENT_NAME_PATTERN, load_agent_config
 from deerflow.config.app_config import get_app_config, reload_app_config
 from deerflow.config.checkpointer_config import (
     DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY,
@@ -171,6 +171,10 @@ class DeerFlowClient:
         middlewares: Sequence[AgentMiddleware] | None = None,
         additional_mcp_tools: Sequence[Any] | None = None,
         excluded_tool_names: set[str] | None = None,
+        allowed_tool_names: set[str] | None = None,
+        system_prompt_overlay: str | None = None,
+        subagent_system_prompt_overlay: str | None = None,
+        subagent_middlewares: Sequence[AgentMiddleware] | None = None,
         recursion_limit: int = 200,
         checkpoint_channel_mode: CheckpointChannelMode | None = None,
         checkpoint_snapshot_frequency: int | None = None,
@@ -193,6 +197,10 @@ class DeerFlowClient:
             available_skills: Optional set of skill names to make available. If None (default), all scanned skills are available.
             middlewares: Optional list of custom middlewares to inject into the agent.
             excluded_tool_names: Tool names to omit from this embedded client.
+            allowed_tool_names: Optional hard allowlist applied after all tools are assembled.
+            system_prompt_overlay: Server-owned instructions appended to the generated prompt.
+            subagent_system_prompt_overlay: Server-owned instructions appended to subagent prompts.
+            subagent_middlewares: Guardrail middlewares inherited by internal subagents.
         """
         if config_path is not None:
             reload_app_config(config_path)
@@ -208,10 +216,29 @@ class DeerFlowClient:
         self._plan_mode = plan_mode
         self._max_concurrent_subagents = max_concurrent_subagents
         self._agent_name = agent_name
-        self._available_skills = set(available_skills) if available_skills is not None else None
+        self._agent_config = load_agent_config(agent_name) if agent_name is not None else None
+        profile_skills = self._agent_config.skills if self._agent_config is not None else None
+        if available_skills is None:
+            self._available_skills = set(profile_skills) if profile_skills is not None else None
+        elif profile_skills is None:
+            self._available_skills = set(available_skills)
+        else:
+            self._available_skills = set(available_skills).intersection(profile_skills)
+        self._tool_groups = self._agent_config.tool_groups if self._agent_config is not None else None
+        self._profile_model_name = self._agent_config.model if self._agent_config is not None else None
         self._middlewares = list(middlewares) if middlewares else []
+        self._subagent_middlewares = list(subagent_middlewares or [])
         self._additional_mcp_tools = list(additional_mcp_tools or [])
         self._excluded_tool_names = frozenset(excluded_tool_names or ())
+        self._allowed_tool_names = (
+            frozenset(allowed_tool_names) if allowed_tool_names is not None else None
+        )
+        self._system_prompt_overlay = (system_prompt_overlay or "").strip()
+        self._subagent_system_prompt_overlay = (
+            subagent_system_prompt_overlay
+            if subagent_system_prompt_overlay is not None
+            else self._system_prompt_overlay
+        ).strip()
         self._recursion_limit = recursion_limit
         configured_checkpointer = getattr(self._app_config, "checkpointer", None)
         self._checkpoint_channel_mode: CheckpointChannelMode = (
@@ -280,7 +307,10 @@ class DeerFlowClient:
         """Build a RunnableConfig for agent invocation."""
         configurable = {
             "thread_id": thread_id,
-            "model_name": overrides.get("model_name", self._model_name),
+            "model_name": overrides.get(
+                "model_name",
+                self._model_name or getattr(self, "_profile_model_name", None),
+            ),
             "thinking_enabled": overrides.get("thinking_enabled", self._thinking_enabled),
             "is_plan_mode": overrides.get("plan_mode", self._plan_mode),
             "subagent_enabled": overrides.get("subagent_enabled", self._subagent_enabled),
@@ -293,11 +323,31 @@ class DeerFlowClient:
         # parent-agent context from runtime.config["metadata"] at call time.
         # _get_runnable_config puts model_name/thinking_enabled into configurable for
         # LangGraph checkpoint keying, but ToolRuntime only exposes metadata to tools.
-        effective_model = overrides.get("model_name") or self._model_name
+        effective_model = (
+            overrides.get("model_name")
+            or self._model_name
+            or getattr(self, "_profile_model_name", None)
+        )
         if effective_model:
             metadata["model_name"] = effective_model
         metadata["thinking_enabled"] = bool(overrides.get("thinking_enabled", self._thinking_enabled))
         metadata["agent_name"] = self._agent_name or "agent"
+        metadata["tool_groups"] = getattr(self, "_tool_groups", None)
+        metadata["available_skills"] = (
+            sorted(self._available_skills) if self._available_skills is not None else None
+        )
+        subagent_middlewares = getattr(self, "_subagent_middlewares", [])
+        if subagent_middlewares:
+            metadata["subagent_middlewares"] = subagent_middlewares
+        metadata["subagent_system_prompt_overlay"] = getattr(
+            self, "_subagent_system_prompt_overlay", ""
+        )
+        metadata["subagent_excluded_tool_names"] = sorted(self._excluded_tool_names)
+        metadata["subagent_allowed_tool_names"] = (
+            sorted(self._allowed_tool_names)
+            if self._allowed_tool_names is not None
+            else None
+        )
         if overrides.get("user_id") is not None:
             metadata["user_id"] = str(overrides["user_id"])
         result = RunnableConfig(
@@ -345,7 +395,9 @@ class DeerFlowClient:
         """Create (or recreate) the agent when config-dependent params change."""
         cfg = config.get("configurable", {})
         app_config = get_app_config()
-        requested_model_name = cfg.get("model_name")
+        requested_model_name = cfg.get("model_name") or getattr(
+            self, "_profile_model_name", None
+        )
         model_name = requested_model_name or app_config.get_default_model_name()
         model_config = app_config.get_model_config(model_name) if model_name else None
         memory_signature = self._get_memory_signature(self._agent_name)
@@ -359,7 +411,7 @@ class DeerFlowClient:
             "_checkpoint_snapshot_frequency",
             DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY,
         )
-        key = (
+        key: tuple[Any, ...] = (
             model_name,
             getattr(model_config, "supports_vision", False),
             cfg.get("thinking_enabled"),
@@ -376,6 +428,13 @@ class DeerFlowClient:
             checkpoint_mode,
             checkpoint_frequency,
             getattr(self, "_excluded_tool_names", frozenset()),
+            getattr(self, "_allowed_tool_names", None),
+            getattr(self, "_system_prompt_overlay", ""),
+            getattr(self, "_subagent_system_prompt_overlay", ""),
+            tuple(
+                type(middleware).__qualname__
+                for middleware in getattr(self, "_subagent_middlewares", [])
+            ),
         )
 
         if self._agent is not None and self._agent_config_key == key:
@@ -404,19 +463,24 @@ class DeerFlowClient:
             checkpoint_mode,
             checkpoint_frequency,
         )
+        tools = self._get_tools(model_name=model_name, subagent_enabled=subagent_enabled)
+        effective_tool_names = {tool.name for tool in tools}
+        effective_subagent_enabled = subagent_enabled and "task" in effective_tool_names
         kwargs: dict[str, Any] = {
             # disable_keepalive: the lead agent's ChatOpenAI is cached per
             # config and reused across requests; opting out of keep-alive
             # ensures the httpx pool never carries SSL transports that
             # could later be torn down on a foreign loop.
             "model": create_chat_model(name=model_name, thinking_enabled=thinking_enabled, disable_keepalive=True),
-            "tools": self._get_tools(model_name=model_name, subagent_enabled=subagent_enabled),
+            "tools": tools,
             "middleware": middlewares,
             "system_prompt": apply_prompt_template(
-                subagent_enabled=subagent_enabled,
+                subagent_enabled=effective_subagent_enabled,
                 max_concurrent_subagents=max_concurrent_subagents,
                 agent_name=self._agent_name,
                 available_skills=self._available_skills,
+                available_tool_names=effective_tool_names,
+                system_prompt_overlay=getattr(self, "_system_prompt_overlay", ""),
             ),
             "state_schema": get_thread_state_schema(
                 checkpoint_mode,
@@ -444,6 +508,7 @@ class DeerFlowClient:
         tools = list(
             get_available_tools(
                 model_name=model_name,
+                groups=getattr(self, "_tool_groups", None),
                 subagent_enabled=subagent_enabled,
             )
         )
@@ -457,11 +522,42 @@ class DeerFlowClient:
                 continue
             tools.append(tool)
             existing_names.add(tool.name)
-        return [
+        filtered = [
             tool
             for tool in tools
             if tool.name not in getattr(self, "_excluded_tool_names", frozenset())
         ]
+        allowed = getattr(self, "_allowed_tool_names", None)
+        if allowed is not None:
+            filtered = [tool for tool in filtered if tool.name in allowed]
+
+        try:
+            from deerflow.tools.builtins.tool_search import (
+                clone_deferred_registry_for_tools,
+                get_deferred_registry,
+                reset_deferred_registry,
+                set_deferred_registry,
+            )
+
+            source_registry = get_deferred_registry()
+            if source_registry is not None:
+                filtered_names = {tool.name for tool in filtered}
+                if "tool_search" not in filtered_names:
+                    # Allowed deferred tools become ordinary bound tools when
+                    # discovery itself is unavailable.
+                    reset_deferred_registry()
+                else:
+                    filtered_registry = clone_deferred_registry_for_tools(
+                        source_registry, filtered
+                    )
+                    if filtered_registry is None:
+                        filtered = [tool for tool in filtered if tool.name != "tool_search"]
+                        reset_deferred_registry()
+                    else:
+                        set_deferred_registry(filtered_registry)
+        except Exception:
+            logger.debug("Failed to apply deferred tool policy", exc_info=True)
+        return filtered
 
     @staticmethod
     def _serialize_tool_calls(tool_calls) -> list[dict]:

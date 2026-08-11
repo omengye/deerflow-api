@@ -98,6 +98,8 @@ api:
 local_acp:
   checkpointer_path: ./data/acp-checkpoints.db
   session_store_path: ./data/acp-sessions.db
+  # Idle local editor windows are cheap and do not consume a run slot.
+  max_active_connections: 16
   max_active_runs: 2
   run_timeout_seconds: 600
   session_page_size: 50
@@ -108,6 +110,29 @@ local_acp:
   model_name: null
   thinking_enabled: true
   plan_mode: true
+  # Internal DeerFlow task subagents can share the parent workspace and inherit
+  # the local ACP tool/permission policy. External invoke_acp_agent remains off.
+  subagent_enabled: false
+  max_concurrent_subagents: 2
+  # off | dangerous | all. dangerous approves read/search/think locally and asks
+  # the ACP client before edit/delete/execute/fetch/unknown tool calls.
+  permission_mode: dangerous
+  # Optional hard tool policy applied after global tools and client MCP tools are assembled.
+  # When task is omitted or denied, subagents are effectively disabled even if
+  # subagent_enabled is true.
+  tool_allowlist: null
+  tool_denylist: []
+  # global | workspace | session. workspace is the safer default for a local
+  # task agent because unrelated project directories do not share memories.
+  memory_scope: workspace
+  # Optional server-owned prompt addition. prompt_overlay_file is resolved relative
+  # to config.yaml; do not use ACP user messages as system instructions.
+  prompt_overlay: ""
+  # prompt_overlay_file: ./config/local-acp-overlay.md
+  resource_link_max_size_mb: 25
+  # Closed sessions disappear immediately. Their metadata and checkpoints are
+  # deleted at a later daemon/stdio startup after this retention period.
+  closed_session_retention_days: 30
   recursion_limit: 200
   agent_name: null
   # session/new.cwd is mounted as /mnt/user-data/workspace for this local
@@ -117,7 +142,7 @@ local_acp:
   # filesystem locations visible to that sandbox. WSL is not a strict project
   # boundary because mounted Windows drives remain reachable.
   enable_bash: false
-  # External ACP-agent and subagent tools remain unavailable in either mode.
+  # External ACP-agent and persistent scheduler tools remain unavailable.
   # Trusted local clients only. When enabled, ACP stdio, SSE, and HTTP
   # (Streamable HTTP) mcpServers are attached per session, kept in memory, and
   # cleaned up when the client disconnects. Remote URLs and headers are supplied

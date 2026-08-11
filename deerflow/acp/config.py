@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import yaml
+from dotenv import load_dotenv
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -70,6 +71,15 @@ def _as_bool(value: Any, *, name: str) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
+def _string_list(value: Any, *, name: str) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{name} must be a list of strings or null")
+    normalized = tuple(dict.fromkeys(item.strip() for item in value if item.strip()))
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
 class LocalACPArtifactConfig:
     """S3-compatible artifact publishing settings for remote ACP clients."""
@@ -96,25 +106,36 @@ class LocalACPConfig:
     deerflow_home: Path | None = None
     deerflow_host_base_dir: Path | None = None
     extensions_config_path: Path | None = None
+    max_active_connections: int = 16
     max_active_runs: int = 2
     run_timeout_seconds: float = 600.0
     session_page_size: int = 50
     model_name: str | None = None
     thinking_enabled: bool = True
-    # Kept in the resolved shape for persisted-session compatibility. Local
-    # ACP is deliberately single-agent and always resolves these to False/1.
     subagent_enabled: bool = False
     plan_mode: bool = True
-    max_concurrent_subagents: int = 1
+    max_concurrent_subagents: int = 2
     recursion_limit: int = 200
     agent_name: str | None = None
     enable_bash: bool = False
     accept_client_mcp_servers: bool = False
+    permission_mode: str = "dangerous"
+    tool_allowlist: tuple[str, ...] | None = None
+    tool_denylist: tuple[str, ...] = ()
+    memory_scope: str = "workspace"
+    prompt_overlay: str = ""
+    resource_link_max_size_bytes: int = 25 * 1024 * 1024
+    closed_session_retention_days: int = 30
     artifacts: LocalACPArtifactConfig | None = None
 
     @classmethod
     def from_file(cls, config_path: str | None = None) -> "LocalACPConfig":
         resolved = _resolve_config_path(config_path)
+        # The API process loads the project .env during app bootstrap, but the
+        # standalone ACP daemon does not import that package. Load the .env
+        # beside config.yaml here so every ACP entrypoint has the same secrets
+        # and environment overrides. Explicit process variables keep priority.
+        load_dotenv(resolved.parent / ".env", override=False)
         with resolved.open(encoding="utf-8") as stream:
             raw = yaml.safe_load(stream) or {}
         if not isinstance(raw, dict):
@@ -139,16 +160,55 @@ class LocalACPConfig:
             str(_value(local, "session_store_path", data_dir / "acp-sessions.db")),
         )
 
+        max_active_connections = _env_int(
+            "DEER_FLOW_ACP_MAX_ACTIVE_CONNECTIONS",
+            int(_value(local, "max_active_connections", 16)),
+        )
         max_active_runs = _env_int(
             "DEER_FLOW_ACP_MAX_ACTIVE_RUNS",
             int(_value(local, "max_active_runs", 2)),
         )
         run_timeout = _env_float(
             "DEER_FLOW_ACP_RUN_TIMEOUT",
-            float(_value(local, "run_timeout_seconds", _value(api, "chat_request_timeout", 600.0))),
+            float(
+                _value(
+                    local,
+                    "run_timeout_seconds",
+                    _value(api, "chat_request_timeout", 600.0),
+                )
+            ),
         )
         page_size = int(_value(local, "session_page_size", 50))
-        recursion_limit = int(_value(local, "recursion_limit", _value(api, "recursion_limit", 200)))
+        recursion_limit = int(
+            _value(local, "recursion_limit", _value(api, "recursion_limit", 200))
+        )
+        max_concurrent_subagents = int(_value(local, "max_concurrent_subagents", 2))
+        permission_raw = _value(local, "permission_mode", "dangerous")
+        # PyYAML follows YAML 1.1 here and parses an unquoted `off` as False.
+        # Treat that representation as the documented permission mode instead
+        # of letting daemon startup fail before publishing its endpoint.
+        permission_mode = (
+            "off" if permission_raw is False else str(permission_raw).strip().lower()
+        )
+        memory_scope = str(_value(local, "memory_scope", "workspace")).strip().lower()
+        closed_retention_days = int(_value(local, "closed_session_retention_days", 30))
+        resource_link_max_size_mb = int(_value(local, "resource_link_max_size_mb", 25))
+        tool_allowlist = _string_list(
+            local.get("tool_allowlist"), name="local_acp.tool_allowlist"
+        )
+        tool_denylist = (
+            _string_list(local.get("tool_denylist", []), name="local_acp.tool_denylist")
+            or ()
+        )
+        prompt_overlay = str(_value(local, "prompt_overlay", "")).strip()
+        prompt_overlay_file = local.get("prompt_overlay_file")
+        if prompt_overlay_file:
+            overlay_path = _resolve_path(str(prompt_overlay_file), base_dir)
+            prompt_overlay = overlay_path.read_text(encoding="utf-8").strip()
+        if len(prompt_overlay) > 65_536:
+            raise ValueError(
+                "local_acp.prompt_overlay must be at most 65536 characters"
+            )
         deerflow_home_raw = (
             api.get("deerflow_home")
             or os.getenv("DEER_FLOW_HOME")
@@ -161,6 +221,10 @@ class LocalACPConfig:
             "DEER_FLOW_EXTENSIONS_CONFIG_PATH"
         )
 
+        if not 1 <= max_active_connections <= 128:
+            raise ValueError(
+                "local_acp.max_active_connections must be between 1 and 128"
+            )
         if max_active_runs < 1:
             raise ValueError("local_acp.max_active_runs must be at least 1")
         if run_timeout <= 0:
@@ -169,6 +233,24 @@ class LocalACPConfig:
             raise ValueError("local_acp.session_page_size must be between 1 and 500")
         if recursion_limit < 10:
             raise ValueError("local_acp.recursion_limit must be at least 10")
+        if not 1 <= max_concurrent_subagents <= 4:
+            raise ValueError(
+                "local_acp.max_concurrent_subagents must be between 1 and 4"
+            )
+        if permission_mode not in {"off", "dangerous", "all"}:
+            raise ValueError("local_acp.permission_mode must be off, dangerous, or all")
+        if memory_scope not in {"global", "workspace", "session"}:
+            raise ValueError(
+                "local_acp.memory_scope must be global, workspace, or session"
+            )
+        if not 0 <= closed_retention_days <= 3650:
+            raise ValueError(
+                "local_acp.closed_session_retention_days must be between 0 and 3650"
+            )
+        if not 1 <= resource_link_max_size_mb <= 2048:
+            raise ValueError(
+                "local_acp.resource_link_max_size_mb must be between 1 and 2048"
+            )
 
         artifact_enabled = _as_bool(
             os.getenv(
@@ -179,12 +261,16 @@ class LocalACPConfig:
         )
         artifact_config: LocalACPArtifactConfig | None = None
         if artifact_enabled:
-            endpoint_url = str(
-                os.getenv(
-                    "DEER_FLOW_ACP_ARTIFACT_ENDPOINT",
-                    _value(artifact_raw, "endpoint_url", ""),
+            endpoint_url = (
+                str(
+                    os.getenv(
+                        "DEER_FLOW_ACP_ARTIFACT_ENDPOINT",
+                        _value(artifact_raw, "endpoint_url", ""),
+                    )
                 )
-            ).strip().rstrip("/")
+                .strip()
+                .rstrip("/")
+            )
             bucket = str(
                 os.getenv(
                     "DEER_FLOW_ACP_ARTIFACT_BUCKET",
@@ -220,7 +306,9 @@ class LocalACPConfig:
                     "local_acp.artifacts.presigned_get_expires_seconds must be between 60 and 604800"
                 )
             if max_size_mb < 1:
-                raise ValueError("local_acp.artifacts.max_file_size_mb must be at least 1")
+                raise ValueError(
+                    "local_acp.artifacts.max_file_size_mb must be at least 1"
+                )
             addressing_style = str(
                 _value(artifact_raw, "addressing_style", "path")
             ).strip()
@@ -259,20 +347,26 @@ class LocalACPConfig:
             extensions_config_path=(
                 _resolve_path(str(extensions_raw), base_dir) if extensions_raw else None
             ),
+            max_active_connections=max_active_connections,
             max_active_runs=max_active_runs,
             run_timeout_seconds=run_timeout,
             session_page_size=page_size,
             model_name=_value(local, "model_name", api.get("model_name")),
             thinking_enabled=_as_bool(
-                _value(local, "thinking_enabled", _value(api, "thinking_enabled", True)),
+                _value(
+                    local, "thinking_enabled", _value(api, "thinking_enabled", True)
+                ),
                 name="local_acp.thinking_enabled",
             ),
-            subagent_enabled=False,
+            subagent_enabled=_as_bool(
+                _value(local, "subagent_enabled", False),
+                name="local_acp.subagent_enabled",
+            ),
             plan_mode=_as_bool(
                 _value(local, "plan_mode", _value(api, "plan_mode", True)),
                 name="local_acp.plan_mode",
             ),
-            max_concurrent_subagents=1,
+            max_concurrent_subagents=max_concurrent_subagents,
             recursion_limit=recursion_limit,
             agent_name=_value(local, "agent_name", api.get("agent_name")),
             enable_bash=_as_bool(
@@ -289,6 +383,13 @@ class LocalACPConfig:
                 ),
                 name="local_acp.accept_client_mcp_servers",
             ),
+            permission_mode=permission_mode,
+            tool_allowlist=tool_allowlist,
+            tool_denylist=tool_denylist,
+            memory_scope=memory_scope,
+            prompt_overlay=prompt_overlay,
+            resource_link_max_size_bytes=resource_link_max_size_mb * 1024 * 1024,
+            closed_session_retention_days=closed_retention_days,
             artifacts=artifact_config,
         )
         return result
