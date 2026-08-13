@@ -10,6 +10,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from deerflow.config.project_root import find_project_root
+from deerflow.constants import DEFAULT_MCP_SESSION_INIT_TIMEOUT
 
 
 _extensions_config_lock = threading.RLock()
@@ -92,6 +93,14 @@ class McpServerConfig(BaseModel):
     tool_name_prefix: bool = Field(
         default=True,
         description="Whether to prefix discovered tool names with the MCP server name to avoid collisions",
+    )
+    session_init_timeout: float | None = Field(
+        default=DEFAULT_MCP_SESSION_INIT_TIMEOUT,
+        gt=0,
+        description=(
+            "Timeout in seconds for MCP tool discovery and persistent session "
+            "initialization. Set null explicitly to disable the timeout."
+        ),
     )
     model_config = ConfigDict(extra="allow")
 

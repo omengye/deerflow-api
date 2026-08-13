@@ -337,7 +337,10 @@ class SchedulerStore:
                 if row is None:
                     return None
                 next_run_at = row["next_run_at"]
-                if enabled and next_run_at is None:
+                if enabled and (
+                    next_run_at is None
+                    or datetime.fromisoformat(next_run_at).astimezone(UTC) <= _utc_now()
+                ):
                     task = self._row_to_task(row)
                     next_dt = compute_next_run_at(
                         schedule_type=task.schedule_type,
@@ -356,12 +359,87 @@ class SchedulerStore:
 
         return await asyncio.to_thread(_write)
 
+    async def pause_task(
+        self,
+        task_id: str,
+        *,
+        reason: str = "Scheduled task paused",
+    ) -> tuple[ScheduledTask | None, list[dict[str, Any]]]:
+        """Disable a task and terminalize every outstanding occurrence."""
+        now = _dt_to_iso(_utc_now())
+
+        def _write() -> tuple[ScheduledTask | None, list[dict[str, Any]]]:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)).fetchone()
+                if row is None:
+                    return None, []
+                active = [
+                    dict(item)
+                    for item in conn.execute(
+                        """
+                        SELECT * FROM scheduled_task_runs
+                        WHERE task_id = ?
+                          AND status IN ('pending', 'retry', 'claimed', 'running', 'launched')
+                        """,
+                        (task_id,),
+                    ).fetchall()
+                ]
+                conn.execute(
+                    "UPDATE scheduled_tasks SET enabled = 0, updated_at = ? WHERE id = ?",
+                    (now, task_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE scheduled_task_runs
+                    SET status = 'cancelled', error = ?,
+                        execution_status = COALESCE(execution_status, 'cancelled'),
+                        execution_error = COALESCE(execution_error, ?),
+                        available_at = NULL, lease_expires_at = NULL,
+                        finished_at = COALESCE(finished_at, ?), updated_at = ?
+                    WHERE task_id = ?
+                      AND status IN ('pending', 'retry', 'claimed', 'running', 'launched')
+                    """,
+                    (reason[:4000], reason[:4000], now, now, task_id),
+                )
+                updated = conn.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)).fetchone()
+                return self._row_to_task(updated), active
+
+        return await asyncio.to_thread(_write)
+
     async def delete_task(self, task_id: str) -> bool:
         def _write() -> bool:
             with self._connect() as conn:
                 conn.execute("DELETE FROM scheduled_task_runs WHERE task_id = ?", (task_id,))
                 cur = conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
                 return cur.rowcount > 0
+
+        return await asyncio.to_thread(_write)
+
+    async def delete_tasks_for_thread(self, thread_id: str) -> int:
+        """Delete all task definitions/history when no scheduler is active."""
+        def _write() -> int:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                task_ids = [
+                    row["id"]
+                    for row in conn.execute(
+                        "SELECT id FROM scheduled_tasks WHERE thread_id = ?",
+                        (thread_id,),
+                    ).fetchall()
+                ]
+                if not task_ids:
+                    return 0
+                placeholders = ",".join("?" for _ in task_ids)
+                conn.execute(
+                    f"DELETE FROM scheduled_task_runs WHERE task_id IN ({placeholders})",
+                    task_ids,
+                )
+                conn.execute(
+                    "DELETE FROM scheduled_tasks WHERE thread_id = ?",
+                    (thread_id,),
+                )
+                return len(task_ids)
 
         return await asyncio.to_thread(_write)
 
@@ -486,10 +564,12 @@ class SchedulerStore:
 
                 candidates = conn.execute(
                     f"""
-                    SELECT id, task_id, scheduled_at, attempt_count
-                    FROM scheduled_task_runs
-                    WHERE attempt_count < ? AND ({claimable_sql})
-                    ORDER BY COALESCE(available_at, scheduled_at), created_at
+                    SELECT runs.id, runs.task_id, runs.scheduled_at, runs.attempt_count
+                    FROM scheduled_task_runs AS runs
+                    JOIN scheduled_tasks AS tasks ON tasks.id = runs.task_id
+                    WHERE (tasks.enabled = 1 OR tasks.schedule_type = 'once')
+                      AND runs.attempt_count < ? AND ({claimable_sql})
+                    ORDER BY COALESCE(runs.available_at, runs.scheduled_at), runs.created_at
                     LIMIT ?
                     """,
                     (max_attempts, now_iso, now_iso, limit * 4),
@@ -504,9 +584,12 @@ class SchedulerStore:
                         SELECT DISTINCT tasks.thread_id
                         FROM scheduled_task_runs AS runs
                         JOIN scheduled_tasks AS tasks ON tasks.id = runs.task_id
-                        WHERE runs.status IN ('claimed', 'running')
-                          AND runs.lease_expires_at IS NOT NULL
-                          AND runs.lease_expires_at > ?
+                        WHERE runs.status = 'launched'
+                           OR (
+                              runs.status IN ('claimed', 'running')
+                              AND runs.lease_expires_at IS NOT NULL
+                              AND runs.lease_expires_at > ?
+                           )
                         """,
                         (now_iso,),
                     ).fetchall()
@@ -574,6 +657,14 @@ class SchedulerStore:
                     UPDATE scheduled_task_runs
                     SET run_id = ?, status = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
                     WHERE id = ? AND attempt_count = ? AND status IN ('claimed', 'running')
+                      AND EXISTS (
+                          SELECT 1 FROM scheduled_tasks
+                          WHERE scheduled_tasks.id = scheduled_task_runs.task_id
+                            AND (
+                                scheduled_tasks.enabled = 1
+                                OR scheduled_tasks.schedule_type = 'once'
+                            )
+                      )
                     """,
                     (run_id, now, now, task_run_id, attempt_count),
                 )
@@ -598,9 +689,76 @@ class SchedulerStore:
                     """
                     UPDATE scheduled_task_runs
                     SET lease_expires_at = ?, updated_at = ?
-                    WHERE id = ? AND attempt_count = ? AND status IN ('claimed', 'running')
+                    WHERE id = ? AND attempt_count = ? AND status IN ('claimed', 'running', 'launched')
                     """,
                     (lease_expires_at, now_iso, task_run_id, attempt_count),
+                )
+                return cur.rowcount > 0
+
+        return await asyncio.to_thread(_write)
+
+    async def reconcile_expired_launched_runs(
+        self,
+        *,
+        now: datetime,
+        orphan_grace_seconds: float = 3600.0,
+    ) -> int:
+        """Terminalize expired launch fences without replaying the prompt."""
+        now = now.astimezone(UTC)
+        now_iso = _dt_to_iso(now)
+        orphaned_before = _dt_to_iso(
+            now - timedelta(seconds=max(0.0, orphan_grace_seconds))
+        )
+        reason = "Scheduler owner disappeared after managed run launch; prompt was not retried"
+
+        def _write() -> int:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE scheduled_task_runs
+                    SET status = 'interrupted', error = ?,
+                        execution_status = 'unknown', execution_error = ?,
+                        lease_expires_at = NULL,
+                        finished_at = COALESCE(finished_at, ?), updated_at = ?
+                    WHERE status = 'launched'
+                      AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                      AND updated_at <= ?
+                    """,
+                    (reason, reason, now_iso, now_iso, now_iso, orphaned_before),
+                )
+                return cur.rowcount
+
+        return await asyncio.to_thread(_write)
+
+    async def mark_task_run_launched(
+        self,
+        task_run_id: str,
+        run_id: str,
+        *,
+        attempt_count: int,
+    ) -> bool:
+        """Fence an occurrence once a managed run has actually been created.
+
+        ``launched`` rows are intentionally not part of ``claim_due_tasks``'
+        expired-lease recovery set.  After this boundary, automatic prompt
+        replay is unsafe because the managed run may already have committed
+        external side effects.  Explicit retry decisions (shutdown after
+        cancellation or a classified transient LLM failure) still use
+        ``reschedule_task_run`` below.
+        """
+        now = _dt_to_iso(_utc_now())
+
+        def _write() -> bool:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE scheduled_task_runs
+                    SET run_id = ?, status = 'launched',
+                        started_at = COALESCE(started_at, ?), updated_at = ?
+                    WHERE id = ? AND attempt_count = ?
+                      AND status IN ('claimed', 'running', 'launched')
+                    """,
+                    (run_id, now, now, task_run_id, attempt_count),
                 )
                 return cur.rowcount > 0
 
@@ -647,7 +805,7 @@ class SchedulerStore:
                         execution_status = ?, execution_error = ?,
                         delivery_status = ?, delivery_error = ?,
                         finished_at = ?, updated_at = ?
-                    WHERE id = ? AND attempt_count = ? AND status IN ('claimed', 'running')
+                    WHERE id = ? AND attempt_count = ? AND status IN ('claimed', 'running', 'launched')
                     """,
                     (
                         status,
@@ -705,7 +863,7 @@ class SchedulerStore:
                 attempt_clause = (
                     ""
                     if attempt_count is None
-                    else " AND attempt_count = ? AND status IN ('claimed', 'running')"
+                    else " AND attempt_count = ? AND status IN ('claimed', 'running', 'launched')"
                 )
                 params: list[Any] = [
                     status,
@@ -849,12 +1007,19 @@ class SchedulerService:
         self._task: asyncio.Task | None = None
         self._stopping = asyncio.Event()
         self._dispatch_tasks: set[asyncio.Task] = set()
+        self._dispatch_tasks_by_task_id: dict[str, set[asyncio.Task]] = {}
         self._last_cleanup_at = 0.0
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
             return
         self.store.setup()
+        reconciled = await self.store.reconcile_expired_launched_runs(now=_utc_now())
+        if reconciled:
+            logger.warning(
+                "Reconciled %d orphaned launched scheduler occurrence(s) without replay",
+                reconciled,
+            )
         set_scheduler_service(self)
         self._stopping.clear()
         self._task = asyncio.create_task(self._run_loop(), name="deerflow-scheduler")
@@ -877,6 +1042,7 @@ class SchedulerService:
                 task.cancel()
             await asyncio.gather(*active, return_exceptions=True)
         self._dispatch_tasks.clear()
+        self._dispatch_tasks_by_task_id.clear()
         set_scheduler_service(None)
         logger.info("Scheduler service stopped")
 
@@ -901,6 +1067,13 @@ class SchedulerService:
                 logger.info("Cleaned up %d old scheduled-task run records", deleted)
             self._last_cleanup_at = loop.time()
 
+        reconciled = await self.store.reconcile_expired_launched_runs(now=_utc_now())
+        if reconciled:
+            logger.warning(
+                "Reconciled %d expired launched scheduler occurrence(s) without replay",
+                reconciled,
+            )
+
         active_count = sum(1 for task in self._dispatch_tasks if not task.done())
         capacity = self.max_concurrent_runs - active_count
         if capacity <= 0:
@@ -917,15 +1090,87 @@ class SchedulerService:
                 name=f"scheduled-dispatch-{task.id}-{task_run_id}",
             )
             self._dispatch_tasks.add(dispatch_task)
-            dispatch_task.add_done_callback(self._on_dispatch_done)
+            self._dispatch_tasks_by_task_id.setdefault(task.id, set()).add(dispatch_task)
+            dispatch_task.add_done_callback(
+                lambda completed, task_id=task.id: self._on_dispatch_done(task_id, completed)
+            )
 
-    def _on_dispatch_done(self, task: asyncio.Task) -> None:
+    def _on_dispatch_done(self, task_id: str, task: asyncio.Task) -> None:
         self._dispatch_tasks.discard(task)
+        by_task = self._dispatch_tasks_by_task_id.get(task_id)
+        if by_task is not None:
+            by_task.discard(task)
+            if not by_task:
+                self._dispatch_tasks_by_task_id.pop(task_id, None)
         if task.cancelled():
             return
         exc = task.exception()
         if exc is not None:
             logger.error("Scheduled dispatch task escaped with an error", exc_info=exc)
+
+    async def set_task_enabled(self, task_id: str, enabled: bool) -> ScheduledTask | None:
+        """Change task state while coordinating outstanding occurrences."""
+        if enabled:
+            return await self.store.set_enabled(task_id, True)
+        task, active = await self.store.pause_task(task_id)
+        if task is None:
+            return None
+        await self._cancel_active_task_work(task_id, active, reason="Scheduled task paused")
+        return task
+
+    async def delete_task(self, task_id: str) -> bool:
+        """Fence/cancel active work before deleting the durable definition."""
+        task, active = await self.store.pause_task(
+            task_id,
+            reason="Scheduled task deleted",
+        )
+        if task is None:
+            return False
+        await self._cancel_active_task_work(task_id, active, reason="Scheduled task deleted")
+        return await self.store.delete_task(task_id)
+
+    async def delete_tasks_for_thread(self, thread_id: str) -> int:
+        """Delete every enabled or disabled schedule owned by one thread."""
+        deleted = 0
+        while True:
+            tasks = await self.store.list_tasks(
+                thread_id=thread_id,
+                include_disabled=True,
+                limit=200,
+            )
+            if not tasks:
+                return deleted
+            for task in tasks:
+                if await self.delete_task(task.id):
+                    deleted += 1
+
+    async def _cancel_active_task_work(
+        self,
+        task_id: str,
+        active_rows: list[dict[str, Any]],
+        *,
+        reason: str,
+    ) -> None:
+        run_ids = {
+            str(row["run_id"])
+            for row in active_rows
+            if row.get("run_id")
+        }
+        for run_id in run_ids:
+            try:
+                await self.manager.cancel_run(run_id, action="interrupt")
+            except Exception:
+                logger.warning("Could not cancel scheduled managed run %s", run_id, exc_info=True)
+
+        dispatches = {
+            task
+            for task in self._dispatch_tasks_by_task_id.get(task_id, set())
+            if not task.done()
+        }
+        for dispatch in dispatches:
+            dispatch.cancel(msg=reason)
+        if dispatches:
+            await asyncio.gather(*dispatches, return_exceptions=True)
 
     def _retry_delay_seconds(self, attempt_count: int) -> float:
         return min(self.retry_base_seconds * (2 ** max(0, attempt_count - 1)), 300.0)
@@ -1001,6 +1246,10 @@ class SchedulerService:
         managed_run_id = f"{task_run_id}-a{attempt_count}"
         heartbeat: asyncio.Task | None = None
         delivery_task: asyncio.Task | None = None
+        record: Any | None = None
+        launch_succeeded = False
+        delivery_status = "not_requested"
+        delivery_error: str | None = None
         try:
             owns_lease = await self.store.mark_task_run_started(
                 task_run_id,
@@ -1027,14 +1276,22 @@ class SchedulerService:
                 on_disconnect="continue",
                 multitask_strategy=task.multitask_strategy,
             )
-            if record.run_id != managed_run_id:
-                await self.store.mark_task_run_started(
-                    task_run_id,
+            # From this point onward a managed run exists.  A later scheduler
+            # bookkeeping failure must never turn this occurrence back into a
+            # retry while that run may still execute.
+            launch_succeeded = True
+            launch_recorded = await self.store.mark_task_run_launched(
+                task_run_id,
+                record.run_id,
+                attempt_count=attempt_count,
+            )
+            if not launch_recorded:
+                logger.warning(
+                    "Managed run %s launched after scheduler attempt %d lost ownership of occurrence %s",
                     record.run_id,
-                    attempt_count=attempt_count,
+                    attempt_count,
+                    task_run_id,
                 )
-            delivery_status = "not_requested"
-            delivery_error: str | None = None
             if isinstance(task.metadata.get("delivery"), dict):
                 try:
                     delivery_task = self._start_delivery(task, record.run_id)
@@ -1114,6 +1371,15 @@ class SchedulerService:
             if delivery_task is not None and not delivery_task.done():
                 delivery_task.cancel()
                 await asyncio.gather(delivery_task, return_exceptions=True)
+            # Scheduler shutdown cancels the managed task before requeueing the
+            # interrupted occurrence.  This keeps the existing at-least-once
+            # recovery contract without allowing the old and new attempts to
+            # run concurrently.
+            if launch_succeeded and record is not None:
+                managed_task = getattr(record, "task", None)
+                if managed_task is not None and not managed_task.done():
+                    managed_task.cancel()
+                    await asyncio.gather(managed_task, return_exceptions=True)
             await self._reschedule_failure(
                 task_run_id,
                 attempt_count=attempt_count,
@@ -1125,17 +1391,135 @@ class SchedulerService:
             raise
         except Exception as exc:
             logger.exception("Scheduled task %s dispatch failed", task.id)
-            await self._reschedule_failure(
-                task_run_id,
-                attempt_count=attempt_count,
-                error=str(exc) or type(exc).__name__,
-                execution_status="error",
-                execution_error=str(exc) or type(exc).__name__,
-            )
+            if launch_succeeded and record is not None:
+                await self._reconcile_launched_run(
+                    task=task,
+                    task_run_id=task_run_id,
+                    attempt_count=attempt_count,
+                    record=record,
+                    delivery_task=delivery_task,
+                    delivery_status=delivery_status,
+                    delivery_error=delivery_error,
+                    bookkeeping_error=str(exc) or type(exc).__name__,
+                )
+            else:
+                await self._reschedule_failure(
+                    task_run_id,
+                    attempt_count=attempt_count,
+                    error=str(exc) or type(exc).__name__,
+                    execution_status="error",
+                    execution_error=str(exc) or type(exc).__name__,
+                )
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def _reconcile_launched_run(
+        self,
+        *,
+        task: ScheduledTask,
+        task_run_id: str,
+        attempt_count: int,
+        record: Any,
+        delivery_task: asyncio.Task | None,
+        delivery_status: str,
+        delivery_error: str | None,
+        bookkeeping_error: str,
+    ) -> None:
+        """Finish bookkeeping after launch without ever re-running the prompt.
+
+        The normal dispatch path can fail after ``start_client_stream_run`` has
+        returned (for example while correcting a run ID or writing the terminal
+        occurrence row).  At that point retrying the occurrence is unsafe: the
+        managed run may already have produced external side effects.  Wait for
+        the already-launched work and make one best-effort terminal write.
+        """
+        logger.error(
+            "Scheduled task %s launched as run %s but scheduler bookkeeping failed: %s",
+            task.id,
+            getattr(record, "run_id", None),
+            bookkeeping_error,
+        )
+        try:
+            try:
+                launch_recorded = await self.store.mark_task_run_launched(
+                    task_run_id,
+                    record.run_id,
+                    attempt_count=attempt_count,
+                )
+                if not launch_recorded:
+                    logger.warning(
+                        "Could not persist launch fence for stale scheduler attempt %d on occurrence %s",
+                        attempt_count,
+                        task_run_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "Could not persist launch fence for run %s; continuing reconciliation without requeue",
+                    record.run_id,
+                )
+
+            managed_task = getattr(record, "task", None)
+            if managed_task is not None:
+                try:
+                    await managed_task
+                except asyncio.CancelledError:
+                    if asyncio.current_task() is not None and asyncio.current_task().cancelling():
+                        raise
+                    logger.warning("Launched scheduled run %s was cancelled", record.run_id)
+                except Exception:
+                    logger.warning("Launched scheduled run task raised during reconciliation", exc_info=True)
+
+            if delivery_task is not None:
+                try:
+                    await delivery_task
+                    delivery_status = "success"
+                except asyncio.CancelledError:
+                    if asyncio.current_task() is not None and asyncio.current_task().cancelling():
+                        raise
+                    delivery_status = "error"
+                    delivery_error = "Delivery was cancelled"
+                except Exception as exc:
+                    delivery_status = "error"
+                    delivery_error = f"Delivery failed: {exc}"
+
+            current = self.manager.run_manager.get(record.run_id)
+            execution_status = current.status.value if current is not None else "unknown"
+            execution_error = current.error if current is not None else "Managed run metadata disappeared"
+            if execution_status == "success":
+                overall_status = "error" if delivery_status == "error" else "success"
+                overall_error = delivery_error if delivery_status == "error" else None
+            else:
+                overall_status = "error"
+                overall_error = execution_error or f"Execution ended with status {execution_status}"
+
+            applied = await self.store.mark_task_run_finished_detailed(
+                task_run_id,
+                status=overall_status,
+                error=overall_error,
+                execution_status=execution_status,
+                execution_error=execution_error,
+                delivery_status=delivery_status,
+                delivery_error=delivery_error,
+                attempt_count=attempt_count,
+            )
+            if not applied:
+                logger.warning(
+                    "Could not reconcile stale scheduler attempt %d for occurrence %s",
+                    attempt_count,
+                    task_run_id,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Crucially, do not call _reschedule_failure here.  The running row
+            # and lease are safer than knowingly duplicating launched work.
+            logger.exception(
+                "Failed to reconcile launched scheduled run %s; occurrence %s was not requeued",
+                getattr(record, "run_id", None),
+                task_run_id,
+            )
 
     def _start_delivery(self, task: ScheduledTask, run_id: str) -> asyncio.Task | None:
         delivery = task.metadata.get("delivery")

@@ -14,8 +14,11 @@ class SandboxConfig(BaseModel):
 
     Common options:
         use: Class path of the sandbox provider (required)
-        allow_host_bash: Enable host-side bash execution for LocalSandboxProvider.
-            Dangerous and intended only for fully trusted local workflows.
+        allow_host_bash: Enable bash for host-filesystem-backed providers
+            (LocalSandboxProvider and LocalWslProvider). Dangerous and intended
+            only for fully trusted local workflows.
+        allow_host_tools: Enable tools that execute in the API host process or
+            reuse host credentials/login state. Disabled by default.
 
     AioSandboxProvider specific options:
         image: Docker image to use (default: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest)
@@ -50,7 +53,18 @@ class SandboxConfig(BaseModel):
     )
     allow_host_bash: bool = Field(
         default=False,
-        description="Allow the bash tool to execute directly on the host when using LocalSandboxProvider. Dangerous; intended only for fully trusted local environments.",
+        description=(
+            "Allow bash for LocalSandboxProvider or LocalWslProvider. These "
+            "providers share the host filesystem and are not isolation boundaries. "
+            "Dangerous; intended only for fully trusted local environments."
+        ),
+    )
+    allow_host_tools: bool = Field(
+        default=False,
+        description=(
+            "Allow tools that execute in the API host process or reuse host "
+            "credentials/login state (for example host_opencli)."
+        ),
     )
     image: str | None = Field(
         default=None,

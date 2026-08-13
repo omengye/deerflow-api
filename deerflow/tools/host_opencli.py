@@ -16,6 +16,7 @@ import shutil
 from langchain_core.tools import tool
 
 from deerflow.config import get_app_config
+from deerflow.sandbox.security import HOST_TOOLS_DISABLED_MESSAGE, is_host_tool_allowed
 
 ALLOWED_SITES = frozenset({"web", "twitter", "xiaohongshu", "xiaoyuzhou", "weixin", "douyin", "bilibili"})
 
@@ -55,6 +56,8 @@ def _opencli_argv(site: str, command: str, arguments: list[str] | None) -> list[
 
 
 async def _run_host_opencli(site: str, command: str, arguments: list[str] | None = None) -> str:
+    if not is_host_tool_allowed():
+        return f"Error: {HOST_TOOLS_DISABLED_MESSAGE}"
     if site not in ALLOWED_SITES:
         return f"Error: OpenCLI site is not allowed: {site}"
     if not command.strip():

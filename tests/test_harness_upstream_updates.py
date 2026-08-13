@@ -27,8 +27,8 @@ def test_local_sandbox_provider_scopes_user_data_by_thread(monkeypatch, tmp_path
     first_id = provider.acquire("thread-1")
     second_id = provider.acquire("thread-2")
 
-    assert first_id == "local:thread-1"
-    assert second_id == "local:thread-2"
+    assert first_id.startswith("local:thread-1:")
+    assert second_id.startswith("local:thread-2:")
 
     first = provider.get(first_id)
     second = provider.get(second_id)

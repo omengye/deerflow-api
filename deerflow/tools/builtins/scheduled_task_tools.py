@@ -138,7 +138,7 @@ async def set_scheduled_task_enabled_tool(
     """
     service = get_scheduler_service()
     await _require_task_owned_by_current_thread(runtime, task_id)
-    task = await service.store.set_enabled(task_id, enabled)
+    task = await service.set_task_enabled(task_id, enabled)
     if task is None:
         raise ValueError(f"Scheduled task not found: {task_id}")
     return _json({"updated": task_to_dict(task)})
@@ -156,7 +156,7 @@ async def delete_scheduled_task_tool(
     """
     service = get_scheduler_service()
     await _require_task_owned_by_current_thread(runtime, task_id)
-    deleted = await service.store.delete_task(task_id)
+    deleted = await service.delete_task(task_id)
     if not deleted:
         raise ValueError(f"Scheduled task not found: {task_id}")
     return _json({"deleted": task_id})

@@ -39,9 +39,9 @@ REM Start uvicorn
 if defined HOST (
     set APP_HOST=%HOST%
 ) else (
-    for /f "delims=" %%h in ('uv run python scripts\read_api_config.py host 0.0.0.0 2^>nul') do set APP_HOST=%%h
+    for /f "delims=" %%h in ('uv run python scripts\read_api_config.py host 127.0.0.1 2^>nul') do set APP_HOST=%%h
 )
-if not defined APP_HOST set APP_HOST=0.0.0.0
+if not defined APP_HOST set APP_HOST=127.0.0.1
 
 if defined PORT (
     set APP_PORT=%PORT%

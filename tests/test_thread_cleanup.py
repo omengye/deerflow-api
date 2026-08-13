@@ -42,6 +42,48 @@ def _make_manager() -> ClientManager:
     return cm
 
 
+def test_cleanup_retires_mcp_sandbox_and_scheduler_resources(tmp_path, monkeypatch):
+    manager = _make_manager()
+    thread_id = "retire-all"
+    thread_dir = tmp_path / "threads" / thread_id
+    thread_dir.mkdir(parents=True)
+    monkeypatch.setattr(
+        "deerflow.config.paths.get_paths",
+        lambda: _FakePaths(thread_dir, f"/host/data/threads/{thread_id}"),
+    )
+
+    closed_scopes: list[str] = []
+    released_threads: list[str] = []
+    deleted_schedule_threads: list[str] = []
+
+    class Pool:
+        async def close_scope(self, scope: str) -> None:
+            closed_scopes.append(scope)
+
+    class SandboxProvider:
+        def release_thread(self, scope: str) -> None:
+            released_threads.append(scope)
+
+    class Scheduler:
+        async def delete_tasks_for_thread(self, scope: str) -> int:
+            deleted_schedule_threads.append(scope)
+            return 2
+
+    manager.scheduler_service = Scheduler()
+    monkeypatch.setattr("deerflow.mcp.session_pool.get_session_pool", lambda: Pool())
+    monkeypatch.setattr(
+        "deerflow.sandbox.sandbox_provider.get_existing_sandbox_provider",
+        lambda: SandboxProvider(),
+    )
+
+    result = manager.delete_thread_completely(thread_id)
+
+    assert result["success"] is True
+    assert closed_scopes == [thread_id]
+    assert released_threads == [thread_id]
+    assert deleted_schedule_threads == [thread_id]
+
+
 def test_cleanup_falls_back_to_root_container_on_permission_error(tmp_path, monkeypatch):
     thread_id = "feishu_oc_abc123"
     thread_dir = tmp_path / "threads" / thread_id
@@ -73,7 +115,7 @@ def test_cleanup_falls_back_to_root_container_on_permission_error(tmp_path, monk
     # A throwaway root container mounting the PARENT and removing only the target.
     assert args[:3] == ["docker", "run", "--rm"]
     assert "-v" in args
-    assert f"/host/data/threads:/target" in args
+    assert "/host/data/threads:/target" in args
     assert args[-3:] == ["rm", "-rf", f"/target/{thread_id}"]
 
 

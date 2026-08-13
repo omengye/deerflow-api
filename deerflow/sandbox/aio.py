@@ -9,7 +9,9 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Collection
 from dataclasses import dataclass
+from pathlib import Path
 
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX, get_paths
 from deerflow.sandbox.sandbox import Sandbox
@@ -34,6 +36,7 @@ class _SandboxRecord:
     sandbox: AioSandbox
     thread_id: str
     last_used: float
+    skills_revision: str
 
 
 class AioSandbox(Sandbox):
@@ -479,7 +482,6 @@ class AioSandboxProvider(SandboxProvider):
         else:
             self.container_user = raw_user or None
             self.container_run_user = self.container_user
-        self.skills_path = config.skills.get_skills_path()
         self.skills_container_path = config.skills.container_path
         self._lock = threading.Lock()
         self._records: OrderedDict[str, _SandboxRecord] = OrderedDict()
@@ -500,8 +502,8 @@ class AioSandboxProvider(SandboxProvider):
             raise ValueError(f"Invalid thread_id {value!r}: only alphanumeric characters, hyphens, and underscores are allowed.")
         return value
 
-    def _sandbox_id(self, thread_id: str) -> str:
-        return f"aio-{thread_id}"
+    def _sandbox_id(self, thread_id: str, skills_revision: str) -> str:
+        return f"aio-{thread_id}-{skills_revision}"
 
     def _container_name(self, sandbox_id: str) -> str:
         return f"{self.container_prefix}-{sandbox_id}"
@@ -509,7 +511,14 @@ class AioSandboxProvider(SandboxProvider):
     def _run_docker(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(["docker", *args], shell=False, capture_output=True, text=True, timeout=60, check=check)
 
-    def _build_run_args(self, thread_id: str, sandbox_id: str) -> list[str]:
+    def _build_run_args(
+        self,
+        thread_id: str,
+        sandbox_id: str,
+        *,
+        skills_path: str,
+        skills_revision: str,
+    ) -> list[str]:
         paths = get_paths()
         paths.ensure_thread_dirs(thread_id)
         args = [
@@ -528,8 +537,9 @@ class AioSandboxProvider(SandboxProvider):
             "-v",
             f"{paths.host_acp_workspace_dir(thread_id)}:/mnt/acp-workspace:rw",
         ]
-        if self.skills_path.exists():
-            args.extend(["-v", f"{self.skills_path}:{self.skills_container_path}:ro"])
+        if Path(skills_path).exists():
+            host_projection = paths.host_skill_projection_dir(skills_revision)
+            args.extend(["-v", f"{host_projection}:{self.skills_container_path}:ro"])
         for mount in self.mounts:
             if not os.path.exists(mount.host_path):
                 continue
@@ -546,11 +556,27 @@ class AioSandboxProvider(SandboxProvider):
         args.extend([self.image, "sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600; done"])
         return args
 
-    def _start_container(self, thread_id: str, sandbox_id: str) -> AioSandbox:
+    def _start_container(
+        self,
+        thread_id: str,
+        sandbox_id: str,
+        *,
+        skills_path: str,
+        skills_revision: str,
+    ) -> AioSandbox:
         name = self._container_name(sandbox_id)
         self._run_docker(["rm", "-f", name], check=False)
         try:
-            self._run_docker(_as_str_list(self._build_run_args(thread_id, sandbox_id)))
+            self._run_docker(
+                _as_str_list(
+                    self._build_run_args(
+                        thread_id,
+                        sandbox_id,
+                        skills_path=skills_path,
+                        skills_revision=skills_revision,
+                    )
+                )
+            )
         except subprocess.CalledProcessError as exc:
             diagnostic = (exc.stderr or exc.stdout or "").strip()
             raise RuntimeError(f"Failed to start sandbox container {name}: {diagnostic}") from exc
@@ -577,9 +603,17 @@ class AioSandboxProvider(SandboxProvider):
             record = self._records.pop(sandbox_id)
             self._remove_container(record.sandbox.container_name)
 
-    def acquire(self, thread_id: str | None = None) -> str:
+    def acquire(
+        self,
+        thread_id: str | None = None,
+        *,
+        available_skills: Collection[str] | None = None,
+    ) -> str:
+        from deerflow.skills.projection import get_skill_projection
+
         safe_thread_id = self._safe_thread_id(thread_id)
-        sandbox_id = self._sandbox_id(safe_thread_id)
+        projection = get_skill_projection(available_skills)
+        sandbox_id = self._sandbox_id(safe_thread_id, projection.revision)
         with self._lock:
             self._cleanup_idle_locked()
             record = self._records.get(sandbox_id)
@@ -588,8 +622,18 @@ class AioSandboxProvider(SandboxProvider):
                 self._records.move_to_end(sandbox_id)
                 return sandbox_id
             self._evict_if_needed()
-            sandbox = self._start_container(safe_thread_id, sandbox_id)
-            self._records[sandbox_id] = _SandboxRecord(sandbox=sandbox, thread_id=safe_thread_id, last_used=time.time())
+            sandbox = self._start_container(
+                safe_thread_id,
+                sandbox_id,
+                skills_path=str(projection.path),
+                skills_revision=projection.revision,
+            )
+            self._records[sandbox_id] = _SandboxRecord(
+                sandbox=sandbox,
+                thread_id=safe_thread_id,
+                last_used=time.time(),
+                skills_revision=projection.revision,
+            )
             return sandbox_id
 
     def get(self, sandbox_id: str) -> Sandbox | None:
@@ -607,6 +651,22 @@ class AioSandboxProvider(SandboxProvider):
             if record is not None:
                 record.last_used = time.time()
                 self._records.move_to_end(sandbox_id)
+
+    def release_thread(self, thread_id: str) -> None:
+        """Remove every container revision bound to one thread."""
+        safe_thread_id = self._safe_thread_id(thread_id)
+        with self._lock:
+            records = [
+                self._records.pop(sandbox_id)
+                for sandbox_id, record in list(self._records.items())
+                if record.thread_id == safe_thread_id
+            ]
+        for record in records:
+            self._remove_container(record.sandbox.container_name)
+
+    def active_skill_revisions(self) -> set[str]:
+        with self._lock:
+            return {record.skills_revision for record in self._records.values()}
 
     def shutdown(self) -> None:
         with self._lock:

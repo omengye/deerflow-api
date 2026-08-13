@@ -7,6 +7,9 @@ from typing import Any, cast
 from unittest.mock import patch
 
 from fastapi import HTTPException, Request
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.testclient import TestClient
 
 from app.dependencies import ClientManager
 from app.routers import chat
@@ -180,21 +183,52 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         return events, fake_manager, chunks
 
     async def test_chat_stream_options_preflight(self) -> None:
-        response = await chat.chat_stream_options()
+        cors_app = FastAPI()
+        cors_app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["https://allowed.test"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        cors_app.include_router(chat.router, prefix="/api")
+        with TestClient(cors_app) as client:
+            response = client.options(
+                "/api/chat/stream",
+                headers={
+                    "Origin": "https://allowed.test",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "Authorization",
+                },
+            )
 
-        self.assertEqual(response.status_code, 204)
-        self.assertEqual(response.headers["allow"], "OPTIONS, POST")
-        self.assertEqual(response.headers["access-control-allow-origin"], "*")
-        self.assertEqual(response.headers["access-control-allow-methods"], "OPTIONS, POST")
-        self.assertEqual(response.headers["access-control-allow-headers"], "Content-Type, Authorization")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers["access-control-allow-origin"],
+            "https://allowed.test",
+        )
+        self.assertIn("POST", response.headers["access-control-allow-methods"])
 
     async def test_chat_agui_options_preflight(self) -> None:
-        response = await chat.chat_agui_options()
+        cors_app = FastAPI()
+        cors_app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["https://allowed.test"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        cors_app.include_router(chat.router, prefix="/api")
+        with TestClient(cors_app) as client:
+            response = client.options(
+                "/api/chat/agui",
+                headers={
+                    "Origin": "https://disallowed.test",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "Accept, Last-Event-ID",
+                },
+            )
 
-        self.assertEqual(response.status_code, 204)
-        self.assertEqual(response.headers["allow"], "OPTIONS, POST")
-        self.assertEqual(response.headers["access-control-allow-methods"], "OPTIONS, POST")
-        self.assertIn("Accept", response.headers["access-control-allow-headers"])
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("access-control-allow-origin", response.headers)
 
     async def test_chat_agui_disables_sse_buffering(self) -> None:
         response = await chat.chat_agui(_fake_request(), self._agui_request())

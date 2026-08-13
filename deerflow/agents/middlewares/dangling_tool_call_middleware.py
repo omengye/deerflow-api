@@ -60,8 +60,14 @@ class DanglingToolCallMiddleware(AgentMiddleware[AgentState]):
         tool_calls = getattr(msg, "tool_calls", None) or []
         normalized.extend(list(tool_calls))
 
+        invalid_tool_calls = getattr(msg, "invalid_tool_calls", None) or []
         raw_tool_calls = (getattr(msg, "additional_kwargs", None) or {}).get("tool_calls") or []
-        if not tool_calls:
+        # ``additional_kwargs.tool_calls`` is a fallback serialization of the
+        # structured views, not a third independent source.  When LangChain has
+        # already classified the provider payload as ``invalid_tool_calls``,
+        # collecting the raw copy as well would emit two ToolMessages for one
+        # call id -- a shape rejected by strict OpenAI-compatible validators.
+        if not tool_calls and not invalid_tool_calls:
             for raw_tc in raw_tool_calls:
                 if not isinstance(raw_tc, dict):
                     continue
@@ -89,7 +95,7 @@ class DanglingToolCallMiddleware(AgentMiddleware[AgentState]):
                     }
                 )
 
-        for invalid_tc in getattr(msg, "invalid_tool_calls", None) or []:
+        for invalid_tc in invalid_tool_calls:
             if not isinstance(invalid_tc, dict):
                 continue
             normalized.append(

@@ -78,13 +78,14 @@ def test_aio_provider_mounts_thread_data_and_skills(tmp_path, monkeypatch) -> No
             provider = AioSandboxProvider()
             sandbox_id = provider.acquire("thread_1")
 
-    assert sandbox_id == "aio-thread_1"
+    assert sandbox_id.startswith("aio-thread_1-")
     run_cmd = next(cmd for cmd in calls if cmd[:2] == ["docker", "run"])
     assert "--name" in run_cmd
-    assert "df-test-aio-thread_1" in run_cmd
+    assert f"df-test-{sandbox_id}" in run_cmd
     assert f"{base_dir / 'threads' / 'thread_1' / 'user-data'}:/mnt/user-data:rw" in run_cmd
     assert f"{base_dir / 'threads' / 'thread_1' / 'acp-workspace'}:/mnt/acp-workspace:rw" in run_cmd
-    assert f"{skills_dir}:/mnt/skills:ro" in run_cmd
+    assert any(mount.endswith(":/mnt/skills:ro") for mount in run_cmd)
+    assert all(str(skills_dir) not in mount for mount in run_cmd if mount.endswith(":/mnt/skills:ro"))
     assert "--security-opt" in run_cmd
     assert "seccomp:unconfined" in run_cmd
     assert "TOKEN=secret" in run_cmd
@@ -136,7 +137,7 @@ def test_aio_provider_auto_user_applies_only_to_exec(tmp_path, monkeypatch) -> N
     run_cmd = next(cmd for cmd in calls if cmd[:2] == ["docker", "run"])
     exec_cmd = next(cmd for cmd in calls if cmd[:3] == ["docker", "exec", "-i"])
     assert "--user" not in run_cmd
-    assert exec_cmd[:6] == ["docker", "exec", "-i", "-u", "1234:5678", "df-test-aio-thread_1"]
+    assert exec_cmd[:6] == ["docker", "exec", "-i", "-u", "1234:5678", f"df-test-{sandbox_id}"]
 
 
 def test_aio_provider_rejects_unsafe_thread_id(tmp_path, monkeypatch) -> None:

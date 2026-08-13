@@ -2,7 +2,7 @@
 
 Usage:
     python scripts/read_api_config.py port 8000
-    python scripts/read_api_config.py host 0.0.0.0
+    python scripts/read_api_config.py host 127.0.0.1
 """
 
 from __future__ import annotations

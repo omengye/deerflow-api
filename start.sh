@@ -67,7 +67,7 @@ except Exception:
 PY
 }
 
-APP_HOST="$(read_config_value host "${HOST:-0.0.0.0}")"
+APP_HOST="$(read_config_value host "${HOST:-127.0.0.1}")"
 APP_PORT="$(read_config_value port "${PORT:-8000}")"
 
 # Start uvicorn

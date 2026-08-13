@@ -6,7 +6,7 @@ from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from deerflow.agents.middlewares.view_image_middleware import ViewImageMiddleware
-from deerflow.tools.builtins.view_image_tool import view_image_tool
+from deerflow.tools.builtins.view_image_tool import _sanitize_image_error, view_image_tool
 
 
 IMAGE_PATH = "/mnt/user-data/uploads/test.png"
@@ -138,3 +138,18 @@ def test_view_image_tool_accepts_gif87a_and_gif89a(tmp_path: Path) -> None:
         )
 
         assert command.update["viewed_images"] == {virtual_path: {"mime_type": "image/gif"}}
+
+
+def test_view_image_error_masks_runtime_scoped_skill_projection(tmp_path: Path) -> None:
+    projection = tmp_path / "projection"
+    projection.mkdir()
+    runtime = SimpleNamespace(state={"sandbox": {"skills_path": str(projection)}})
+
+    sanitized = _sanitize_image_error(
+        OSError(f"cannot read {projection / 'public' / 'example' / 'image.png'}"),
+        {},
+        runtime,
+    )
+
+    assert str(projection) not in sanitized
+    assert "/mnt/skills/public/example/image.png" in sanitized

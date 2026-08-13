@@ -42,11 +42,26 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
         super().__init__()
         self._lazy_init = lazy_init
 
-    def _acquire_sandbox(self, thread_id: str) -> str:
+    def _acquire_sandbox(
+        self,
+        thread_id: str,
+        available_skills: list[str] | None,
+    ) -> tuple[str, dict]:
+        from deerflow.skills.projection import get_skill_projection
+
+        projection = get_skill_projection(available_skills)
         provider = get_sandbox_provider()
-        sandbox_id = provider.acquire(thread_id)
+        sandbox_id = provider.acquire(
+            thread_id,
+            available_skills=available_skills,
+        )
         logger.info(f"Acquiring sandbox {sandbox_id}")
-        return sandbox_id
+        return sandbox_id, {
+            "sandbox_id": sandbox_id,
+            "skills_revision": projection.revision,
+            "skills_path": str(projection.path),
+            "available_skills": available_skills,
+        }
 
     @override
     def before_agent(self, state: SandboxMiddlewareState, runtime: Runtime) -> dict | None:
@@ -59,9 +74,13 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
             thread_id = (runtime.context or {}).get("thread_id")
             if thread_id is None:
                 return super().before_agent(state, runtime)
-            sandbox_id = self._acquire_sandbox(thread_id)
+            raw_skills = (runtime.context or {}).get("available_skills")
+            if raw_skills is None:
+                raw_skills = (runtime.config or {}).get("metadata", {}).get("available_skills")
+            available_skills = list(raw_skills) if raw_skills is not None else None
+            sandbox_id, sandbox_state = self._acquire_sandbox(thread_id, available_skills)
             logger.info(f"Assigned sandbox {sandbox_id} to thread {thread_id}")
-            return {"sandbox": {"sandbox_id": sandbox_id}}
+            return {"sandbox": sandbox_state}
         return super().before_agent(state, runtime)
 
     @override

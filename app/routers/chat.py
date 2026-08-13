@@ -10,10 +10,9 @@ from urllib.parse import quote
 import logging
 
 from fastapi import APIRouter, Body, HTTPException, Request
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 
-from app.config import settings
 from app.dependencies import get_client_manager
 from app.middleware import get_request_id
 
@@ -23,22 +22,6 @@ from deerflow.client import StreamEvent, StreamEventType
 from deerflow.runtime import ConflictError, END_SENTINEL, HEARTBEAT_SENTINEL, RunStatus
 
 router = APIRouter(tags=["chat"])
-
-_CHAT_STREAM_OPTIONS_HEADERS = {
-    "Allow": "OPTIONS, POST",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "OPTIONS, POST",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Max-Age": "86400",
-}
-
-_AGUI_OPTIONS_HEADERS = {
-    "Allow": "OPTIONS, POST",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "OPTIONS, POST",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, Last-Event-ID",
-    "Access-Control-Max-Age": "86400",
-}
 
 _SSE_RESPONSE_HEADERS = {
     "Cache-Control": "no-cache, no-transform",
@@ -117,12 +100,6 @@ async def chat_stream(request: Request, req: ChatRequest = Body()):
             }
 
     return EventSourceResponse(event_generator())
-
-
-@router.options("/chat/stream")
-async def chat_stream_options():
-    """CORS preflight support for the streaming chat endpoint."""
-    return Response(status_code=204, headers=_CHAT_STREAM_OPTIONS_HEADERS)
 
 
 def _chat_kwargs_from_request(req: ChatRequest) -> dict[str, Any]:
@@ -358,12 +335,6 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                     await detach(record.run_id)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers=_SSE_RESPONSE_HEADERS)
-
-
-@router.options("/chat/agui")
-async def chat_agui_options():
-    """CORS preflight support for the AG-UI chat endpoint."""
-    return Response(status_code=204, headers=_AGUI_OPTIONS_HEADERS)
 
 
 def _chat_kwargs_from_agui(req: AguiRunAgentInput) -> dict[str, Any]:

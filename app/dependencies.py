@@ -87,6 +87,7 @@ class ClientManager:
         self._completed_expiry_handles: dict[str, asyncio.TimerHandle] = {}
         self._metadata_cleanup_handles: dict[str, asyncio.TimerHandle] = {}
         self._lifecycle_tasks: set[asyncio.Task] = set()
+        self._service_loop: asyncio.AbstractEventLoop | None = None
         self.scheduler_service = None
         self.thread_cleanup_service = None
         self.feishu_channel = None
@@ -152,9 +153,11 @@ class ClientManager:
 
     async def startup(self):
         """Initialize the DeerFlowClient on startup."""
-        from app.config import ensure_data_dirs
+        from app.config import ensure_data_dirs, validate_api_exposure
         from deerflow.config.app_config import get_app_config, reload_app_config
 
+        self._service_loop = asyncio.get_running_loop()
+        validate_api_exposure(settings)
         ensure_data_dirs()
         if settings.auth_enabled and not settings.api_keys:
             raise RuntimeError("DEER_FLOW_AUTH_ENABLED is true but DEER_FLOW_API_KEYS is empty")
@@ -935,6 +938,68 @@ class ClientManager:
             self._deleting_threads.add(thread_id)
 
         try:
+            # 0. Retire every process-local or durable resource that can keep
+            # acting on this conversation. These synchronous bridges are safe
+            # here because deletion itself runs on a worker thread.
+            try:
+                from deerflow.mcp.session_pool import get_session_pool
+
+                asyncio.run(get_session_pool().close_scope(thread_id))
+            except Exception:
+                logger.warning("MCP scope cleanup failed for %s", thread_id, exc_info=True)
+                return {
+                    "success": False,
+                    "detail": f"Failed to close MCP sessions for {thread_id}",
+                }
+
+            scheduler = self.scheduler_service
+            if scheduler is not None:
+                try:
+                    service_loop = self._service_loop
+                    if service_loop is not None and service_loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            scheduler.delete_tasks_for_thread(thread_id),
+                            service_loop,
+                        ).result(timeout=settings.chat_request_timeout)
+                    else:
+                        asyncio.run(scheduler.delete_tasks_for_thread(thread_id))
+                except Exception:
+                    logger.warning("scheduler cleanup failed for %s", thread_id, exc_info=True)
+                    return {
+                        "success": False,
+                        "detail": f"Failed to delete scheduled tasks for {thread_id}",
+                    }
+            elif settings.scheduler_db_path:
+                try:
+                    from deerflow.runtime.scheduler import SchedulerStore
+
+                    scheduler_db_path = Path(settings.scheduler_db_path)
+                    if not scheduler_db_path.is_absolute():
+                        scheduler_db_path = Path(settings.config_path).parent / scheduler_db_path
+                    if scheduler_db_path.exists():
+                        scheduler_store = SchedulerStore(scheduler_db_path)
+                        scheduler_store.setup()
+                        asyncio.run(scheduler_store.delete_tasks_for_thread(thread_id))
+                except Exception:
+                    logger.warning("persisted scheduler cleanup failed for %s", thread_id, exc_info=True)
+                    return {
+                        "success": False,
+                        "detail": f"Failed to delete persisted scheduled tasks for {thread_id}",
+                    }
+
+            try:
+                from deerflow.sandbox.sandbox_provider import get_existing_sandbox_provider
+
+                sandbox_provider = get_existing_sandbox_provider()
+                if sandbox_provider is not None:
+                    sandbox_provider.release_thread(thread_id)
+            except Exception:
+                logger.warning("sandbox cleanup failed for %s", thread_id, exc_info=True)
+                return {
+                    "success": False,
+                    "detail": f"Failed to release sandbox resources for {thread_id}",
+                }
+
             # 1. Delete from checkpointer
             checkpointer = self.get_checkpointer()
             if checkpointer is not None and hasattr(checkpointer, "delete_thread"):
@@ -1060,6 +1125,14 @@ class ClientManager:
         await self.stop_feishu_channel()
 
         try:
+            from deerflow.mcp.session_pool import get_session_pool, reset_session_pool
+
+            await get_session_pool().close_all()
+            reset_session_pool()
+        except Exception:
+            logger.warning("Error during MCP session cleanup", exc_info=True)
+
+        try:
             from deerflow.agents.memory import (
                 get_memory_manager,
                 reset_memory_manager,
@@ -1156,6 +1229,7 @@ class ClientManager:
         self._checkpointer = None
         self._running_threads.clear()
         self._stream_subscribers.clear()
+        self._service_loop = None
 
 
 def get_client_manager() -> ClientManager:

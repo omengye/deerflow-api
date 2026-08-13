@@ -1,6 +1,7 @@
 import logging
 import threading
 from collections import OrderedDict
+from collections.abc import Collection
 from pathlib import Path
 
 from deerflow.sandbox.local.local_sandbox import LocalSandbox, PathMapping
@@ -15,7 +16,7 @@ _ACP_WORKSPACE_VIRTUAL_PREFIX = "/mnt/acp-workspace"
 DEFAULT_MAX_CACHED_THREAD_SANDBOXES = 256
 
 
-def build_host_fs_path_mappings() -> list[PathMapping]:
+def build_host_fs_path_mappings(*, skills_path: Path | None = None) -> list[PathMapping]:
     """
     Build path mappings for host-filesystem-backed sandboxes.
 
@@ -34,7 +35,10 @@ def build_host_fs_path_mappings() -> list[PathMapping]:
         from deerflow.config import get_app_config
 
         config = get_app_config()
-        skills_path = config.skills.get_skills_path()
+        if skills_path is None:
+            from deerflow.skills.projection import get_skill_projection
+
+            skills_path = get_skill_projection().path
         container_path = config.skills.container_path
 
         # Only add mapping if skills directory exists
@@ -107,11 +111,25 @@ class LocalSandboxProvider(SandboxProvider):
 
     def __init__(self, max_cached_threads: int = DEFAULT_MAX_CACHED_THREAD_SANDBOXES):
         """Initialize the local sandbox provider with path mappings."""
-        self._path_mappings = build_host_fs_path_mappings()
+        self._path_mappings = self._build_non_skill_path_mappings()
         self._generic_sandbox: LocalSandbox | None = None
         self._thread_sandboxes: OrderedDict[str, LocalSandbox] = OrderedDict()
         self._max_cached_threads = max_cached_threads
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _build_non_skill_path_mappings() -> list[PathMapping]:
+        """Build custom mounts without ever exposing the source Skill tree."""
+        from deerflow.config import get_app_config
+
+        config = get_app_config()
+        skills_container = config.skills.container_path.rstrip("/") or "/"
+        mappings = build_host_fs_path_mappings(skills_path=Path("__missing_skills_projection__"))
+        return [
+            mapping
+            for mapping in mappings
+            if (mapping.container_path.rstrip("/") or "/") != skills_container
+        ]
 
     @staticmethod
     def _build_thread_path_mappings(thread_id: str) -> list[PathMapping]:
@@ -149,31 +167,55 @@ class LocalSandboxProvider(SandboxProvider):
             ),
         ]
 
-    def acquire(self, thread_id: str | None = None) -> str:
+    @staticmethod
+    def _projection_mapping(available_skills: Collection[str] | None):
+        from deerflow.config import get_app_config
+        from deerflow.skills.projection import get_skill_projection
+
+        projection = get_skill_projection(available_skills)
+        mapping = PathMapping(
+            container_path=get_app_config().skills.container_path,
+            local_path=str(projection.path),
+            read_only=True,
+        )
+        return projection, mapping
+
+    def acquire(
+        self,
+        thread_id: str | None = None,
+        *,
+        available_skills: Collection[str] | None = None,
+    ) -> str:
         global _singleton
+        projection, skills_mapping = self._projection_mapping(available_skills)
         if thread_id is None:
+            sandbox_id = f"local:global:{projection.revision}"
             with self._lock:
-                if self._generic_sandbox is None:
-                    self._generic_sandbox = LocalSandbox("local", path_mappings=list(self._path_mappings))
+                if self._generic_sandbox is None or self._generic_sandbox.id != sandbox_id:
+                    self._generic_sandbox = LocalSandbox(
+                        sandbox_id,
+                        path_mappings=[*self._path_mappings, skills_mapping],
+                    )
                     _singleton = self._generic_sandbox
                 return self._generic_sandbox.id
 
+        cache_key = f"{thread_id}:{projection.revision}"
         with self._lock:
-            cached = self._thread_sandboxes.get(thread_id)
+            cached = self._thread_sandboxes.get(cache_key)
             if cached is not None:
-                self._thread_sandboxes.move_to_end(thread_id)
+                self._thread_sandboxes.move_to_end(cache_key)
                 return cached.id
 
-        new_mappings = list(self._path_mappings) + self._build_thread_path_mappings(thread_id)
+        new_mappings = [*self._path_mappings, skills_mapping, *self._build_thread_path_mappings(thread_id)]
 
         with self._lock:
-            cached = self._thread_sandboxes.get(thread_id)
+            cached = self._thread_sandboxes.get(cache_key)
             if cached is None:
-                cached = LocalSandbox(f"local:{thread_id}", path_mappings=new_mappings)
-                self._thread_sandboxes[thread_id] = cached
+                cached = LocalSandbox(f"local:{thread_id}:{projection.revision}", path_mappings=new_mappings)
+                self._thread_sandboxes[cache_key] = cached
                 self._evict_until_within_cap_locked()
             else:
-                self._thread_sandboxes.move_to_end(thread_id)
+                self._thread_sandboxes.move_to_end(cache_key)
             return cached.id
 
     def _evict_until_within_cap_locked(self) -> None:
@@ -187,7 +229,7 @@ class LocalSandboxProvider(SandboxProvider):
             )
 
     def get(self, sandbox_id: str) -> Sandbox | None:
-        if sandbox_id == "local":
+        if sandbox_id == "local" or sandbox_id.startswith("local:global:"):
             with self._lock:
                 generic = self._generic_sandbox
             if generic is None:
@@ -196,11 +238,11 @@ class LocalSandboxProvider(SandboxProvider):
                     return self._generic_sandbox
             return generic
         if isinstance(sandbox_id, str) and sandbox_id.startswith("local:"):
-            thread_id = sandbox_id[len("local:") :]
+            cache_key = sandbox_id[len("local:") :]
             with self._lock:
-                cached = self._thread_sandboxes.get(thread_id)
+                cached = self._thread_sandboxes.get(cache_key)
                 if cached is not None:
-                    self._thread_sandboxes.move_to_end(thread_id)
+                    self._thread_sandboxes.move_to_end(cache_key)
                 return cached
         return None
 
@@ -210,6 +252,27 @@ class LocalSandboxProvider(SandboxProvider):
         # Note: This method is intentionally not called by SandboxMiddleware
         # to allow sandbox reuse across multiple turns in a thread.
         pass
+
+    def release_thread(self, thread_id: str) -> None:
+        """Drop every cached Skill-revision view for one thread."""
+        prefix = f"{thread_id}:"
+        with self._lock:
+            keys = [key for key in self._thread_sandboxes if key.startswith(prefix)]
+            for key in keys:
+                self._thread_sandboxes.pop(key, None)
+
+    def active_skill_revisions(self) -> set[str]:
+        with self._lock:
+            sandbox_ids = [
+                sandbox.id for sandbox in self._thread_sandboxes.values()
+            ]
+            if self._generic_sandbox is not None:
+                sandbox_ids.append(self._generic_sandbox.id)
+        return {
+            sandbox_id.rsplit(":", 1)[-1]
+            for sandbox_id in sandbox_ids
+            if sandbox_id.count(":") >= 2
+        }
 
     def reset(self) -> None:
         """Drop all cached LocalSandbox instances."""

@@ -16,7 +16,12 @@ from pydantic import BaseModel, Field
 from deerflow.agents.thread_state import AgentContext, ThreadState
 from deerflow.sandbox.security import LOCAL_BASH_SUBAGENT_DISABLED_MESSAGE, is_host_bash_allowed
 from deerflow.subagents import SubagentExecutor, get_available_subagent_names, get_subagent_config
-from deerflow.subagents.executor import SubagentStatus, cleanup_background_task, get_background_task_result, request_cancel_background_task
+from deerflow.subagents.executor import (
+    SubagentStatus,
+    cleanup_background_task,
+    finalize_cancelled_background_task,
+    get_background_task_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -227,16 +232,19 @@ async def _task_tool_impl(
     # time.  The callback is invoked synchronously from the subagent's isolated
     # event loop thread; _emit schedules the async bridge publish on the main loop,
     # so it is safe to call across thread boundaries.
-    # tool_call_id is used as the task_id, so we can safely reference it here.
+    # Client events remain correlated with the provider's tool-call ID. The
+    # process-wide task registry uses a separate server-generated execution ID.
     def _token_stream_callback(event: dict[str, Any]) -> None:
         _emit({"type": "task_token_chunk", "task_id": tool_call_id, **event})
 
-    # Start background execution (always async to prevent blocking)
-    # Use tool_call_id as task_id for better traceability
-    task_id = executor.execute_async(prompt, task_id=tool_call_id, stream_callback=_token_stream_callback)
+    execution_id = executor.execute_async(
+        prompt,
+        task_id=tool_call_id,
+        stream_callback=_token_stream_callback,
+    )
 
     # Send Task Started message
-    _emit({"type": "task_started", "task_id": task_id, "description": description})
+    _emit({"type": "task_started", "task_id": tool_call_id, "description": description})
 
     # Poll for task completion in backend (removes need for LLM to poll)
     poll_count = 0
@@ -245,21 +253,29 @@ async def _task_tool_impl(
     # Polling timeout: execution timeout + 60s buffer, checked every _POLL_INTERVAL seconds
     max_poll_count = (config.timeout_seconds + 60) // _POLL_INTERVAL
 
-    logger.info(f"[trace={trace_id}] Started background task {task_id} (subagent={subagent_type}, timeout={config.timeout_seconds}s, polling_limit={max_poll_count} polls)")
+    logger.info(
+        "[trace=%s] Started background task %s (execution_id=%s, subagent=%s, timeout=%ss, polling_limit=%s polls)",
+        trace_id,
+        tool_call_id,
+        execution_id,
+        subagent_type,
+        config.timeout_seconds,
+        max_poll_count,
+    )
 
     try:
         while True:
-            result = get_background_task_result(task_id)
+            result = get_background_task_result(execution_id)
 
             if result is None:
-                logger.error(f"[trace={trace_id}] Task {task_id} not found in background tasks")
-                _emit({"type": "task_failed", "task_id": task_id, "error": "Task disappeared from background tasks"})
-                cleanup_background_task(task_id)
-                return f"Error: Task {task_id} disappeared from background tasks"
+                logger.error(f"[trace={trace_id}] Task {tool_call_id} execution {execution_id} not found in background tasks")
+                _emit({"type": "task_failed", "task_id": tool_call_id, "error": "Task disappeared from background tasks"})
+                cleanup_background_task(execution_id)
+                return f"Error: Task {tool_call_id} disappeared from background tasks"
 
             # Log status changes for debugging
             if result.status != last_status:
-                logger.info(f"[trace={trace_id}] Task {task_id} status: {result.status.value}")
+                logger.info(f"[trace={trace_id}] Task {tool_call_id} execution {execution_id} status: {result.status.value}")
                 last_status = result.status
 
             # Check for new AI messages and send task_running events
@@ -271,35 +287,35 @@ async def _task_tool_impl(
                     _emit(
                         {
                             "type": "task_running",
-                            "task_id": task_id,
+                            "task_id": tool_call_id,
                             "message": message,
                             "message_index": i + 1,  # 1-based index for display
                             "total_messages": current_message_count,
                         }
                     )
-                    logger.info(f"[trace={trace_id}] Task {task_id} sent message #{i + 1}/{current_message_count}")
+                    logger.info(f"[trace={trace_id}] Task {tool_call_id} sent message #{i + 1}/{current_message_count}")
                 last_message_count = current_message_count
 
             # Check if task completed, failed, or timed out
             if result.status == SubagentStatus.COMPLETED:
-                _emit({"type": "task_completed", "task_id": task_id, "result": result.result})
-                logger.info(f"[trace={trace_id}] Task {task_id} completed after {poll_count} polls")
-                cleanup_background_task(task_id)
+                _emit({"type": "task_completed", "task_id": tool_call_id, "result": result.result})
+                logger.info(f"[trace={trace_id}] Task {tool_call_id} completed after {poll_count} polls")
+                cleanup_background_task(execution_id)
                 return f"Task Succeeded. Result: {result.result}"
             elif result.status == SubagentStatus.FAILED:
-                _emit({"type": "task_failed", "task_id": task_id, "error": result.error})
-                logger.error(f"[trace={trace_id}] Task {task_id} failed: {result.error}")
-                cleanup_background_task(task_id)
+                _emit({"type": "task_failed", "task_id": tool_call_id, "error": result.error})
+                logger.error(f"[trace={trace_id}] Task {tool_call_id} failed: {result.error}")
+                cleanup_background_task(execution_id)
                 return f"Task failed. Error: {result.error}"
             elif result.status == SubagentStatus.CANCELLED:
-                _emit({"type": "task_cancelled", "task_id": task_id, "error": result.error})
-                logger.info(f"[trace={trace_id}] Task {task_id} cancelled: {result.error}")
-                cleanup_background_task(task_id)
+                _emit({"type": "task_cancelled", "task_id": tool_call_id, "error": result.error})
+                logger.info(f"[trace={trace_id}] Task {tool_call_id} cancelled: {result.error}")
+                cleanup_background_task(execution_id)
                 return "Task cancelled by user."
             elif result.status == SubagentStatus.TIMED_OUT:
-                _emit({"type": "task_timed_out", "task_id": task_id, "error": result.error})
-                logger.warning(f"[trace={trace_id}] Task {task_id} timed out: {result.error}")
-                cleanup_background_task(task_id)
+                _emit({"type": "task_timed_out", "task_id": tool_call_id, "error": result.error})
+                logger.warning(f"[trace={trace_id}] Task {tool_call_id} timed out: {result.error}")
+                cleanup_background_task(execution_id)
                 return f"Task timed out. Error: {result.error}"
 
             # Still running, wait before next poll
@@ -309,51 +325,28 @@ async def _task_tool_impl(
             # Polling timeout as a safety net (in case thread pool timeout doesn't work)
             # Set to execution timeout + 60s buffer, in _POLL_INTERVAL-second intervals
             # This catches edge cases where the background task gets stuck
-            # Note: We don't call cleanup_background_task here because the task may
-            # still be running in the background. The cleanup will happen when the
-            # executor completes and sets a terminal status.
             if poll_count > max_poll_count:
                 timeout_minutes = config.timeout_seconds // 60
-                logger.error(f"[trace={trace_id}] Task {task_id} polling timed out after {poll_count} polls (should have been caught by thread pool timeout)")
-                _emit({"type": "task_timed_out", "task_id": task_id})
+                logger.error(f"[trace={trace_id}] Task {tool_call_id} execution {execution_id} polling timed out after {poll_count} polls (should have been caught by thread pool timeout)")
+                _emit({"type": "task_timed_out", "task_id": tool_call_id})
+                finalize_cancelled_background_task(
+                    execution_id,
+                    status=SubagentStatus.TIMED_OUT,
+                    error="Parent task polling safety timeout",
+                )
+                cleanup_background_task(execution_id)
                 return f"Task polling timed out after {timeout_minutes} minutes. This may indicate the background task is stuck. Status: {result.status.value}"
     except asyncio.CancelledError:
         # Signal the background subagent thread to stop cooperatively.
         # Without this, the thread (running in ThreadPoolExecutor with its
         # own event loop via asyncio.run) would continue executing even
         # after the parent task is cancelled.
-        request_cancel_background_task(task_id)
-
-        async def cleanup_when_done() -> None:
-            max_cleanup_polls = max_poll_count
-            cleanup_poll_count = 0
-
-            while True:
-                result = get_background_task_result(task_id)
-                if result is None:
-                    return
-
-                if result.status in {SubagentStatus.COMPLETED, SubagentStatus.FAILED, SubagentStatus.CANCELLED, SubagentStatus.TIMED_OUT} or getattr(result, "completed_at", None) is not None:
-                    cleanup_background_task(task_id)
-                    return
-
-                if cleanup_poll_count > max_cleanup_polls:
-                    logger.warning(f"[trace={trace_id}] Deferred cleanup for task {task_id} timed out after {cleanup_poll_count} polls")
-                    return
-
-                await asyncio.sleep(_POLL_INTERVAL)
-                cleanup_poll_count += 1
-
-        def log_cleanup_failure(cleanup_task: asyncio.Task[None]) -> None:
-            if cleanup_task.cancelled():
-                return
-
-            exc = cleanup_task.exception()
-            if exc is not None:
-                logger.error(f"[trace={trace_id}] Deferred cleanup failed for task {task_id}: {exc}")
-
-        logger.debug(f"[trace={trace_id}] Scheduling deferred cleanup for cancelled task {task_id}")
-        asyncio.create_task(cleanup_when_done()).add_done_callback(log_cleanup_failure)
+        finalize_cancelled_background_task(
+            execution_id,
+            status=SubagentStatus.CANCELLED,
+            error="Parent task was cancelled",
+        )
+        cleanup_background_task(execution_id)
         raise
 
 

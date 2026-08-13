@@ -23,6 +23,9 @@ from deerflow.config.checkpointer_config import (
 
 class SandboxState(TypedDict):
     sandbox_id: NotRequired[str | None]
+    skills_revision: NotRequired[str]
+    skills_path: NotRequired[str]
+    available_skills: NotRequired[list[str] | None]
 
 
 class AgentContext(TypedDict, total=False):
@@ -38,6 +41,7 @@ class AgentContext(TypedDict, total=False):
     agent_name: NotRequired[str]
     user_id: NotRequired[str]
     workspace_path: NotRequired[str]
+    available_skills: NotRequired[list[str] | None]
 
 
 class ThreadDataState(TypedDict):

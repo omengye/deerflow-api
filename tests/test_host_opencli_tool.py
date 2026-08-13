@@ -78,6 +78,7 @@ async def test_host_opencli_allows_an_entire_site(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(host_opencli_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     monkeypatch.setattr(host_opencli_module, "_get_opencli_executable", lambda: "opencli")
+    monkeypatch.setattr(host_opencli_module, "is_host_tool_allowed", lambda: True)
 
     result = await host_opencli_module._run_host_opencli("twitter", "search", ["openai", "--limit", "5"])
 
@@ -91,7 +92,21 @@ async def test_host_opencli_blocks_a_site_not_in_allowed_sites(monkeypatch: pyte
         raise AssertionError("subprocess must not be started for a blocked site")
 
     monkeypatch.setattr(host_opencli_module.asyncio, "create_subprocess_exec", fail_if_called)
+    monkeypatch.setattr(host_opencli_module, "is_host_tool_allowed", lambda: True)
 
     result = await host_opencli_module._run_host_opencli("docker", "ps")
 
     assert result == "Error: OpenCLI site is not allowed: docker"
+
+
+@pytest.mark.asyncio
+async def test_host_opencli_is_disabled_without_explicit_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail_if_called(*args: object, **kwargs: object) -> _FakeProcess:
+        raise AssertionError("subprocess must not start while host tools are disabled")
+
+    monkeypatch.setattr(host_opencli_module.asyncio, "create_subprocess_exec", fail_if_called)
+    monkeypatch.setattr(host_opencli_module, "is_host_tool_allowed", lambda: False)
+
+    result = await host_opencli_module._run_host_opencli("twitter", "search", ["openai"])
+
+    assert "Host tools are disabled" in result

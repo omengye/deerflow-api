@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import app.config as app_config
-from app.config import settings
+from app.config import settings, validate_api_exposure
 from app.dependencies import ClientManager
 from app.middleware import ApiKeyAuthMiddleware
 from deerflow.config.app_config import AppConfig, get_app_config, reset_app_config
@@ -268,6 +268,7 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
                 "cors_allow_origins": ["https://example.test"],
                 "api_keys": ["from-config"],
                 "auth_enabled": True,
+                "allow_insecure_remote": True,
                 "chat_request_timeout": 12.5,
                 "max_upload_size_mb": 8,
                 "max_uploads_per_request": 2,
@@ -294,6 +295,7 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(loaded.cors_allow_origins, ["https://example.test"])
             self.assertEqual(loaded.api_keys, ["from-config"])
             self.assertTrue(loaded.auth_enabled)
+            self.assertTrue(loaded.allow_insecure_remote)
             self.assertEqual(loaded.chat_request_timeout, 12.5)
             self.assertEqual(loaded.max_upload_size_mb, 8)
             self.assertEqual(loaded.max_uploads_per_request, 2)
@@ -340,6 +342,36 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(short.max_concurrent_subagents, 2)
         finally:
             app_config._API_CONFIG = original_api_config
+
+    async def test_unauthenticated_remote_bind_fails_closed(self) -> None:
+        exposed = app_config.Settings(
+            host="0.0.0.0",
+            auth_enabled=False,
+            api_keys=[],
+            allow_insecure_remote=False,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Refusing to bind"):
+            validate_api_exposure(exposed)
+
+    async def test_loopback_or_explicit_remote_opt_in_is_allowed(self) -> None:
+        for host in ("127.0.0.1", "::1", "localhost"):
+            validate_api_exposure(
+                app_config.Settings(
+                    host=host,
+                    auth_enabled=False,
+                    api_keys=[],
+                    allow_insecure_remote=False,
+                )
+            )
+        validate_api_exposure(
+            app_config.Settings(
+                host="0.0.0.0",
+                auth_enabled=False,
+                api_keys=[],
+                allow_insecure_remote=True,
+            )
+        )
 
     async def test_app_config_resolves_braced_env_variables_with_defaults(self) -> None:
         config = {

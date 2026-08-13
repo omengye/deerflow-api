@@ -185,6 +185,7 @@ class AdminRuntimePatchRequest(BaseModel):
     max_upload_size_mb: int | None = Field(default=None, ge=1, le=2048)
     max_uploads_per_request: int | None = Field(default=None, ge=1, le=200)
     allowed_upload_extensions: list[str] | None = None
+    allow_insecure_remote: bool | None = None
     scheduler_enabled: bool | None = None
     scheduler_poll_interval_seconds: float | None = Field(default=None, ge=0.5, le=3600)
     scheduler_timezone: str | None = Field(default=None, min_length=1, max_length=128)
@@ -274,6 +275,7 @@ _HOT_RUNTIME_FIELDS = {
     "allowed_upload_extensions",
 }
 _RESTART_RUNTIME_FIELDS = {
+    "allow_insecure_remote",
     "scheduler_enabled",
     "scheduler_poll_interval_seconds",
     "scheduler_timezone",
@@ -1938,7 +1940,18 @@ async def delete_admin_scheduled_task(task_id: str):
         task = await store.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="Scheduled task not found")
-        if not await store.delete_task(task_id):
+        from deerflow.runtime.scheduler import get_scheduler_service
+
+        try:
+            service = get_scheduler_service()
+        except RuntimeError:
+            service = None
+        deleted = (
+            await service.delete_task(task_id)
+            if service is not None and service.store.db_path.resolve() == store.db_path.resolve()
+            else await store.delete_task(task_id)
+        )
+        if not deleted:
             raise HTTPException(status_code=404, detail="Scheduled task not found")
     except HTTPException:
         raise

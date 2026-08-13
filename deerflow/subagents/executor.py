@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -38,13 +39,25 @@ class SubagentStatus(Enum):
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
 
+    @property
+    def is_terminal(self) -> bool:
+        return self in {
+            type(self).COMPLETED,
+            type(self).FAILED,
+            type(self).CANCELLED,
+            type(self).TIMED_OUT,
+        }
+
 
 @dataclass
 class SubagentResult:
     """Result of a subagent execution.
 
     Attributes:
-        task_id: Unique identifier for this execution.
+        task_id: Server-generated identifier that owns this execution.
+        external_task_id: Optional provider correlation ID. Provider tool-call
+            IDs may repeat across parent runs and therefore never own registry
+            state.
         trace_id: Trace ID for distributed tracing (links parent and subagent logs).
         status: Current status of the execution.
         result: The final result message (if completed).
@@ -57,12 +70,47 @@ class SubagentResult:
     task_id: str
     trace_id: str
     status: SubagentStatus
+    external_task_id: str | None = None
     result: str | None = None
     error: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     ai_messages: list[dict[str, Any]] = field(default_factory=list)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _state_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def try_mark_running(self) -> bool:
+        """Move a pending execution to running without reviving terminal work."""
+        with self._state_lock:
+            if self.status != SubagentStatus.PENDING:
+                return False
+            self.status = SubagentStatus.RUNNING
+            self.started_at = datetime.now()
+            return True
+
+    def try_set_terminal(
+        self,
+        status: SubagentStatus,
+        *,
+        result: str | None = None,
+        error: str | None = None,
+        ai_messages: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Publish a terminal outcome once; late workers cannot overwrite it."""
+        if not status.is_terminal:
+            raise ValueError(f"Status {status!r} is not terminal")
+        with self._state_lock:
+            if self.status.is_terminal:
+                return False
+            self.status = status
+            self.result = result
+            self.error = error
+            # Always detach the published terminal snapshot from any list a
+            # caller or worker may still hold, even when no replacement list
+            # was supplied explicitly.
+            self.ai_messages = list(ai_messages if ai_messages is not None else self.ai_messages)
+            self.completed_at = datetime.now()
+            return True
 
 
 # Global storage for background task results
@@ -72,9 +120,71 @@ _background_tasks_lock = threading.Lock()
 # Thread pool for background task scheduling and orchestration
 _scheduler_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="subagent-scheduler-")
 
-# Thread pool for actual subagent execution (with timeout support)
-# Larger pool to avoid blocking when scheduler submits execution tasks
-_execution_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="subagent-exec-")
+# Python cannot force-stop a thread that is blocked in a synchronous tool.  A
+# fixed execution pool is therefore unsafe here: three timed-out workers would
+# permanently occupy all three slots.  Execute each subagent in its own daemon
+# thread and quarantine timed-out workers instead.  The cap bounds the leak
+# while still leaving replacement capacity for the normal three-way fan-out.
+MAX_CONCURRENT_SUBAGENTS = 3
+MAX_QUARANTINED_SUBAGENTS = 6
+_execution_threads_lock = threading.Lock()
+_active_execution_threads: set[threading.Thread] = set()
+_quarantined_execution_threads: set[threading.Thread] = set()
+
+
+def _start_isolated_execution(
+    func: Callable[[], SubagentResult],
+    *,
+    execution_id: str,
+) -> tuple[Future[SubagentResult], threading.Thread] | None:
+    """Start one daemon worker, refusing work once the quarantine is full.
+
+    Active workers reserve a quarantine slot up front.  Consequently, even if
+    every active worker times out simultaneously, the number of live detached
+    threads can never grow beyond ``MAX_QUARANTINED_SUBAGENTS``.
+    """
+    future: Future[SubagentResult] = Future()
+
+    def worker() -> None:
+        try:
+            future.set_result(func())
+        except BaseException as exc:
+            future.set_exception(exc)
+        finally:
+            current = threading.current_thread()
+            with _execution_threads_lock:
+                _active_execution_threads.discard(current)
+                _quarantined_execution_threads.discard(current)
+
+    thread = threading.Thread(
+        target=worker,
+        name=f"subagent-exec-{execution_id[:8]}",
+        daemon=True,
+    )
+    with _execution_threads_lock:
+        live_count = len(_active_execution_threads) + len(
+            _quarantined_execution_threads
+        )
+        if live_count >= MAX_QUARANTINED_SUBAGENTS:
+            return None
+        _active_execution_threads.add(thread)
+    try:
+        thread.start()
+    except BaseException:
+        with _execution_threads_lock:
+            _active_execution_threads.discard(thread)
+        raise
+    return future, thread
+
+
+def _quarantine_execution_thread(thread: threading.Thread) -> bool:
+    """Detach a still-running timed-out worker from supervised capacity."""
+    with _execution_threads_lock:
+        if thread not in _active_execution_threads:
+            return False
+        _active_execution_threads.remove(thread)
+        _quarantined_execution_threads.add(thread)
+        return True
 
 
 def _filter_tools(
@@ -313,8 +423,23 @@ class SubagentExecutor:
             "messages": messages,
         }
 
-        # Pass through sandbox and thread data from parent
-        if self.sandbox_state is not None:
+        # A subagent may have a narrower Skill allowlist than its parent.  Do
+        # not reuse the parent's sandbox snapshot in that case; lazy sandbox
+        # acquisition below will bind the subagent's own projection revision.
+        inherited_skills = (
+            self.sandbox_state.get("available_skills")
+            if self.sandbox_state is not None
+            else None
+        )
+        same_skill_policy = (
+            (inherited_skills is None and self.config.skills is None)
+            or (
+                inherited_skills is not None
+                and self.config.skills is not None
+                and set(inherited_skills) == set(self.config.skills)
+            )
+        )
+        if self.sandbox_state is not None and same_skill_policy:
             state["sandbox"] = self.sandbox_state
         if self.thread_data is not None:
             state["thread_data"] = self.thread_data
@@ -354,6 +479,12 @@ class SubagentExecutor:
                 started_at=datetime.now(),
             )
 
+        # Build AI-message output off-object and publish it together with the
+        # terminal state.  A timed-out/cancelled worker may continue briefly;
+        # mutating result.ai_messages in that window would otherwise make an
+        # already-terminal result keep changing underneath pollers.
+        captured_ai_messages = list(result.ai_messages)
+
         chat_model: Any = None
         deferred_registry_set = False
         try:
@@ -375,6 +506,11 @@ class SubagentExecutor:
             if self.thread_id:
                 run_config["configurable"] = {"thread_id": self.thread_id}
                 context["thread_id"] = self.thread_id
+            context["available_skills"] = (
+                list(self.config.skills)
+                if self.config.skills is not None
+                else None
+            )
 
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} starting async execution with max_turns={self.config.max_turns}")
 
@@ -397,11 +533,11 @@ class SubagentExecutor:
             # Pre-check: bail out immediately if already cancelled before streaming starts
             if result.cancel_event.is_set():
                 logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} cancelled before streaming")
-                with _background_tasks_lock:
-                    if result.status == SubagentStatus.RUNNING:
-                        result.status = SubagentStatus.CANCELLED
-                        result.error = "Cancelled by user"
-                        result.completed_at = datetime.now()
+                result.try_set_terminal(
+                    SubagentStatus.CANCELLED,
+                    error="Cancelled by user",
+                    ai_messages=captured_ai_messages,
+                )
                 return result
 
             async for mode, chunk in agent.astream(  # type: ignore[arg-type]
@@ -416,11 +552,11 @@ class SubagentExecutor:
                 # interrupted until the next chunk is yielded.
                 if result.cancel_event.is_set():
                     logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} cancelled by parent")
-                    with _background_tasks_lock:
-                        if result.status == SubagentStatus.RUNNING:
-                            result.status = SubagentStatus.CANCELLED
-                            result.error = "Cancelled by user"
-                            result.completed_at = datetime.now()
+                    result.try_set_terminal(
+                        SubagentStatus.CANCELLED,
+                        error="Cancelled by user",
+                        ai_messages=captured_ai_messages,
+                    )
                     return result
 
                 if mode == "messages":
@@ -462,7 +598,6 @@ class SubagentExecutor:
                     continue
 
                 # mode == "values": full state snapshot — one per completed graph node
-                turn_number = final_state is not None  # False on first chunk → turn 0
                 final_state = chunk
 
                 # Emit turn_complete so callers can track agent progress
@@ -489,19 +624,20 @@ class SubagentExecutor:
                         message_id = message_dict.get("id")
                         is_duplicate = False
                         if message_id:
-                            is_duplicate = any(msg.get("id") == message_id for msg in result.ai_messages)
+                            is_duplicate = any(msg.get("id") == message_id for msg in captured_ai_messages)
                         else:
-                            is_duplicate = message_dict in result.ai_messages
+                            is_duplicate = message_dict in captured_ai_messages
 
                         if not is_duplicate:
-                            result.ai_messages.append(message_dict)
-                            logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} captured AI message #{len(result.ai_messages)}")
+                            captured_ai_messages.append(message_dict)
+                            logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} captured AI message #{len(captured_ai_messages)}")
 
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} completed async execution")
 
+            final_result: str
             if final_state is None:
                 logger.warning(f"[trace={self.trace_id}] Subagent {self.config.name} no final state")
-                result.result = "No response generated"
+                final_result = "No response generated"
             else:
                 # Extract the final message - find the last AIMessage
                 messages = final_state.get("messages", [])
@@ -518,7 +654,7 @@ class SubagentExecutor:
                     content = last_ai_message.content
                     # Handle both str and list content types for the final result
                     if isinstance(content, str):
-                        result.result = content
+                        final_result = content
                     elif isinstance(content, list):
                         # Extract text from list of content blocks for final result only.
                         # Concatenate raw string chunks directly, but preserve separation
@@ -537,16 +673,16 @@ class SubagentExecutor:
                                     text_parts.append(text_val)
                         if pending_str_parts:
                             text_parts.append("".join(pending_str_parts))
-                        result.result = "\n".join(text_parts) if text_parts else "No text content in response"
+                        final_result = "\n".join(text_parts) if text_parts else "No text content in response"
                     else:
-                        result.result = str(content)
+                        final_result = str(content)
                 elif messages:
                     # Fallback: use the last message if no AIMessage found
                     last_message = messages[-1]
                     logger.warning(f"[trace={self.trace_id}] Subagent {self.config.name} no AIMessage found, using last message: {type(last_message)}")
                     raw_content = last_message.content if hasattr(last_message, "content") else str(last_message)
                     if isinstance(raw_content, str):
-                        result.result = raw_content
+                        final_result = raw_content
                     elif isinstance(raw_content, list):
                         parts = []
                         pending_str_parts = []
@@ -562,21 +698,26 @@ class SubagentExecutor:
                                     parts.append(text_val)
                         if pending_str_parts:
                             parts.append("".join(pending_str_parts))
-                        result.result = "\n".join(parts) if parts else "No text content in response"
+                        final_result = "\n".join(parts) if parts else "No text content in response"
                     else:
-                        result.result = str(raw_content)
+                        final_result = str(raw_content)
                 else:
                     logger.warning(f"[trace={self.trace_id}] Subagent {self.config.name} no messages in final state")
-                    result.result = "No response generated"
+                    final_result = "No response generated"
 
-            result.status = SubagentStatus.COMPLETED
-            result.completed_at = datetime.now()
+            result.try_set_terminal(
+                SubagentStatus.COMPLETED,
+                result=final_result,
+                ai_messages=captured_ai_messages,
+            )
 
         except Exception as e:
             logger.exception(f"[trace={self.trace_id}] Subagent {self.config.name} async execution failed")
-            result.status = SubagentStatus.FAILED
-            result.error = str(e)
-            result.completed_at = datetime.now()
+            result.try_set_terminal(
+                SubagentStatus.FAILED,
+                error=str(e),
+                ai_messages=captured_ai_messages,
+            )
         finally:
             if deferred_registry_set:
                 from deerflow.tools.builtins.tool_search import reset_deferred_registry
@@ -617,7 +758,7 @@ class SubagentExecutor:
         """Execute synchronously via ``asyncio.run``.
 
         Intended for callers that have no running event loop (e.g. CLI
-        scripts and the ``_execution_pool`` worker invoked by
+        scripts and the isolated daemon worker invoked by
         :meth:`execute_async`).  Async callers must use :meth:`aexecute`
         instead — calling this from a running loop would either deadlock or
         force a fresh isolated loop, which is precisely what previously
@@ -645,11 +786,10 @@ class SubagentExecutor:
                 result = SubagentResult(
                     task_id=str(uuid.uuid4())[:8],
                     trace_id=self.trace_id,
-                    status=SubagentStatus.FAILED,
+                    status=SubagentStatus.RUNNING,
+                    started_at=datetime.now(),
                 )
-            result.status = SubagentStatus.FAILED
-            result.error = str(e)
-            result.completed_at = datetime.now()
+            result.try_set_terminal(SubagentStatus.FAILED, error=str(e))
             return result
 
     def execute_async(
@@ -662,78 +802,107 @@ class SubagentExecutor:
 
         Args:
             task: The task description for the subagent.
-            task_id: Optional task ID to use. If not provided, a random UUID will be generated.
+            task_id: Optional external correlation ID for logs and client
+                events. It is never used as the process-wide registry key.
             stream_callback: Optional callback for real-time LLM token chunks.
 
         Returns:
-            Task ID that can be used to check status later.
+            Server-generated execution ID used to control this execution.
         """
-        # Use provided task_id or generate a new one
-        if task_id is None:
-            task_id = str(uuid.uuid4())[:8]
+        execution_id = str(uuid.uuid4())
 
         # Create initial pending result
         result = SubagentResult(
-            task_id=task_id,
+            task_id=execution_id,
             trace_id=self.trace_id,
             status=SubagentStatus.PENDING,
+            external_task_id=task_id,
         )
 
-        logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} starting async execution, task_id={task_id}, timeout={self.config.timeout_seconds}s")
+        logger.info(
+            "[trace=%s] Subagent %s starting async execution, execution_id=%s, external_task_id=%s, timeout=%ss",
+            self.trace_id,
+            self.config.name,
+            execution_id,
+            task_id,
+            self.config.timeout_seconds,
+        )
 
         with _background_tasks_lock:
-            _background_tasks[task_id] = result
+            _background_tasks[execution_id] = result
 
         # Submit to scheduler pool
         def run_task():
             with _background_tasks_lock:
-                _background_tasks[task_id].status = SubagentStatus.RUNNING
-                _background_tasks[task_id].started_at = datetime.now()
-                result_holder = _background_tasks[task_id]
+                if _background_tasks.get(execution_id) is not result:
+                    logger.debug("Execution %s was removed before it could start", execution_id)
+                    return
+                result.try_mark_running()
 
             try:
-                # Submit execution to execution pool with timeout
-                # Pass result_holder so execute() can update it in real-time
-                execution_future: Future = _execution_pool.submit(self.execute, task, result_holder, stream_callback)
-                try:
-                    # Wait for execution with timeout
-                    exec_result = execution_future.result(timeout=self.config.timeout_seconds)
-                    with _background_tasks_lock:
-                        task_result = _background_tasks.get(task_id)
-                        if task_result is not None:
-                            task_result.status = exec_result.status
-                            task_result.result = exec_result.result
-                            task_result.error = exec_result.error
-                            task_result.completed_at = datetime.now()
-                            task_result.ai_messages = exec_result.ai_messages
-                except FuturesTimeoutError:
-                    logger.error(f"[trace={self.trace_id}] Subagent {self.config.name} execution timed out after {self.config.timeout_seconds}s")
-                    with _background_tasks_lock:
-                        task_result = _background_tasks.get(task_id)
-                        if task_result is not None and task_result.status == SubagentStatus.RUNNING:
-                            task_result.status = SubagentStatus.TIMED_OUT
-                            task_result.error = f"Execution timed out after {self.config.timeout_seconds} seconds"
-                            task_result.completed_at = datetime.now()
-                        else:
-                            logger.debug(f"[trace={self.trace_id}] Task {task_id} already cleaned up before timeout handler ran")
-                    # Signal cooperative cancellation and cancel the future
-                    result_holder.cancel_event.set()
-                    execution_future.cancel()
+                # A dedicated daemon thread prevents a timed-out blocking tool
+                # from poisoning a shared ThreadPoolExecutor slot forever.
+                started = _start_isolated_execution(
+                    lambda: self.execute(task, result, stream_callback),
+                    execution_id=execution_id,
+                )
+                if started is None:
+                    result.try_set_terminal(
+                        SubagentStatus.FAILED,
+                        error=(
+                            "Subagent execution capacity is exhausted because "
+                            f"{MAX_QUARANTINED_SUBAGENTS} worker threads are still "
+                            "running. Restart the service or wait for blocked tools "
+                            "to return before retrying."
+                        ),
+                    )
+                    return
+                execution_future, execution_thread = started
+                deadline = time.monotonic() + self.config.timeout_seconds
+                while True:
+                    if result.cancel_event.is_set() and result.status.is_terminal:
+                        _quarantine_execution_thread(execution_thread)
+                        return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.error(f"[trace={self.trace_id}] Subagent {self.config.name} execution timed out after {self.config.timeout_seconds}s")
+                        result.try_set_terminal(
+                            SubagentStatus.TIMED_OUT,
+                            error=f"Execution timed out after {self.config.timeout_seconds} seconds",
+                        )
+                        result.cancel_event.set()
+                        if _quarantine_execution_thread(execution_thread):
+                            logger.warning(
+                                "[trace=%s] Quarantined timed-out subagent worker %s; "
+                                "in-process synchronous tools cannot be force-stopped",
+                                self.trace_id,
+                                execution_thread.name,
+                            )
+                        return
+                    try:
+                        exec_result = execution_future.result(
+                            timeout=min(0.25, remaining)
+                        )
+                    except FuturesTimeoutError:
+                        continue
+                    # The normal path returns ``result`` itself. Keep this
+                    # defensive copy for custom executors, while the one-shot
+                    # terminal transition prevents a late worker from replacing
+                    # a timeout/cancellation outcome.
+                    if exec_result is not result and exec_result.status.is_terminal:
+                        result.try_set_terminal(
+                            exec_result.status,
+                            result=exec_result.result,
+                            error=exec_result.error,
+                            ai_messages=exec_result.ai_messages,
+                        )
+                    return
             except Exception as e:
                 logger.exception(f"[trace={self.trace_id}] Subagent {self.config.name} async execution failed")
-                with _background_tasks_lock:
-                    task_result = _background_tasks.get(task_id)
-                    if task_result is not None:
-                        task_result.status = SubagentStatus.FAILED
-                        task_result.error = str(e)
-                        task_result.completed_at = datetime.now()
+                result.try_set_terminal(SubagentStatus.FAILED, error=str(e))
 
         _scheduler_pool.submit(run_task)
-        return task_id
-
-
-MAX_CONCURRENT_SUBAGENTS = 3
-
+        return execution_id
 
 def request_cancel_background_task(task_id: str) -> None:
     """Signal a running background task to stop.
@@ -751,6 +920,30 @@ def request_cancel_background_task(task_id: str) -> None:
         if result is not None:
             result.cancel_event.set()
             logger.info("Requested cancellation for background task %s", task_id)
+
+
+def finalize_cancelled_background_task(
+    task_id: str,
+    *,
+    status: SubagentStatus,
+    error: str,
+) -> bool:
+    """Cancel and publish a terminal owner-side outcome in one operation.
+
+    A worker thread cannot be force-killed while it is inside a blocking tool,
+    but the caller that owns the registry entry must still be able to stop
+    waiting and release that entry.  ``try_set_terminal`` fences all later
+    worker writes, so removal is safe even while cooperative cancellation is
+    still propagating inside the worker.
+    """
+    if status not in {SubagentStatus.CANCELLED, SubagentStatus.TIMED_OUT}:
+        raise ValueError("Owner-side cancellation must be cancelled or timed_out")
+    with _background_tasks_lock:
+        result = _background_tasks.get(task_id)
+        if result is None:
+            return False
+        result.cancel_event.set()
+        return result.try_set_terminal(status, error=error)
 
 
 def get_background_task_result(task_id: str) -> SubagentResult | None:

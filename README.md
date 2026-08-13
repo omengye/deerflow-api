@@ -18,8 +18,12 @@ uv sync --frozen --inexact
 # 停止
 ./stop.sh
 # 或手动启动：
-uv run uvicorn app:app --host 0.0.0.0 --port 8000 --app-dir app
+uv run uvicorn app:app --host 127.0.0.1 --port 8000 --app-dir app
 ```
+
+服务默认只允许未鉴权的 loopback 监听。若要监听 `0.0.0.0`，请先配置
+`api.auth_enabled: true` 和至少一个 `api.api_keys`；只有已由外层网络严格
+隔离的可信环境才应显式设置 `api.allow_insecure_remote: true`。
 
 ## 飞书与七牛云可选依赖
 
@@ -85,7 +89,7 @@ tools:
 
 ```yaml
 api:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8000
   deerflow_home: ./data/deerflow
   plan_mode: true

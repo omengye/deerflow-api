@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Collection
 
 from deerflow.config import get_app_config
 from deerflow.reflection import resolve_class
@@ -12,7 +13,12 @@ class SandboxProvider(ABC):
     uses_thread_data_mounts: bool = False
 
     @abstractmethod
-    def acquire(self, thread_id: str | None = None) -> str:
+    def acquire(
+        self,
+        thread_id: str | None = None,
+        *,
+        available_skills: Collection[str] | None = None,
+    ) -> str:
         """Acquire a sandbox environment and return its ID.
 
         Returns:
@@ -38,6 +44,17 @@ class SandboxProvider(ABC):
         """
         pass
 
+    def release_thread(self, thread_id: str) -> None:
+        """Release every sandbox resource scoped to one conversation.
+
+        Providers without per-thread resources may keep the default no-op.
+        """
+        del thread_id
+
+    def active_skill_revisions(self) -> set[str]:
+        """Return Skill projections currently reachable by provider resources."""
+        return set()
+
 
 _default_sandbox_provider: SandboxProvider | None = None
 
@@ -56,6 +73,11 @@ def get_sandbox_provider(**kwargs) -> SandboxProvider:
         config = get_app_config()
         cls = resolve_class(normalize_sandbox_provider_path(config.sandbox.use), SandboxProvider)
         _default_sandbox_provider = cls(**kwargs)
+    return _default_sandbox_provider
+
+
+def get_existing_sandbox_provider() -> SandboxProvider | None:
+    """Return the initialized provider without creating new resources."""
     return _default_sandbox_provider
 
 

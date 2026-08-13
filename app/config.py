@@ -1,5 +1,6 @@
 """Global settings for DeerFlow API service."""
 import logging
+import ipaddress
 import os
 import socket
 from pathlib import Path
@@ -343,7 +344,7 @@ class Settings(BaseModel):
     )
 
     # Server settings
-    host: str = Field(default_factory=lambda: _setting_str("host", "HOST", "0.0.0.0"))
+    host: str = Field(default_factory=lambda: _setting_str("host", "HOST", "127.0.0.1"))
     port: int = Field(default_factory=lambda: _setting_int("port", "PORT", 8000))
 
     # Checkpointer: memory / sqlite / none
@@ -391,6 +392,17 @@ class Settings(BaseModel):
     # DEER_FLOW_AUTH_ENABLED=true is set.
     api_keys: list[str] = Field(default_factory=lambda: _setting_list("api_keys", "DEER_FLOW_API_KEYS", []))
     auth_enabled: bool = Field(default_factory=_auth_enabled_default)
+    allow_insecure_remote: bool = Field(
+        default_factory=lambda: _setting_bool(
+            "allow_insecure_remote",
+            "DEER_FLOW_ALLOW_INSECURE_REMOTE",
+            False,
+        ),
+        description=(
+            "Explicitly allow a non-loopback bind without API authentication. "
+            "Unsafe outside a trusted, isolated network."
+        ),
+    )
 
     # Per-request /chat timeout (seconds).
     chat_request_timeout: float = Field(
@@ -491,6 +503,31 @@ class Settings(BaseModel):
     )
 
 settings = Settings()
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return whether an API bind target is restricted to this machine."""
+    normalized = host.strip().strip("[]").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_api_exposure(config: Settings = settings) -> None:
+    """Fail closed when an unauthenticated API is exposed remotely."""
+    if (
+        not is_loopback_host(config.host)
+        and not config.auth_enabled
+        and not config.allow_insecure_remote
+    ):
+        raise RuntimeError(
+            f"Refusing to bind unauthenticated DeerFlow API to {config.host!r}. "
+            "Enable api.auth_enabled with at least one API key, bind to "
+            "127.0.0.1/::1, or explicitly set api.allow_insecure_remote: true."
+        )
 
 
 def ensure_data_dirs():

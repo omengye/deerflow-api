@@ -4,7 +4,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 
 from deerflow.config import get_app_config
 from deerflow.reflection import resolve_variable
-from deerflow.sandbox.security import is_host_bash_allowed
+from deerflow.sandbox.security import is_host_bash_allowed, is_host_tool_allowed
 from deerflow.tools.builtins import (
     ask_clarification_tool,
     list_uploaded_files_tool,
@@ -44,6 +44,13 @@ def _is_host_bash_tool(tool: object) -> bool:
     return False
 
 
+def _is_host_process_tool(tool: object) -> bool:
+    """Return True for tools that bypass the configured sandbox entirely."""
+    group = getattr(tool, "group", None)
+    use = getattr(tool, "use", None)
+    return (isinstance(group, str) and group.startswith("host:")) or use == "deerflow.tools.host_opencli:host_opencli_tool"
+
+
 def _ensure_sync_invocable_tool(tool: BaseTool) -> BaseTool:
     """Attach a sync wrapper to async-only tools used by sync agent callers."""
     if isinstance(tool, StructuredTool) and tool.func is None and tool.coroutine is not None:
@@ -77,6 +84,8 @@ def get_available_tools(
     # Do not expose host bash by default when LocalSandboxProvider is active.
     if not is_host_bash_allowed(config):
         tool_configs = [tool for tool in tool_configs if not _is_host_bash_tool(tool)]
+    if not is_host_tool_allowed(config):
+        tool_configs = [tool for tool in tool_configs if not _is_host_process_tool(tool)]
 
     loaded_tools_raw = [(cfg, resolve_variable(cfg.use, BaseTool)) for cfg in tool_configs]
 

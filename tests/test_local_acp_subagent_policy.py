@@ -21,6 +21,7 @@ async def test_task_tool_propagates_acp_policy_to_internal_subagent(
     permission_middleware = object()
     captured: dict[str, Any] = {}
     cleanup_calls: list[str] = []
+    lookup_calls: list[str] = []
     available_tool_calls: list[dict[str, Any]] = []
     child_config = SubagentConfig(
         name="general-purpose",
@@ -48,7 +49,7 @@ async def test_task_tool_propagates_acp_policy_to_internal_subagent(
         def execute_async(self, prompt: str, **kwargs: Any) -> str:
             captured["prompt"] = prompt
             captured["execute_kwargs"] = kwargs
-            return "tool-call-1"
+            return "execution-1"
 
     completed_result = SimpleNamespace(
         status=SubagentStatus.COMPLETED,
@@ -60,7 +61,11 @@ async def test_task_tool_propagates_acp_policy_to_internal_subagent(
     monkeypatch.setattr(task_tool_module, "get_available_subagent_names", lambda: ["general-purpose"])
     monkeypatch.setattr(task_tool_module, "get_subagent_config", lambda _name: child_config)
     monkeypatch.setattr(task_tool_module, "SubagentExecutor", FakeExecutor)
-    monkeypatch.setattr(task_tool_module, "get_background_task_result", lambda _task_id: completed_result)
+    def get_result(task_id: str):
+        lookup_calls.append(task_id)
+        return completed_result
+
+    monkeypatch.setattr(task_tool_module, "get_background_task_result", get_result)
     monkeypatch.setattr(task_tool_module, "cleanup_background_task", cleanup_calls.append)
     monkeypatch.setattr(tools_module, "get_available_tools", fake_get_available_tools)
     monkeypatch.setattr(tool_search_module, "get_deferred_registry", lambda: None)
@@ -117,4 +122,5 @@ async def test_task_tool_propagates_acp_policy_to_internal_subagent(
     assert captured["parent_model"] == "parent-model"
     assert captured["thinking_enabled"] is True
     assert captured["prompt"] == "Inspect the workspace"
-    assert cleanup_calls == ["tool-call-1"]
+    assert lookup_calls == ["execution-1"]
+    assert cleanup_calls == ["execution-1"]

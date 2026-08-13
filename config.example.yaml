@@ -8,7 +8,7 @@ log_level: info
 # of .env. Environment variables are still supported as compatibility fallbacks
 # when a field is omitted.
 api:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8000
   checkpointer_type: sqlite
   checkpointer_path: ./data/checkpoints.db
@@ -41,7 +41,9 @@ api:
   # a no-argument constructor — appended to the lead agent's middleware chain
   # after the built-in middlewares and before ClarificationMiddleware.
   # Example: "middlewares": ["my_package.middlewares:MyAuditMiddleware"]
-  # MCP entries in that file accept "tool_name_prefix": true (default).
+  # MCP entries in that file accept "tool_name_prefix": true (default) and
+  # "session_init_timeout": 60. Set the latter to null only when an unbounded
+  # spawn/connect + initialize + tools/list phase is explicitly required.
   # Set it false only when the server already exposes globally unique names.
   extensions_config_path: null
   cors_allow_origins:
@@ -51,6 +53,9 @@ api:
   # Set api_keys to enable Bearer-token auth, or set auth_enabled explicitly.
   api_keys: []
   auth_enabled: false
+  # Startup refuses a non-loopback bind while auth is disabled. This is an
+  # explicit escape hatch for an already-isolated trusted network only.
+  allow_insecure_remote: false
   chat_request_timeout: 600
   max_upload_size_mb: 25
   max_uploads_per_request: 10
@@ -208,12 +213,18 @@ default_model: qwen3.6-plus
 sandbox:
   use: deerflow.sandbox.local:LocalSandboxProvider
   allow_host_bash: false
+  # Host-process tools such as host_opencli can reuse browser login state and
+  # credentials outside the sandbox. Keep disabled unless every prompt and
+  # fetched document is trusted.
+  allow_host_tools: false
 
 # WSL mode (Windows only): bash runs inside a WSL2 distro while file I/O
-# stays on the Windows filesystem. Host bash is auto-allowed for non-local
-# providers, so 'allow_host_bash' is not needed.
+# stays on the Windows filesystem. WSL is not an isolation boundary: Windows
+# drives and the distro filesystem remain reachable, so bash requires the same
+# explicit trusted-workflow opt-in as LocalSandboxProvider.
 # sandbox:
 #   use: deerflow.sandbox.local:LocalWslProvider   # short alias: 'wsl'
+#   allow_host_bash: false
 #   wsl_distro: Ubuntu-22.04          # omit to use the default distro
 #   wsl_user: null                    # omit to use the distro's default user
 #   wsl_shell: bash

@@ -785,6 +785,11 @@ class DeerFlowClient:
         context = {
             "thread_id": thread_id,
             "loop_detection_scope_id": f"{thread_id}:{uuid.uuid4().hex}",
+            "available_skills": (
+                sorted(self._available_skills)
+                if self._available_skills is not None
+                else None
+            ),
         }
         if self._agent_name:
             context["agent_name"] = self._agent_name

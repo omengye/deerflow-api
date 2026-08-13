@@ -8,6 +8,7 @@ non-Windows hosts at construction time.
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -425,6 +426,7 @@ def test_provider_init_raises_when_wsl_exe_missing() -> None:
 def test_provider_acquire_singleton_and_get() -> None:
     _reset_provider_singleton()
     fake_run, fake_config = _patched_windows_provider_env()
+    fake_config.skills = SimpleNamespace(container_path="/mnt/skills")
     with (
         patch("platform.system", return_value="Windows"),
         patch("subprocess.run", side_effect=fake_run),
@@ -435,13 +437,48 @@ def test_provider_acquire_singleton_and_get() -> None:
         patch("deerflow.config.get_app_config", return_value=fake_config),
     ):
         provider = LocalWslProvider()
-        sid_a = provider.acquire("t1")
-        sid_b = provider.acquire("t2")
+        with patch(
+            "deerflow.skills.projection.get_skill_projection",
+            return_value=SimpleNamespace(path=Path("projected-skills"), revision="a" * 24),
+        ):
+            sid_a = provider.acquire("t1")
+            sid_b = provider.acquire("t2")
 
-    assert sid_a == "wsl"
+    assert sid_a == f"wsl:{'a' * 24}"
     assert sid_a == sid_b
-    assert provider.get("wsl") is not None
+    assert provider.get(sid_a) is not None
     assert provider.get("local") is None
+
+
+def test_provider_lru_bounds_revision_cache() -> None:
+    _reset_provider_singleton()
+    fake_run, fake_config = _patched_windows_provider_env()
+    fake_config.skills = SimpleNamespace(container_path="/mnt/skills")
+    projections = [
+        SimpleNamespace(path=Path(f"skills-{index}"), revision=f"{index:024x}")
+        for index in range(3)
+    ]
+    with (
+        patch("platform.system", return_value="Windows"),
+        patch("subprocess.run", side_effect=fake_run),
+        patch(
+            "deerflow.sandbox.local.local_wsl_provider.build_host_fs_path_mappings",
+            return_value=[],
+        ),
+        patch("deerflow.config.get_app_config", return_value=fake_config),
+    ):
+        provider = LocalWslProvider()
+        provider._max_cached_sandboxes = 2
+        with patch(
+            "deerflow.skills.projection.get_skill_projection",
+            side_effect=projections,
+        ):
+            sandbox_ids = [provider.acquire("thread") for _ in projections]
+
+    assert len(provider._sandboxes) == 2
+    assert provider.get(sandbox_ids[0]) is None
+    assert provider.get(sandbox_ids[1]) is not None
+    assert provider.get(sandbox_ids[2]) is not None
 
 
 # ── Aliases / gate helpers ────────────────────────────────────────────────
@@ -465,6 +502,20 @@ def test_provider_path_classification() -> None:
     assert is_host_fs_sandbox_provider_path("local") is True
     assert is_host_fs_sandbox_provider_path("wsl") is True
     assert is_host_fs_sandbox_provider_path("deerflow.sandbox.aio:AioSandboxProvider") is False
+
+
+def test_wsl_bash_requires_the_same_explicit_opt_in_as_local() -> None:
+    from deerflow.sandbox.security import is_host_bash_allowed
+
+    disabled = SimpleNamespace(
+        sandbox=SimpleNamespace(use="wsl", allow_host_bash=False)
+    )
+    enabled = SimpleNamespace(
+        sandbox=SimpleNamespace(use="wsl", allow_host_bash=True)
+    )
+
+    assert is_host_bash_allowed(disabled) is False
+    assert is_host_bash_allowed(enabled) is True
 
 
 def _runtime_with_sandbox_id(sandbox_id: str | None) -> MagicMock:

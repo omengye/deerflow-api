@@ -101,26 +101,20 @@ def _get_skills_container_path() -> str:
         return _DEFAULT_SKILLS_CONTAINER_PATH
 
 
-def _get_skills_host_path() -> str | None:
-    """Get the skills host filesystem path from config.
-
-    Returns None if the skills directory does not exist or config cannot be
-    loaded.  Only successful lookups are cached; failures are retried on the
-    next call so that a transiently unavailable skills directory does not
-    permanently disable skills access.
-    """
-    cached = getattr(_get_skills_host_path, "_cached", None)
-    if cached is not None:
-        return cached
+def _get_skills_host_path(
+    runtime: ToolRuntime[AgentContext, ThreadState] | None = None,
+) -> str | None:
+    """Get the run's enabled/allowlisted Skill projection host path."""
+    if runtime is not None and runtime.state is not None:
+        sandbox_state = runtime.state.get("sandbox")
+        if sandbox_state is not None:
+            value = sandbox_state.get("skills_path")
+            if value and Path(value).is_dir():
+                return str(value)
     try:
-        from deerflow.config import get_app_config
+        from deerflow.skills.projection import get_skill_projection
 
-        config = get_app_config()
-        skills_path = config.skills.get_skills_path()
-        if skills_path.exists():
-            value = str(skills_path)
-            _get_skills_host_path._cached = value  # type: ignore[attr-defined]
-            return value
+        return str(get_skill_projection().path)
     except Exception:
         pass
     return None
@@ -132,7 +126,10 @@ def _is_skills_path(path: str) -> bool:
     return path == skills_prefix or path.startswith(f"{skills_prefix}/")
 
 
-def _resolve_skills_path(path: str) -> str:
+def _resolve_skills_path(
+    path: str,
+    runtime: ToolRuntime[AgentContext, ThreadState] | None = None,
+) -> str:
     """Resolve a virtual skills path to a host filesystem path.
 
     Args:
@@ -145,7 +142,7 @@ def _resolve_skills_path(path: str) -> str:
         FileNotFoundError: If skills directory is not configured or doesn't exist.
     """
     skills_container = _get_skills_container_path()
-    skills_host = _get_skills_host_path()
+    skills_host = _get_skills_host_path(runtime)
     if skills_host is None:
         raise FileNotFoundError(f"Skills directory not available for path: {path}")
 
@@ -372,10 +369,14 @@ def _resolve_max_results(name: str, requested: int, *, default: int, upper_bound
     return min(requested_max_results, configured_max_results)
 
 
-def _resolve_local_read_path(path: str, thread_data: ThreadDataState) -> str:
+def _resolve_local_read_path(
+    path: str,
+    thread_data: ThreadDataState,
+    runtime: ToolRuntime[AgentContext, ThreadState] | None = None,
+) -> str:
     validate_local_tool_path(path, thread_data, read_only=True)
     if _is_skills_path(path):
-        return _resolve_skills_path(path)
+        return _resolve_skills_path(path, runtime)
     if _is_acp_workspace_path(path):
         return _resolve_acp_workspace_path(path, _extract_thread_id_from_thread_data(thread_data))
     return _resolve_and_validate_user_data_path(path, thread_data)
@@ -434,7 +435,7 @@ def _sanitize_error(error: Exception, runtime: "ToolRuntime[AgentContext, Thread
     msg = f"{type(error).__name__}: {error}"
     if runtime is not None and is_local_sandbox(runtime):
         thread_data = get_thread_data(runtime)
-        msg = mask_local_paths_in_output(msg, thread_data)
+        msg = mask_local_paths_in_output(msg, thread_data, runtime)
     return msg
 
 
@@ -504,7 +505,11 @@ def _thread_actual_to_virtual_mappings(thread_data: ThreadDataState) -> dict[str
     return {actual: virtual for virtual, actual in _thread_virtual_to_actual_mappings(thread_data).items()}
 
 
-def mask_local_paths_in_output(output: str, thread_data: ThreadDataState | None) -> str:
+def mask_local_paths_in_output(
+    output: str,
+    thread_data: ThreadDataState | None,
+    runtime: ToolRuntime[AgentContext, ThreadState] | None = None,
+) -> str:
     """Mask host absolute paths from local sandbox output using virtual paths.
 
     Handles user-data paths (per-thread), skills paths, and ACP workspace paths (global).
@@ -512,7 +517,7 @@ def mask_local_paths_in_output(output: str, thread_data: ThreadDataState | None)
     result = output
 
     # Mask skills host paths
-    skills_host = _get_skills_host_path()
+    skills_host = _get_skills_host_path(runtime)
     skills_container = _get_skills_container_path()
     if skills_host:
         raw_base = str(Path(skills_host))
@@ -525,7 +530,7 @@ def mask_local_paths_in_output(output: str, thread_data: ThreadDataState | None)
                 matched_path = match.group(0)
                 if matched_path == _base:
                     return skills_container
-                relative = matched_path[len(_base) :].lstrip("/\\")
+                relative = matched_path[len(_base) :].lstrip("/\\").replace("\\", "/")
                 return f"{skills_container}/{relative}" if relative else skills_container
 
             result = pattern.sub(replace_skills, result)
@@ -544,7 +549,7 @@ def mask_local_paths_in_output(output: str, thread_data: ThreadDataState | None)
                 matched_path = match.group(0)
                 if matched_path == _base:
                     return _ACP_WORKSPACE_VIRTUAL_PATH
-                relative = matched_path[len(_base) :].lstrip("/\\")
+                relative = matched_path[len(_base) :].lstrip("/\\").replace("\\", "/")
                 return f"{_ACP_WORKSPACE_VIRTUAL_PATH}/{relative}" if relative else _ACP_WORKSPACE_VIRTUAL_PATH
 
             result = pattern.sub(replace_acp, result)
@@ -570,7 +575,7 @@ def mask_local_paths_in_output(output: str, thread_data: ThreadDataState | None)
                 matched_path = match.group(0)
                 if matched_path == _base:
                     return _virtual
-                relative = matched_path[len(_base) :].lstrip("/\\")
+                relative = matched_path[len(_base) :].lstrip("/\\").replace("\\", "/")
                 return f"{_virtual}/{relative}" if relative else _virtual
 
             result = pattern.sub(replace_match, result)
@@ -964,15 +969,28 @@ def validate_local_bash_command_paths(command: str, thread_data: ThreadDataState
     boundary and must not be treated as isolation from the host filesystem.
 
     In local mode, commands must use virtual paths under /mnt/user-data for
-    user data access. Skills paths under /mnt/skills, ACP workspace paths
-    under /mnt/acp-workspace, and custom mount container paths (configured in
-    config.yaml) are allowed (path-traversal checks only; write prevention
-    for bash commands is not enforced here).
+    user data access. ACP workspace paths and custom mount container paths
+    (configured in config.yaml) are allowed with path-traversal checks only.
+    Skills are intentionally excluded because host bash cannot enforce an
+    immutable content-addressed projection.
     A small allowlist of common system path prefixes is kept for executable
     and device references (e.g. /bin/sh, /dev/null).
     """
     if thread_data is None:
         raise SandboxRuntimeError("Thread data not available for local sandbox")
+
+    # The same OS user that launches host bash can undo projection chmod/ACL
+    # protections, corrupting a content-addressed directory shared by later
+    # sandboxes. Keep Skill access on the read-only file/search tools. Docker
+    # sandboxes do not take this branch and retain their real ``:ro`` mount.
+    skills_container = _get_skills_container_path().rstrip("/") or "/"
+    skills_reference = re.compile(
+        rf"(?<![A-Za-z0-9_]){re.escape(skills_container)}(?=$|[/\s\"';&|<>()])"
+    )
+    if skills_reference.search(command):
+        raise PermissionError(
+            "Host bash cannot access /mnt/skills; use read_file, ls, glob, or grep"
+        )
 
     # Block file:// URLs which bypass the absolute-path regex but allow local file exfiltration
     file_url_match = _FILE_URL_PATTERN.search(command)
@@ -998,7 +1016,11 @@ def validate_local_bash_command_paths(command: str, thread_data: ThreadDataState
         raise PermissionError(f"Unsafe absolute paths in command: {unsafe}. Use paths under {VIRTUAL_PATH_PREFIX}")
 
 
-def replace_virtual_paths_in_command(command: str, thread_data: ThreadDataState | None) -> str:
+def replace_virtual_paths_in_command(
+    command: str,
+    thread_data: ThreadDataState | None,
+    runtime: ToolRuntime[AgentContext, ThreadState] | None = None,
+) -> str:
     """Replace all virtual paths (/mnt/user-data, /mnt/skills, /mnt/acp-workspace) in a command string.
 
     Args:
@@ -1012,12 +1034,12 @@ def replace_virtual_paths_in_command(command: str, thread_data: ThreadDataState 
 
     # Replace skills paths
     skills_container = _get_skills_container_path()
-    skills_host = _get_skills_host_path()
+    skills_host = _get_skills_host_path(runtime)
     if skills_host and skills_container in result:
         skills_pattern = re.compile(rf"{re.escape(skills_container)}(/[^\s\"';&|<>()]*)?")
 
         def replace_skills_match(match: re.Match) -> str:
-            return _resolve_skills_path(match.group(0))
+            return _resolve_skills_path(match.group(0), runtime)
 
         result = skills_pattern.sub(replace_skills_match, result)
 
@@ -1093,7 +1115,9 @@ def is_host_fs_sandbox(runtime: ToolRuntime[AgentContext, ThreadState] | None) -
     sandbox_id = sandbox_state.get("sandbox_id")
     if sandbox_id in _HOST_FS_SANDBOX_IDS:
         return True
-    return isinstance(sandbox_id, str) and sandbox_id.startswith("local:")
+    return isinstance(sandbox_id, str) and (
+        sandbox_id.startswith("local:") or sandbox_id.startswith("wsl:")
+    )
 
 
 # Back-compat alias. The historical name implied "local-only" semantics; the
@@ -1155,11 +1179,19 @@ def ensure_sandbox_initialized(runtime: ToolRuntime[AgentContext, ThreadState] |
     if runtime.state is None:
         raise SandboxRuntimeError("Tool runtime state not available")
 
-    # Check if sandbox already exists in state
+    raw_skills = runtime.context.get("available_skills") if runtime.context else None
+    if raw_skills is None and runtime.config:
+        raw_skills = runtime.config.get("metadata", {}).get("available_skills")
+    available_skills = list(raw_skills) if raw_skills is not None else None
+    from deerflow.skills.projection import get_skill_projection
+
+    projection = get_skill_projection(available_skills)
+
+    # Check if the persisted sandbox is still bound to the current Skill view.
     sandbox_state = runtime.state.get("sandbox")
     if sandbox_state is not None:
         sandbox_id = sandbox_state.get("sandbox_id")
-        if sandbox_id is not None:
+        if sandbox_id is not None and sandbox_state.get("skills_revision") == projection.revision:
             sandbox = get_sandbox_provider().get(sandbox_id)
             if sandbox is not None:
                 if runtime.context is not None:
@@ -1175,10 +1207,18 @@ def ensure_sandbox_initialized(runtime: ToolRuntime[AgentContext, ThreadState] |
         raise SandboxRuntimeError("Thread ID not available in runtime context")
 
     provider = get_sandbox_provider()
-    sandbox_id = provider.acquire(thread_id)
+    sandbox_id = provider.acquire(
+        thread_id,
+        available_skills=available_skills,
+    )
 
     # Update runtime state - this persists across tool calls
-    runtime.state["sandbox"] = {"sandbox_id": sandbox_id}
+    runtime.state["sandbox"] = {
+        "sandbox_id": sandbox_id,
+        "skills_revision": projection.revision,
+        "skills_path": str(projection.path),
+        "available_skills": available_skills,
+    }
 
     # Retrieve and return the sandbox
     sandbox = provider.get(sandbox_id)
@@ -1328,7 +1368,7 @@ def bash_tool(runtime: ToolRuntime[AgentContext, ThreadState], description: str,
             ensure_thread_directories_exist(runtime)
             thread_data = get_thread_data(runtime)
             validate_local_bash_command_paths(command, thread_data)
-            command = replace_virtual_paths_in_command(command, thread_data)
+            command = replace_virtual_paths_in_command(command, thread_data, runtime)
             command = _apply_cwd_prefix(command, thread_data)
             output = sandbox.execute_command(command)
             try:
@@ -1338,7 +1378,7 @@ def bash_tool(runtime: ToolRuntime[AgentContext, ThreadState], description: str,
                 max_chars = sandbox_cfg.bash_output_max_chars if sandbox_cfg else 20000
             except Exception:
                 max_chars = 20000
-            return _truncate_bash_output(mask_local_paths_in_output(output, thread_data), max_chars)
+            return _truncate_bash_output(mask_local_paths_in_output(output, thread_data, runtime), max_chars)
         ensure_thread_directories_exist(runtime)
         try:
             from deerflow.config.app_config import get_app_config
@@ -1374,7 +1414,7 @@ def ls_tool(runtime: ToolRuntime[AgentContext, ThreadState], description: str, p
             validate_local_tool_path(path, thread_data, read_only=True)
             assert thread_data is not None
             if _is_skills_path(path):
-                path = _resolve_skills_path(path)
+                path = _resolve_skills_path(path, runtime)
             elif _is_acp_workspace_path(path):
                 path = _resolve_acp_workspace_path(path, _extract_thread_id_from_thread_data(thread_data))
             elif not _is_custom_mount_path(path):
@@ -1385,7 +1425,7 @@ def ls_tool(runtime: ToolRuntime[AgentContext, ThreadState], description: str, p
             return "(empty)"
         output = "\n".join(children)
         if thread_data is not None:
-            output = mask_local_paths_in_output(output, thread_data)
+            output = mask_local_paths_in_output(output, thread_data, runtime)
         try:
             from deerflow.config.app_config import get_app_config
 
@@ -1437,10 +1477,10 @@ def glob_tool(
             thread_data = get_thread_data(runtime)
             if thread_data is None:
                 raise SandboxRuntimeError("Thread data not available for local sandbox")
-            path = _resolve_local_read_path(path, thread_data)
+            path = _resolve_local_read_path(path, thread_data, runtime)
         matches, truncated = sandbox.glob(path, pattern, include_dirs=include_dirs, max_results=effective_max_results)
         if thread_data is not None:
-            matches = [mask_local_paths_in_output(match, thread_data) for match in matches]
+            matches = [mask_local_paths_in_output(match, thread_data, runtime) for match in matches]
         return _format_glob_results(requested_path, matches, truncated)
     except SandboxError as e:
         return f"Error: {e}"
@@ -1491,7 +1531,7 @@ def grep_tool(
             thread_data = get_thread_data(runtime)
             if thread_data is None:
                 raise SandboxRuntimeError("Thread data not available for local sandbox")
-            path = _resolve_local_read_path(path, thread_data)
+            path = _resolve_local_read_path(path, thread_data, runtime)
         matches, truncated = sandbox.grep(
             path,
             pattern,
@@ -1503,7 +1543,7 @@ def grep_tool(
         if thread_data is not None:
             matches = [
                 GrepMatch(
-                    path=mask_local_paths_in_output(match.path, thread_data),
+                    path=mask_local_paths_in_output(match.path, thread_data, runtime),
                     line_number=match.line_number,
                     line=match.line,
                 )
@@ -1556,7 +1596,7 @@ def read_file_tool(
             validate_local_tool_path(path, thread_data, read_only=True)
             assert thread_data is not None
             if _is_skills_path(path):
-                path = _resolve_skills_path(path)
+                path = _resolve_skills_path(path, runtime)
             elif _is_acp_workspace_path(path):
                 path = _resolve_acp_workspace_path(path, _extract_thread_id_from_thread_data(thread_data))
             elif not _is_custom_mount_path(path):

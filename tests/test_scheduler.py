@@ -418,6 +418,321 @@ async def test_transient_llm_failure_retries_occurrence(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_post_launch_bookkeeping_failure_does_not_retry_occurrence(tmp_path, monkeypatch):
+    store = SchedulerStore(tmp_path / "scheduled_tasks.db")
+    store.setup()
+    task = await store.create_task(
+        thread_id="thread-1",
+        prompt="launch once",
+        schedule_type="once",
+        schedule_expr={"run_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()},
+        timezone="UTC",
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), task.id),
+        )
+    claimed_task, task_run_id, scheduled_at, attempt_count = (
+        await store.claim_due_tasks(now=datetime.now(UTC), max_attempts=3)
+    )[0]
+
+    actual_run_id = "manager-selected-run"
+
+    class FakeRunManager:
+        def get(self, run_id):
+            assert run_id == actual_run_id
+            return SimpleNamespace(status=RunStatus.success, error=None, metadata={})
+
+    launches = []
+
+    class FakeManager:
+        run_manager = FakeRunManager()
+
+        async def start_client_stream_run(self, **kwargs):
+            launches.append(kwargs)
+            return SimpleNamespace(
+                run_id=actual_run_id,
+                task=asyncio.create_task(asyncio.sleep(0)),
+            )
+
+    original_mark_launched = store.mark_task_run_launched
+    launch_fence_calls = 0
+
+    async def fail_first_launch_fence(*args, **kwargs):
+        nonlocal launch_fence_calls
+        launch_fence_calls += 1
+        if launch_fence_calls == 1:
+            raise RuntimeError("temporary bookkeeping failure")
+        return await original_mark_launched(*args, **kwargs)
+
+    monkeypatch.setattr(store, "mark_task_run_launched", fail_first_launch_fence)
+    service = SchedulerService(store=store, manager=FakeManager(), poll_interval_seconds=1)
+    retries = []
+
+    async def record_retry(*args, **kwargs):
+        retries.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(service, "_reschedule_failure", record_retry)
+
+    await service._dispatch(claimed_task, task_run_id, scheduled_at, attempt_count)
+
+    run = await store.get_task_run(task_run_id)
+    assert len(launches) == 1
+    assert retries == []
+    assert run is not None
+    assert run["status"] == "success"
+    assert run["run_id"] == actual_run_id
+    assert run["execution_status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_expired_launched_occurrence_is_not_automatically_reclaimed(tmp_path):
+    store = SchedulerStore(tmp_path / "scheduled_tasks.db")
+    store.setup()
+    task = await store.create_task(
+        thread_id="thread-1",
+        prompt="do not duplicate",
+        schedule_type="once",
+        schedule_expr={"run_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()},
+        timezone="UTC",
+    )
+    now = datetime.now(UTC)
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ?",
+            ((now - timedelta(seconds=1)).isoformat(), task.id),
+        )
+    claimed_task, task_run_id, _, attempt_count = (
+        await store.claim_due_tasks(now=now, lease_seconds=1)
+    )[0]
+    assert claimed_task.id == task.id
+    assert await store.mark_task_run_started(
+        task_run_id,
+        "managed-run",
+        attempt_count=attempt_count,
+    )
+    assert await store.mark_task_run_launched(
+        task_run_id,
+        "managed-run",
+        attempt_count=attempt_count,
+    )
+
+    reclaimed = await store.claim_due_tasks(
+        now=now + timedelta(seconds=2),
+        lease_seconds=60,
+    )
+
+    run = await store.get_task_run(task_run_id)
+    assert reclaimed == []
+    assert run is not None and run["status"] == "launched"
+
+
+@pytest.mark.asyncio
+async def test_expired_launched_occurrence_keeps_same_thread_serialized(tmp_path):
+    store = SchedulerStore(tmp_path / "scheduled_tasks.db")
+    store.setup()
+    first_task = await store.create_task(
+        thread_id="shared-thread",
+        prompt="possibly still running",
+        schedule_type="once",
+        schedule_expr={"run_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()},
+        timezone="UTC",
+    )
+    second_task = await store.create_task(
+        thread_id="shared-thread",
+        prompt="must wait for reconciliation",
+        schedule_type="once",
+        schedule_expr={"run_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()},
+        timezone="UTC",
+    )
+    now = datetime.now(UTC)
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ?",
+            ((now - timedelta(seconds=2)).isoformat(), first_task.id),
+        )
+        conn.execute(
+            "UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ?",
+            ((now - timedelta(seconds=1)).isoformat(), second_task.id),
+        )
+
+    first = (await store.claim_due_tasks(now=now, limit=1, lease_seconds=1))[0]
+    assert first[0].id == first_task.id
+    assert await store.mark_task_run_started(
+        first[1],
+        "managed-run",
+        attempt_count=first[3],
+    )
+    assert await store.mark_task_run_launched(
+        first[1],
+        "managed-run",
+        attempt_count=first[3],
+    )
+
+    later = await store.claim_due_tasks(
+        now=now + timedelta(seconds=2),
+        limit=10,
+        lease_seconds=60,
+    )
+
+    assert later == []
+    second_runs = await store.list_task_runs(second_task.id)
+    assert len(second_runs) == 1
+    assert second_runs[0]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_pausing_task_cancels_retry_and_prevents_reclaim(tmp_path):
+    store = SchedulerStore(tmp_path / "scheduled_tasks.db")
+    store.setup()
+    now = datetime.now(UTC)
+    task = await store.create_task(
+        thread_id="thread-1",
+        prompt="do not retry while paused",
+        schedule_type="interval",
+        schedule_expr={
+            "every_seconds": 60,
+            "start_at": (now + timedelta(seconds=1)).isoformat(),
+        },
+        timezone="UTC",
+    )
+    claim_at = datetime.fromisoformat(task.next_run_at) + timedelta(milliseconds=1)
+    claimed = (await store.claim_due_tasks(now=claim_at, lease_seconds=60))[0]
+    await store.reschedule_task_run(
+        claimed[1],
+        error="retry",
+        delay_seconds=0,
+        max_attempts=3,
+        attempt_count=claimed[3],
+    )
+
+    paused, active = await store.pause_task(task.id)
+    reclaimed = await store.claim_due_tasks(
+        now=datetime.now(UTC) + timedelta(seconds=1),
+        lease_seconds=60,
+    )
+
+    assert paused is not None and paused.enabled is False
+    assert [row["status"] for row in active] == ["retry"]
+    assert reclaimed == []
+    runs = await store.list_task_runs(task.id)
+    assert runs[0]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_service_pause_cancels_managed_run_and_dispatch(tmp_path):
+    store = SchedulerStore(tmp_path / "scheduled_tasks.db")
+    store.setup()
+    task = await store.create_task(
+        thread_id="thread-1",
+        prompt="cancel me",
+        schedule_type="daily",
+        schedule_expr={"time_of_day": "09:00"},
+        timezone="UTC",
+    )
+    now = datetime.now(UTC).isoformat()
+    with store._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO scheduled_task_runs (
+                id, task_id, scheduled_at, run_id, status, attempt_count,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'launched', 1, ?, ?)
+            """,
+            ("occurrence-1", task.id, now, "managed-1", now, now),
+        )
+
+    cancelled_runs: list[str] = []
+
+    class Manager:
+        async def cancel_run(self, run_id, **_kwargs):
+            cancelled_runs.append(run_id)
+            return True
+
+    service = SchedulerService(store=store, manager=Manager(), poll_interval_seconds=1)
+    blocker = asyncio.create_task(asyncio.sleep(60))
+    service._dispatch_tasks.add(blocker)
+    service._dispatch_tasks_by_task_id[task.id] = {blocker}
+
+    paused = await service.set_task_enabled(task.id, False)
+
+    assert paused is not None and paused.enabled is False
+    assert cancelled_runs == ["managed-1"]
+    assert blocker.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_orphaned_launched_occurrence_is_terminalized_without_replay(tmp_path):
+    store = SchedulerStore(tmp_path / "scheduled_tasks.db")
+    store.setup()
+    now = datetime.now(UTC)
+    task = await store.create_task(
+        thread_id="shared-thread",
+        prompt="already launched",
+        schedule_type="once",
+        schedule_expr={"run_at": (now + timedelta(hours=1)).isoformat()},
+        timezone="UTC",
+    )
+    old = (now - timedelta(hours=2)).isoformat()
+    with store._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO scheduled_task_runs (
+                id, task_id, scheduled_at, run_id, status, attempt_count,
+                lease_expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'launched', 1, ?, ?, ?)
+            """,
+            ("orphan-1", task.id, old, "managed-old", old, old, old),
+        )
+
+    reconciled = await store.reconcile_expired_launched_runs(
+        now=now,
+        orphan_grace_seconds=3600,
+    )
+
+    run = await store.get_task_run("orphan-1")
+    assert reconciled == 1
+    assert run is not None and run["status"] == "interrupted"
+    assert "not retried" in run["error"]
+
+
+@pytest.mark.asyncio
+async def test_delete_tasks_for_thread_removes_enabled_disabled_and_history(tmp_path):
+    store = SchedulerStore(tmp_path / "scheduled_tasks.db")
+    store.setup()
+    first = await store.create_task(
+        thread_id="delete-thread",
+        prompt="first",
+        schedule_type="daily",
+        schedule_expr={"time_of_day": "09:00"},
+        timezone="UTC",
+    )
+    await store.create_task(
+        thread_id="delete-thread",
+        prompt="second",
+        schedule_type="daily",
+        schedule_expr={"time_of_day": "10:00"},
+        timezone="UTC",
+    )
+    await store.create_task(
+        thread_id="keep-thread",
+        prompt="keep",
+        schedule_type="daily",
+        schedule_expr={"time_of_day": "11:00"},
+        timezone="UTC",
+    )
+    await store.set_enabled(first.id, False)
+
+    deleted = await store.delete_tasks_for_thread("delete-thread")
+
+    assert deleted == 2
+    assert await store.list_tasks(thread_id="delete-thread", include_disabled=True) == []
+    assert len(await store.list_tasks(thread_id="keep-thread", include_disabled=True)) == 1
+
+
+@pytest.mark.asyncio
 async def test_invalid_due_task_is_quarantined_without_blocking_batch(tmp_path):
     store = SchedulerStore(tmp_path / "scheduled_tasks.db")
     store.setup()
@@ -488,7 +803,7 @@ async def test_legacy_interval_schedule_does_not_drift_from_poll_delay(tmp_path)
 async def test_missing_delivery_channel_is_recorded_separately(tmp_path):
     store = SchedulerStore(tmp_path / "scheduled_tasks.db")
     store.setup()
-    task = await store.create_task(
+    await store.create_task(
         thread_id="feishu_chat-1",
         prompt="deliver",
         schedule_type="once",

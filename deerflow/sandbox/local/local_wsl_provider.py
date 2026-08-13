@@ -6,6 +6,9 @@ import logging
 import platform
 import subprocess
 import threading
+from collections import OrderedDict
+from collections.abc import Collection
+from pathlib import Path
 from typing import ClassVar
 
 from deerflow.sandbox.local.local_sandbox_provider import build_host_fs_path_mappings
@@ -65,7 +68,21 @@ class LocalWslProvider(SandboxProvider):
         if self._distro:
             self._verify_distro_exists(self._distro)
 
-        self._path_mappings = build_host_fs_path_mappings()
+        all_mappings = build_host_fs_path_mappings(
+            skills_path=Path("__missing_skills_projection__")
+        )
+        skills_container = getattr(
+            getattr(config, "skills", None),
+            "container_path",
+            "/mnt/skills",
+        ).rstrip("/") or "/"
+        self._base_path_mappings = [
+            mapping
+            for mapping in all_mappings
+            if (mapping.container_path.rstrip("/") or "/") != skills_container
+        ]
+        self._sandboxes: OrderedDict[str, WslSandbox] = OrderedDict()
+        self._max_cached_sandboxes = 256
 
     def _verify_wsl_available(self) -> None:
         """Probe ``wsl.exe --status`` to confirm WSL is installed and reachable."""
@@ -113,27 +130,76 @@ class LocalWslProvider(SandboxProvider):
                 f"Available distros: {sorted(installed) or 'none'}"
             )
 
-    def acquire(self, thread_id: str | None = None) -> str:
+    def acquire(
+        self,
+        thread_id: str | None = None,
+        *,
+        available_skills: Collection[str] | None = None,
+    ) -> str:
         global _singleton
+        from deerflow.config import get_app_config
+        from deerflow.sandbox.local.local_sandbox import PathMapping
+        from deerflow.skills.projection import get_skill_projection
+
+        projection = get_skill_projection(available_skills)
+        sandbox_id = f"wsl:{projection.revision}"
         with _singleton_lock:
-            if _singleton is None:
-                _singleton = WslSandbox(
-                    self.SANDBOX_ID,
+            sandbox = self._sandboxes.get(sandbox_id)
+            if sandbox is None:
+                sandbox = WslSandbox(
+                    sandbox_id,
                     distro=self._distro,
                     wsl_user=self._wsl_user,
                     wsl_shell=self._wsl_shell,
                     mount_prefix=self._mount_prefix,
-                    path_mappings=self._path_mappings,
+                    path_mappings=[
+                        *self._base_path_mappings,
+                        PathMapping(
+                            container_path=get_app_config().skills.container_path,
+                            local_path=str(projection.path),
+                            read_only=True,
+                        ),
+                    ],
                 )
-        return _singleton.id
+                self._sandboxes[sandbox_id] = sandbox
+                while len(self._sandboxes) > self._max_cached_sandboxes:
+                    evicted_id, _ = self._sandboxes.popitem(last=False)
+                    logger.info(
+                        "Evicting WslSandbox cache entry %s (cap=%d)",
+                        evicted_id,
+                        self._max_cached_sandboxes,
+                    )
+            else:
+                self._sandboxes.move_to_end(sandbox_id)
+            _singleton = sandbox
+        return sandbox.id
 
     def get(self, sandbox_id: str) -> Sandbox | None:
         if sandbox_id == self.SANDBOX_ID:
-            if _singleton is None:
-                self.acquire()
             return _singleton
-        return None
+        with _singleton_lock:
+            sandbox = self._sandboxes.get(sandbox_id)
+            if sandbox is not None:
+                self._sandboxes.move_to_end(sandbox_id)
+            return sandbox
 
     def release(self, sandbox_id: str) -> None:
         # Singleton lifecycle, same semantics as LocalSandboxProvider.release().
         pass
+
+    def active_skill_revisions(self) -> set[str]:
+        with _singleton_lock:
+            return {
+                sandbox_id.removeprefix("wsl:")
+                for sandbox_id in self._sandboxes
+                if sandbox_id.startswith("wsl:")
+            }
+
+    def reset(self) -> None:
+        global _singleton
+        with _singleton_lock:
+            self._sandboxes.clear()
+            _singleton = None
+
+    def shutdown(self) -> None:
+        self.reset()

@@ -127,6 +127,17 @@ class Paths:
         """Root directory for all custom agents: `{base_dir}/agents/`."""
         return self.base_dir / "agents"
 
+    @property
+    def skill_projections_dir(self) -> Path:
+        """Content-addressed read-only Skill views used by sandboxes."""
+        return self.base_dir / "skill-projections"
+
+    def host_skill_projection_dir(self, revision: str) -> str:
+        """Host-visible source path for a Skill projection bind mount."""
+        if not re.fullmatch(r"[a-f0-9]{24}", revision):
+            raise ValueError(f"Invalid Skill projection revision: {revision!r}")
+        return _join_host_path(self._host_base_dir_str(), "skill-projections", revision)
+
     def agent_dir(self, name: str) -> Path:
         """Directory for a specific agent: `{base_dir}/agents/{name}/`."""
         return self.agents_dir / name.lower()

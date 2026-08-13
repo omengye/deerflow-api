@@ -41,10 +41,14 @@ def _detect_image_mime(image_data: bytes) -> str | None:
     return None
 
 
-def _sanitize_image_error(error: Exception, thread_data: ThreadDataState | None) -> str:
+def _sanitize_image_error(
+    error: Exception,
+    thread_data: ThreadDataState | None,
+    runtime: ToolRuntime[AgentContext, ThreadState],
+) -> str:
     from deerflow.sandbox.tools import mask_local_paths_in_output
 
-    return mask_local_paths_in_output(f"{type(error).__name__}: {error}", thread_data)
+    return mask_local_paths_in_output(f"{type(error).__name__}: {error}", thread_data, runtime)
 
 
 @tool("view_image", parse_docstring=True)
@@ -126,7 +130,7 @@ def view_image_tool(
         image_size = path.stat().st_size
     except OSError as e:
         return Command(
-            update={"messages": [ToolMessage(f"Error reading image metadata: {_sanitize_image_error(e, thread_data)}", tool_call_id=tool_call_id)]},
+            update={"messages": [ToolMessage(f"Error reading image metadata: {_sanitize_image_error(e, thread_data, runtime)}", tool_call_id=tool_call_id)]},
         )
     if image_size > _MAX_IMAGE_BYTES:
         return Command(
@@ -139,7 +143,7 @@ def view_image_tool(
             image_data = f.read()
     except Exception as e:
         return Command(
-            update={"messages": [ToolMessage(f"Error reading image file: {_sanitize_image_error(e, thread_data)}", tool_call_id=tool_call_id)]},
+            update={"messages": [ToolMessage(f"Error reading image file: {_sanitize_image_error(e, thread_data, runtime)}", tool_call_id=tool_call_id)]},
         )
 
     detected_mime_type = _detect_image_mime(image_data)

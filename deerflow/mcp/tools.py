@@ -11,6 +11,7 @@ from langgraph.config import get_config
 from langgraph.runtime import Runtime
 
 from deerflow.config.extensions_config import ExtensionsConfig
+from deerflow.constants import DEFAULT_MCP_SESSION_INIT_TIMEOUT
 from deerflow.mcp.client import build_servers_config
 from deerflow.mcp.oauth import build_oauth_tool_interceptor, get_initial_oauth_headers
 from deerflow.mcp.session_pool import get_session_pool
@@ -106,6 +107,7 @@ def _make_session_pool_tool(
     connection: dict[str, Any],
     tool_interceptors: list[Any] | None = None,
     tool_name_prefix: bool = True,
+    session_init_timeout: float | None = DEFAULT_MCP_SESSION_INIT_TIMEOUT,
 ) -> BaseTool:
     """Wrap an MCP tool so it reuses a persistent session from the pool.
 
@@ -130,7 +132,21 @@ def _make_session_pool_tool(
         **arguments: Any,
     ) -> Any:
         thread_id = _extract_thread_id(runtime)
-        session = await pool.get_session(server_name, thread_id, connection)
+        if session_init_timeout is None:
+            session = await pool.get_session(server_name, thread_id, connection)
+        else:
+            try:
+                session = await asyncio.wait_for(
+                    pool.get_session(server_name, thread_id, connection),
+                    timeout=session_init_timeout,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "MCP server '%s' session initialization timed out (%.1fs)",
+                    server_name,
+                    session_init_timeout,
+                )
+                raise
 
         if tool_interceptors:
             from langchain_mcp_adapters.interceptors import MCPToolCallRequest
@@ -249,16 +265,39 @@ async def get_mcp_tools(
             try:
                 server_config = extensions_config.mcp_servers.get(server_name)
                 tool_name_prefix = server_config.tool_name_prefix if server_config is not None else True
-                if tool_name_prefix:
-                    return await client.get_tools(server_name=server_name)
-                return await load_mcp_tools(
-                    None,
-                    connection=servers_config[server_name],
-                    callbacks=getattr(client, "callbacks", None),
-                    server_name=server_name,
-                    tool_interceptors=getattr(client, "tool_interceptors", tool_interceptors),
-                    tool_name_prefix=False,
+                session_init_timeout = (
+                    server_config.session_init_timeout
+                    if server_config is not None
+                    else DEFAULT_MCP_SESSION_INIT_TIMEOUT
                 )
+                if tool_name_prefix:
+                    discovery = client.get_tools(server_name=server_name)
+                else:
+                    discovery = load_mcp_tools(
+                        None,
+                        connection=servers_config[server_name],
+                        callbacks=getattr(client, "callbacks", None),
+                        server_name=server_name,
+                        tool_interceptors=getattr(client, "tool_interceptors", tool_interceptors),
+                        tool_name_prefix=False,
+                    )
+                if session_init_timeout is None:
+                    return await discovery
+                try:
+                    return await asyncio.wait_for(
+                        discovery,
+                        timeout=session_init_timeout,
+                    )
+                except TimeoutError:
+                    # Discovery owns its connection context. Cancelling it via
+                    # wait_for unwinds the adapter's context managers, including
+                    # stdio process-tree cleanup.
+                    logger.warning(
+                        "Skipping MCP server '%s' after tool discovery timed out (%.1fs)",
+                        server_name,
+                        session_init_timeout,
+                    )
+                    return []
             except Exception as exc:
                 logger.warning("Skipping MCP server '%s' after tool discovery failed: %s", server_name, exc, exc_info=True)
                 return []
@@ -287,6 +326,11 @@ async def get_mcp_tools(
         for source_name, server_tools in zip(server_names, tools_by_server, strict=True):
             server_config = extensions_config.mcp_servers.get(source_name)
             tool_name_prefix = server_config.tool_name_prefix if server_config is not None else True
+            session_init_timeout = (
+                server_config.session_init_timeout
+                if server_config is not None
+                else DEFAULT_MCP_SESSION_INIT_TIMEOUT
+            )
             for tool in server_tools:
                 if tool.name in conflicting_names:
                     continue
@@ -297,6 +341,7 @@ async def get_mcp_tools(
                         servers_config[source_name],
                         tool_interceptors,
                         tool_name_prefix=tool_name_prefix,
+                        session_init_timeout=session_init_timeout,
                     )
                 )
 
