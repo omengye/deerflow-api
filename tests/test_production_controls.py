@@ -41,6 +41,22 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
 
         return TestClient(app)
 
+    def _mounted_auth_test_client(self, mount_path: str = "/prefix") -> TestClient:
+        child = FastAPI()
+        child.add_middleware(ApiKeyAuthMiddleware)
+
+        @child.get("/api/chat")
+        async def protected():
+            return {"ok": True}
+
+        @child.get("/health")
+        async def public():
+            return {"status": "ok"}
+
+        parent = FastAPI()
+        parent.mount(mount_path, child)
+        return TestClient(parent)
+
     async def test_api_auth_rejects_missing_bearer_token(self) -> None:
         original_enabled = settings.auth_enabled
         original_keys = list(settings.api_keys)
@@ -92,6 +108,28 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
         try:
             client = self._auth_test_client()
             public = client.get("/health")
+            self.assertEqual(public.status_code, 200)
+        finally:
+            settings.auth_enabled = original_enabled
+            settings.api_keys = original_keys
+
+    async def test_auth_uses_router_path_when_app_is_mounted(self) -> None:
+        original_enabled = settings.auth_enabled
+        original_keys = list(settings.api_keys)
+        settings.auth_enabled = True
+        settings.api_keys = ["secret"]
+        try:
+            client = self._mounted_auth_test_client()
+
+            unauthorized = client.get("/prefix/api/chat")
+            authorized = client.get(
+                "/prefix/api/chat",
+                headers={"Authorization": "Bearer secret"},
+            )
+            public = client.get("/prefix/health")
+
+            self.assertEqual(unauthorized.status_code, 401)
+            self.assertEqual(authorized.status_code, 200)
             self.assertEqual(public.status_code, 200)
         finally:
             settings.auth_enabled = original_enabled

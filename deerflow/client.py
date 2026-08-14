@@ -35,6 +35,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 
+from deerflow.agents.date_context import get_current_date
 from deerflow.agents.lead_agent.agent import _build_middlewares
 from deerflow.agents.lead_agent.prompt import apply_prompt_template
 from deerflow.agents.middlewares.subagent_limit_middleware import clamp_subagent_limit
@@ -400,6 +401,7 @@ class DeerFlowClient:
         )
         model_name = requested_model_name or app_config.get_default_model_name()
         model_config = app_config.get_model_config(model_name) if model_name else None
+        current_date = get_current_date()
         memory_signature = self._get_memory_signature(self._agent_name)
         skill_catalog_version = self._get_skill_catalog_version()
         skill_evolution_config = getattr(app_config, "skill_evolution", None)
@@ -431,6 +433,7 @@ class DeerFlowClient:
             getattr(self, "_allowed_tool_names", None),
             getattr(self, "_system_prompt_overlay", ""),
             getattr(self, "_subagent_system_prompt_overlay", ""),
+            current_date,
             tuple(
                 type(middleware).__qualname__
                 for middleware in getattr(self, "_subagent_middlewares", [])
@@ -481,6 +484,7 @@ class DeerFlowClient:
                 available_skills=self._available_skills,
                 available_tool_names=effective_tool_names,
                 system_prompt_overlay=getattr(self, "_system_prompt_overlay", ""),
+                current_date=current_date,
             ),
             "state_schema": get_thread_state_schema(
                 checkpoint_mode,

@@ -85,6 +85,7 @@ def test_prompt_omits_instructions_for_filtered_tools() -> None:
         subagent_enabled=True,
         available_skills=set(),
         available_tool_names={"task"},
+        current_date="2042-03-04, Tuesday",
     )
 
     assert "<subagent_system>" in prompt
@@ -94,6 +95,7 @@ def test_prompt_omits_instructions_for_filtered_tools() -> None:
     assert "presented using `present_files`" not in prompt
     assert "web_search, web_fetch" not in prompt
     assert "invoke_acp_agent" not in prompt
+    assert prompt.endswith("<current_date>2042-03-04, Tuesday</current_date>")
 
 
 def test_client_filters_deferred_registry_with_tool_policy(monkeypatch) -> None:

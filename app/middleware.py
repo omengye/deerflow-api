@@ -11,6 +11,7 @@ from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import settings
+from app.request_path import get_request_route_path
 
 REQUEST_ID_HEADER = "X-Request-ID"
 
@@ -67,13 +68,14 @@ class ApiKeyAuthMiddleware(BaseHTTPMiddleware):
 def _should_authenticate(request: Request) -> bool:
     if request.method == "OPTIONS":
         return False
-    if request.url.path in ApiKeyAuthMiddleware._PUBLIC_PATHS:
+    route_path = get_request_route_path(request)
+    if route_path in ApiKeyAuthMiddleware._PUBLIC_PATHS:
         return False
     if not settings.auth_enabled:
         return False
-    if request.url.path in ApiKeyAuthMiddleware._PROTECTED_PATHS:
+    if route_path in ApiKeyAuthMiddleware._PROTECTED_PATHS:
         return True
-    return request.url.path.startswith(ApiKeyAuthMiddleware._PROTECTED_PREFIXES)
+    return route_path.startswith(ApiKeyAuthMiddleware._PROTECTED_PREFIXES)
 
 
 def _is_authorized(request: Request) -> bool:

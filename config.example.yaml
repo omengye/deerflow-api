@@ -551,7 +551,14 @@ tools:
 
 guardrails:
   enabled: false
-  providers: []
+  fail_closed: true
+  # Example denylist for irreversible MCP operations. When enabled, the
+  # schema expects the singular `provider` key (not `providers`).
+  provider:
+    use: deerflow.guardrails.builtin:AllowlistProvider
+    config:
+      denied_tools:
+        - openviking_forget
 
 title:
   enabled: true

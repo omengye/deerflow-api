@@ -19,6 +19,7 @@ from langchain.tools import BaseTool
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 
+from deerflow.agents.date_context import append_current_date
 from deerflow.agents.thread_state import AgentContext, SandboxState, ThreadDataState, ThreadState
 from deerflow.models import aclose_chat_model, create_chat_model
 from deerflow.subagents.config import SubagentConfig
@@ -353,7 +354,7 @@ class SubagentExecutor:
             model=model,
             tools=self.tools,
             middleware=cast(Any, middlewares),
-            system_prompt=self.config.system_prompt,
+            system_prompt=append_current_date(self.config.system_prompt),
             state_schema=ThreadState,
             context_schema=AgentContext,
         )

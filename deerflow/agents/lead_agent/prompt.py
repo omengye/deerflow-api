@@ -2,9 +2,9 @@ import asyncio
 import html
 import logging
 import threading
-from datetime import datetime
 from functools import lru_cache
 
+from deerflow.agents.date_context import append_current_date
 from deerflow.config.agents_config import load_agent_soul
 from deerflow.skills import load_skills
 from deerflow.skills.types import Skill
@@ -758,6 +758,7 @@ def apply_prompt_template(
     available_skills: set[str] | None = None,
     available_tool_names: set[str] | None = None,
     system_prompt_overlay: str | None = None,
+    current_date: str | None = None,
 ) -> str:
     # Get memory context
     memory_context = _get_memory_context(agent_name)
@@ -864,4 +865,4 @@ def apply_prompt_template(
     overlay = (system_prompt_overlay or "").strip()
     if overlay:
         prompt += f"\n\n{overlay}"
-    return prompt + f"\n<current_date>{datetime.now().strftime('%Y-%m-%d, %A')}</current_date>"
+    return append_current_date(prompt, current_date)

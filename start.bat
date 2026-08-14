@@ -2,14 +2,14 @@
 REM Start DeerFlow API service
 cd /d "%~dp0"
 
-REM Install dependencies (if not already installed)
-if not exist ".venv" (
-    echo Installing dependencies with uv...
-    uv sync
-)
+REM Reconcile the environment on every start. uv.lock is authoritative;
+REM --inexact preserves explicitly installed optional/operational packages.
+echo Verifying dependencies from uv.lock...
+uv sync --frozen --inexact
+if errorlevel 1 exit /b %errorlevel%
 
 REM Install readabilipy's Readability.js dependencies (Node.js-based extraction)
-for /f "delims=" %%d in ('uv run python -c "import readabilipy.simple_json as m, os; print(os.path.join(os.path.dirname(m.__file__), 'javascript'))" 2^>nul') do set READABILIPY_JSDIR=%%d
+for /f "delims=" %%d in ('uv run --no-sync python -c "import readabilipy.simple_json as m, os; print(os.path.join(os.path.dirname(m.__file__), 'javascript'))" 2^>nul') do set READABILIPY_JSDIR=%%d
 if defined READABILIPY_JSDIR (
     if not exist "%READABILIPY_JSDIR%\node_modules" (
         where npm >nul 2>&1
@@ -39,16 +39,16 @@ REM Start uvicorn
 if defined HOST (
     set APP_HOST=%HOST%
 ) else (
-    for /f "delims=" %%h in ('uv run python scripts\read_api_config.py host 127.0.0.1 2^>nul') do set APP_HOST=%%h
+    for /f "delims=" %%h in ('uv run --no-sync python scripts\read_api_config.py host 127.0.0.1 2^>nul') do set APP_HOST=%%h
 )
 if not defined APP_HOST set APP_HOST=127.0.0.1
 
 if defined PORT (
     set APP_PORT=%PORT%
 ) else (
-    for /f "delims=" %%p in ('uv run python scripts\read_api_config.py port 8000 2^>nul') do set APP_PORT=%%p
+    for /f "delims=" %%p in ('uv run --no-sync python scripts\read_api_config.py port 8000 2^>nul') do set APP_PORT=%%p
 )
 if not defined APP_PORT set APP_PORT=8000
 
 echo Starting DeerFlow API on http://%APP_HOST%:%APP_PORT%
-uv run uvicorn app:app --host %APP_HOST% --port %APP_PORT%
+uv run --no-sync uvicorn app:app --host %APP_HOST% --port %APP_PORT%

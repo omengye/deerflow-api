@@ -116,6 +116,12 @@ tracing:
 
 仍建议保留在环境变量中的只有进程级或系统级凭据/变量，例如 `CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`、`ANTHROPIC_AUTH_TOKEN`、`HOME`、`SystemRoot` 等。
 
+### OpenViking MCP 工具
+
+本项目现有的通用 HTTP MCP 客户端可直接连接 OpenViking 官方的 `/mcp` 端点。可从 [extensions_config.example.json](extensions_config.example.json) 复制禁用状态的示例到 `extensions_config.json`，设置 `OPENVIKING_API_KEY` 后再显式启用。请使用绑定普通用户的 USER API Key，不要使用 root/admin key，也不要额外传递账户或用户身份头；工具名默认会加上 `openviking_` 前缀。
+
+OpenViking 原生 `forget` 工具会永久删除 `viking://` 资源，且本项目不会自动要求二次确认。示例 [config.example.yaml](config.example.yaml) 已用 guardrail denylist 默认阻止 `openviking_forget`；只有在调用方实现明确的用户确认后，才应移除该限制。修改环境变量后需要重启服务或重新保存扩展配置，才能刷新已经初始化的 MCP 工具。
+
 ## Checkpoint 与长期记忆
 
 本分支已同步字节 DeerFlow 近期的 checkpoint / memory 优化思路：checkpoint 支持 `full`、`delta` 双模式和可配置快照频率；delta 历史可使用进程内 LRU 或 Redis 缓存。模式与快照频率都是进程级冻结配置，修改后必须重启所有共享同一 checkpoint 数据库的进程。`full -> delta` 可直接读取；`delta -> full` 会 fail-closed，避免把 delta sentinel 误当成空状态。

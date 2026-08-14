@@ -8,6 +8,9 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn>=0.34.0",
     "sse-starlette>=2.1.0",
+    # Auth classification imports Starlette's router path projection directly;
+    # keep upgrades visible because this is a security boundary.
+    "starlette>=1.3.1,<2",
     "python-multipart>=0.0.26",
     "pydantic>=2.0.0",
     "redis>=5.0.0",

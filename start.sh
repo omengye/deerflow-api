@@ -28,7 +28,7 @@ echo "📦 Verifying dependencies from uv.lock..."
 uv sync --frozen --inexact
 
 # Install readabilipy's Readability.js dependencies (Node.js-based extraction)
-READABILIPY_JSDIR="$(uv run python -c "import readabilipy.simple_json as m, os; print(os.path.join(os.path.dirname(m.__file__), 'javascript'))" 2>/dev/null)"
+READABILIPY_JSDIR="$(uv run --no-sync python -c "import readabilipy.simple_json as m, os; print(os.path.join(os.path.dirname(m.__file__), 'javascript'))" 2>/dev/null)"
 if [ -n "$READABILIPY_JSDIR" ] && [ ! -d "$READABILIPY_JSDIR/node_modules" ]; then
     if command -v npm &>/dev/null; then
         echo "📦 Installing Readability.js dependencies..."
@@ -50,7 +50,7 @@ fi
 read_config_value() {
     local key="$1"
     local fallback="$2"
-    uv run python - "$key" "$fallback" <<'PY'
+    uv run --no-sync python - "$key" "$fallback" <<'PY'
 import sys
 import yaml
 
@@ -72,6 +72,6 @@ APP_PORT="$(read_config_value port "${PORT:-8000}")"
 
 # Start uvicorn
 echo "🦌 Starting DeerFlow API on http://${APP_HOST}:${APP_PORT}"
-exec uv run uvicorn app:app \
+exec uv run --no-sync uvicorn app:app \
     --host "${APP_HOST}" \
     --port "${APP_PORT}"

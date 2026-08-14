@@ -225,6 +225,45 @@ def test_executor_thinking_enabled_three_state_precedence(
     assert captured["thinking_enabled"] is expected
 
 
+def test_executor_injects_current_date_into_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import datetime
+
+    import deerflow.agents.date_context as date_context_module
+    import deerflow.agents.middlewares.finish_reason_middleware as finish_reason_module
+    import deerflow.agents.middlewares.loop_detection_middleware as loop_detection_module
+    import deerflow.agents.middlewares.tool_error_handling_middleware as tool_error_module
+
+    class _FrozenDateTime:
+        @classmethod
+        def now(cls) -> datetime:
+            return datetime(2042, 3, 4)
+
+    captured: dict = {}
+
+    def _capture_agent(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(date_context_module, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(executor_module, "create_chat_model", lambda **_kwargs: object())
+    monkeypatch.setattr(executor_module, "create_agent", _capture_agent)
+    monkeypatch.setattr(tool_error_module, "build_subagent_runtime_middlewares", lambda **_kwargs: [])
+    monkeypatch.setattr(loop_detection_module, "LoopDetectionMiddleware", lambda **_kwargs: object())
+    monkeypatch.setattr(loop_detection_module, "count_steps_per_turn", lambda _middlewares: 1)
+    monkeypatch.setattr(loop_detection_module, "calibrate_loop_detection", lambda *_args: None)
+    monkeypatch.setattr(finish_reason_module, "build_finish_reason_middlewares", lambda: [])
+
+    executor = SubagentExecutor(
+        config=SubagentConfig(name="general-purpose", description="d", system_prompt="subagent prompt"),
+        tools=[],
+    )
+    executor._create_agent()
+
+    assert captured["system_prompt"] == (
+        "subagent prompt\n<current_date>2042-03-04, Tuesday</current_date>"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 6. Factory: unsupported thinking_enabled warns + degrades instead of raising
 # ---------------------------------------------------------------------------
