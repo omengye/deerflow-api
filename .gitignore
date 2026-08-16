@@ -9,6 +9,9 @@ build/
 dist/
 site/
 bridge/target/
+desktop/target/
+.deerflow-config/
+.build-cache/
 .eggs/
 *.egg-info/
 pip-wheel-metadata/

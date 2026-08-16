@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -13,6 +14,22 @@ ENDPOINT_FILENAME = "endpoint.json"
 LOCK_FILENAME = "daemon.lock"
 
 
+def _portable_root() -> Path | None:
+    """Return the ZIP product root when running from bundled Python."""
+
+    executable = Path(sys.executable).resolve()
+    candidates = [executable.parent]
+    if executable.parent.name.lower() in {"runtime", "bin"}:
+        candidates.append(executable.parent.parent)
+    for root in candidates:
+        if (
+            (root / "resources" / "default-config.yaml").is_file()
+            or (root / "user-data" / "config" / "config.yaml").is_file()
+        ):
+            return root
+    return None
+
+
 def get_runtime_dir(override: str | Path | None = None) -> Path:
     """Return the per-user directory used to discover the local ACP daemon."""
 
@@ -20,6 +37,8 @@ def get_runtime_dir(override: str | Path | None = None) -> Path:
         path = Path(override).expanduser()
     elif configured := os.getenv(RUNTIME_DIR_ENV):
         path = Path(configured).expanduser()
+    elif portable_root := _portable_root():
+        path = portable_root / "user-data" / "runtime" / "acp"
     elif local_app_data := os.getenv("LOCALAPPDATA"):
         path = Path(local_app_data) / "DeerFlow" / "acp"
     elif xdg_runtime := os.getenv("XDG_RUNTIME_DIR"):

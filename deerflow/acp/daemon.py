@@ -12,7 +12,7 @@ import os
 import secrets
 import signal
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -31,6 +31,7 @@ from .daemon_endpoint import (
     ensure_runtime_dir,
     get_runtime_dir,
 )
+from .proposal_control import handle_proposal_management_request
 from .runtime import LocalACPRuntime
 from .session_store import LocalACPSessionStore
 
@@ -40,6 +41,8 @@ _HANDSHAKE_LIMIT = 4096
 _HANDSHAKE_TIMEOUT_SECONDS = 3.0
 _WRITER_CLOSE_TIMEOUT_SECONDS = 1.0
 _ACTIVE_TASK_CLOSE_TIMEOUT_SECONDS = 3.0
+_MANAGEMENT_REQUEST_LIMIT = 64 * 1024
+_MANAGEMENT_REQUEST_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass(slots=True)
@@ -101,6 +104,9 @@ class ACPDaemon:
         runtime_dir: Path,
         *,
         agent_factory: Callable[..., DeerFlowACPAgent] = DeerFlowACPAgent,
+        management_handler: Callable[
+            [dict[str, Any]], Awaitable[dict[str, Any]]
+        ] = handle_proposal_management_request,
         token: str | None = None,
     ) -> None:
         self.config = config
@@ -110,10 +116,12 @@ class ACPDaemon:
         self.endpoint_path = self.runtime_dir / ENDPOINT_FILENAME
         self.token = token or secrets.token_urlsafe(32)
         self.agent_factory = agent_factory
+        self.management_handler = management_handler
         self.endpoint: DaemonEndpoint | None = None
         self._server: asyncio.Server | None = None
         self._state_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
+        self._management_lock = asyncio.Lock()
         self._handlers: dict[asyncio.Task[Any], asyncio.StreamWriter] = {}
         self._connections: dict[str, _ACPConnectionState] = {}
         self._next_connection_id = 0
@@ -231,11 +239,47 @@ class ACPDaemon:
             return None
         if version != _HANDSHAKE_VERSION or not hmac.compare_digest(token, self.token):
             return None
-        return command.upper(), token
+        command_parts = command.split()
+        if len(command_parts) != 1:
+            return None
+        return command_parts[0].upper(), token
 
     async def _reply(self, writer: asyncio.StreamWriter, value: str) -> None:
         writer.write(value.encode("utf-8") + b"\n")
         await writer.drain()
+
+    async def _handle_management_request(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await self._reply(writer, "OK")
+        try:
+            raw = await asyncio.wait_for(
+                reader.readline(), timeout=_MANAGEMENT_REQUEST_TIMEOUT_SECONDS
+            )
+            if not raw:
+                raise ValueError("Management request is empty.")
+            if len(raw) > _MANAGEMENT_REQUEST_LIMIT or not raw.endswith(b"\n"):
+                raise ValueError("Management request exceeds the 64 KiB limit.")
+            request = json.loads(raw)
+            if not isinstance(request, dict):
+                raise ValueError("Management request must be a JSON object.")
+            async with self._management_lock:
+                response = await self.management_handler(request)
+            if not isinstance(response, dict):
+                raise TypeError("Management handler returned an invalid response.")
+        except ValueError as exc:
+            response = {
+                "ok": False,
+                "error": str(exc),
+                "code": "invalid_request",
+            }
+        except Exception as exc:
+            logger.exception("ACP management request failed")
+            response = {"ok": False, "error": str(exc), "code": "internal_error"}
+        await self._reply(
+            writer,
+            json.dumps(response, ensure_ascii=False, separators=(",", ":")),
+        )
 
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -271,6 +315,9 @@ class ACPDaemon:
             if command == "STOP":
                 await self._reply(writer, "OK")
                 self.request_stop()
+                return
+            if command == "MANAGE":
+                await self._handle_management_request(reader, writer)
                 return
             if command != "ACP":
                 await self._reply(writer, "ERROR unsupported-command")

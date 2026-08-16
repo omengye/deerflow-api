@@ -1,0 +1,123 @@
+config_version: 14
+log_level: info
+
+api:
+  model_name: null
+  thinking_enabled: true
+  plan_mode: true
+  data_dir: ../data
+  deerflow_home: ../data/deerflow
+  extensions_config_path: ./extensions_config.json
+
+local_acp:
+  checkpointer_path: ../data/acp-checkpoints.db
+  session_store_path: ../data/acp-sessions.db
+  max_active_connections: 16
+  max_active_runs: 2
+  run_timeout_seconds: 600
+  session_page_size: 50
+  model_name: null
+  thinking_enabled: true
+  plan_mode: true
+  subagent_enabled: false
+  max_concurrent_subagents: 2
+  permission_mode: dangerous
+  memory_scope: workspace
+  agent_name: null
+  enable_bash: false
+  tool_allowlist: null
+  tool_denylist: []
+  accept_client_mcp_servers: false
+  closed_session_retention_days: 30
+  recursion_limit: 200
+
+models:
+  - name: openai
+    display_name: OpenAI
+    use: langchain_openai:ChatOpenAI
+    model: gpt-4.1-mini
+    api_key: ${OPENAI_API_KEY:-not-configured}
+    base_url: https://api.openai.com/v1
+    supports_thinking: false
+    supports_reasoning_effort: false
+    supports_vision: true
+
+default_model: openai
+
+subagents:
+  enabled: true
+  timeout_seconds: 900
+  max_turns: null
+  agents: {}
+  custom_agents: {}
+
+sandbox:
+  use: deerflow.sandbox.local:LocalSandboxProvider
+  allow_host_bash: false
+  allow_host_tools: false
+
+skills:
+  enabled: true
+  path: ../skills
+  extensions_file: ./extensions_config.json
+  container_path: /mnt/skills
+
+skill_evolution:
+  enabled: false
+  mode: review
+  storage_path: skill-evolution
+  generation_model_name: null
+  moderation_model_name: null
+  evaluation_model_name: null
+  security_fail_closed: true
+  discovery:
+    enabled: false
+    min_tool_calls: 5
+    repeat_threshold: 2
+    repeat_window_days: 30
+    cooldown_hours: 24
+    max_daily_proposals: 5
+    max_pending_proposals: 20
+  candidate_limits:
+    max_files: 20
+    max_total_bytes: 524288
+    max_file_bytes: 131072
+  auto_patch:
+    max_changed_lines: 40
+    allow_create: false
+    allow_support_files: false
+    allow_scripts: false
+    allow_delete: false
+  monitoring:
+    probation_uses: 3
+    auto_rollback_consecutive_failures: 2
+
+tool_groups:
+  - name: file:read
+  - name: file:write
+  - name: bash
+
+tools:
+  - name: ls
+    group: file:read
+    use: deerflow.sandbox.tools:ls_tool
+  - name: read_file
+    group: file:read
+    use: deerflow.sandbox.tools:read_file_tool
+  - name: glob
+    group: file:read
+    use: deerflow.sandbox.tools:glob_tool
+    max_results: 200
+  - name: grep
+    group: file:read
+    use: deerflow.sandbox.tools:grep_tool
+    max_results: 100
+  - name: write_file
+    group: file:write
+    use: deerflow.sandbox.tools:write_file_tool
+  - name: str_replace
+    group: file:write
+    use: deerflow.sandbox.tools:str_replace_tool
+  - name: bash
+    group: bash
+    use: deerflow.sandbox.tools:bash_tool

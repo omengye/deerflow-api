@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from deerflow.acp.config import LocalACPConfig
+from deerflow.acp import daemon_endpoint
 from deerflow.acp.daemon import ACPDaemon
 from deerflow.acp.daemon_endpoint import (
     DaemonAlreadyRunning,
@@ -47,6 +48,18 @@ async def connect(
     return reader, writer, response
 
 
+async def manage(endpoint: DaemonEndpoint, request: Any) -> dict[str, Any]:
+    reader, writer, response = await connect(endpoint, "MANAGE")
+    assert response == "OK"
+    writer.write(json.dumps(request).encode() + b"\n")
+    await writer.drain()
+    payload = json.loads(await reader.readline())
+    assert await reader.read() == b""
+    writer.close()
+    await writer.wait_closed()
+    return payload
+
+
 def test_endpoint_roundtrip_runtime_override_and_single_instance_lock(
     tmp_path: Path,
 ) -> None:
@@ -75,6 +88,14 @@ def test_endpoint_roundtrip_runtime_override_and_single_instance_lock(
         first.release()
     second.acquire()
     second.release()
+
+
+def test_runtime_dir_uses_portable_product_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DEER_FLOW_ACP_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(daemon_endpoint, "_portable_root", lambda: tmp_path)
+    assert get_runtime_dir() == (tmp_path / "user-data" / "runtime" / "acp").resolve()
 
 
 @pytest.mark.asyncio
@@ -228,6 +249,50 @@ async def test_daemon_rejects_bad_token(tmp_path: Path) -> None:
     assert await reader.readline() == b"UNAUTHORIZED\n"
     writer.close()
     await writer.wait_closed()
+    await daemon.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_daemon_management_json_roundtrip_and_invalid_request(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def handler(request: dict[str, Any]) -> dict[str, Any]:
+        calls.append(request)
+        return {"ok": True, "data": {"echo": request}}
+
+    config = make_config(tmp_path)
+    store = LocalACPSessionStore(config.session_store_path)
+    store.setup()
+    daemon = ACPDaemon(
+        config,
+        store,
+        FakeRuntime(),
+        tmp_path / "runtime",
+        token="test-token",
+        management_handler=handler,
+    )  # type: ignore[arg-type]
+    endpoint = await daemon.start()
+
+    request = {"operation": "proposal.list", "status": "pending_review"}
+    assert await manage(endpoint, request) == {
+        "ok": True,
+        "data": {"echo": request},
+    }
+    assert calls == [request]
+
+    reader, writer, response = await connect(endpoint, "MANAGE")
+    assert response == "OK"
+    writer.write(b"not-json\n")
+    await writer.drain()
+    invalid = json.loads(await reader.readline())
+    assert invalid["ok"] is False
+    assert invalid["code"] == "invalid_request"
+    writer.close()
+    await writer.wait_closed()
+
     await daemon.close()
     store.close()
 

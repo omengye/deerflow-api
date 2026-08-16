@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -38,8 +39,13 @@ class SkillsConfig(BaseModel):
             # Use configured path (can be absolute or relative)
             path = Path(configured_path)
             if not path.is_absolute():
-                # If relative, resolve from the API project root for deterministic behavior.
-                path = find_project_root(Path(__file__)) / path
+                # A portable config lives outside the installed Python package.
+                # Resolve its relative Skill path beside that config so moving
+                # the extracted ZIP does not leave stale absolute paths behind.
+                if config_path := os.getenv("DEER_FLOW_CONFIG_PATH"):
+                    path = Path(config_path).expanduser().resolve().parent / path
+                else:
+                    path = find_project_root(Path(__file__)) / path
             return path.resolve()
         else:
             # Default: ../skills relative to backend directory

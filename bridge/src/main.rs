@@ -20,6 +20,9 @@ const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const FORCED_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+const MANAGEMENT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const MANAGEMENT_REQUEST_LIMIT: usize = 64 * 1024;
+const MANAGEMENT_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 type Result<T> = std::result::Result<T, AnyError>;
@@ -40,6 +43,7 @@ enum Mode {
     Status,
     Start,
     Stop,
+    Manage,
     Gateway,
     Remote,
 }
@@ -87,6 +91,7 @@ fn print_help() {
 Usage:\n  deerflow-acp [--config PATH] [--python PATH] [--daemon PATH] [--no-auto-start]\n  \
 deerflow-acp --status [--config PATH]\n  deerflow-acp --start-daemon [--config PATH]\n  \
 deerflow-acp --stop-daemon [--config PATH]\n  \
+deerflow-acp --manage [--config PATH]\n  \
 deerflow-acp --gateway --workspace PATH [--listen ADDR] [--config PATH]\n  \
 deerflow-acp --remote URL [--token-env NAME]\n\n\
 Options:\n  --config PATH       DeerFlow config.yaml used when starting the daemon\n  \
@@ -94,6 +99,7 @@ Options:\n  --config PATH       DeerFlow config.yaml used when starting the daem
 --daemon PATH       Explicit deerflow-acpd executable\n  --runtime-dir PATH  Override daemon endpoint directory\n  \
 --no-auto-start      Fail instead of starting a missing daemon\n  --status             Check daemon status\n  \
 --start-daemon       Start the daemon without entering ACP proxy mode\n  --stop-daemon        Stop the daemon\n  \
+--manage             Send one JSON management request from stdin\n  \
 --gateway           Expose the local daemon through ACP HTTP + SSE\n  \
 --listen ADDR       Gateway listen address (default 127.0.0.1:8787)\n  \
 --workspace PATH    Fixed local workspace used by remote ACP sessions\n  \
@@ -144,6 +150,7 @@ fn parse_cli() -> Result<Cli> {
             "--status" => set_mode(&mut mode, Mode::Status)?,
             "--start-daemon" => set_mode(&mut mode, Mode::Start)?,
             "--stop-daemon" => set_mode(&mut mode, Mode::Stop)?,
+            "--manage" => set_mode(&mut mode, Mode::Manage)?,
             "--gateway" => set_mode(&mut mode, Mode::Gateway)?,
             "--listen" => {
                 gateway_listen = args
@@ -208,10 +215,40 @@ fn parse_cli() -> Result<Cli> {
 
 fn set_mode(current: &mut Mode, requested: Mode) -> Result<()> {
     if *current != Mode::Proxy {
-        return Err("only one of --status, --start-daemon, and --stop-daemon may be used".into());
+        return Err("only one bridge mode may be selected".into());
     }
     *current = requested;
     Ok(())
+}
+
+fn portable_root() -> Option<PathBuf> {
+    let executable = env::current_exe().ok()?;
+    portable_root_for(&executable)
+}
+
+fn portable_root_for(executable: &Path) -> Option<PathBuf> {
+    let root = executable.parent()?;
+    let bundled_python = if cfg!(windows) {
+        root.join("runtime").join("python.exe")
+    } else {
+        root.join("runtime").join("bin").join("python3")
+    };
+    let portable_marker = bundled_python.is_file()
+        || root.join("resources").join("default-config.yaml").is_file()
+        || root
+            .join("user-data")
+            .join("config")
+            .join("config.yaml")
+            .is_file();
+    portable_marker.then(|| root.to_path_buf())
+}
+
+fn portable_config_path() -> Option<PathBuf> {
+    let path = portable_root()?
+        .join("user-data")
+        .join("config")
+        .join("config.yaml");
+    path.is_file().then_some(path)
 }
 
 fn runtime_dir(override_path: Option<&Path>) -> Result<PathBuf> {
@@ -220,6 +257,9 @@ fn runtime_dir(override_path: Option<&Path>) -> Result<PathBuf> {
     }
     if let Some(value) = env::var_os("DEER_FLOW_ACP_RUNTIME_DIR") {
         return absolute_path(Path::new(&value));
+    }
+    if let Some(root) = portable_root() {
+        return Ok(root.join("user-data").join("runtime").join("acp"));
     }
     if let Some(value) = env::var_os("LOCALAPPDATA") {
         return Ok(PathBuf::from(value).join("DeerFlow").join("acp"));
@@ -724,8 +764,62 @@ fn proxy(mut stream: TcpStream) -> Result<()> {
     Ok(())
 }
 
+fn management_request(endpoint: &Endpoint, request: &[u8]) -> Result<String> {
+    if request.is_empty() {
+        return Err("management request is empty".into());
+    }
+    if request.len() > MANAGEMENT_REQUEST_LIMIT {
+        return Err("management request exceeds the 64 KiB limit".into());
+    }
+    let value: serde_json::Value = serde_json::from_slice(request)
+        .map_err(|error| format!("invalid management request JSON: {error}"))?;
+    if !value.is_object() {
+        return Err("management request must be a JSON object".into());
+    }
+
+    let (mut stream, _) = connect_command(endpoint, "MANAGE")
+        .map_err(|error| format!("failed to connect to DeerFlow ACP daemon: {error}"))?;
+    stream.set_read_timeout(Some(MANAGEMENT_TIMEOUT))?;
+    stream.set_write_timeout(Some(MANAGEMENT_TIMEOUT))?;
+    stream.write_all(request)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let response = read_line(&mut stream, MANAGEMENT_RESPONSE_LIMIT)?;
+    if response.is_empty() {
+        return Err("daemon returned an empty management response".into());
+    }
+    serde_json::from_str::<serde_json::Value>(&response)
+        .map_err(|error| format!("daemon returned invalid management JSON: {error}"))?;
+    Ok(response)
+}
+
+fn manage(cli: &Cli, path: &Path) -> Result<()> {
+    let mut request = Vec::new();
+    io::stdin()
+        .lock()
+        .take((MANAGEMENT_REQUEST_LIMIT + 1) as u64)
+        .read_to_end(&mut request)?;
+    if request.len() > MANAGEMENT_REQUEST_LIMIT {
+        return Err("management request exceeds the 64 KiB limit".into());
+    }
+    while request
+        .last()
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        request.pop();
+    }
+
+    let endpoint = load_endpoint(path).map_err(|_| "DeerFlow ACP daemon is not running")?;
+    validate_config(&endpoint, cli.config.as_deref())?;
+    println!("{}", management_request(&endpoint, &request)?);
+    Ok(())
+}
+
 async fn run() -> Result<()> {
     let mut cli = parse_cli()?;
+    if cli.config.is_none() {
+        cli.config = portable_config_path();
+    }
     if let Some(config) = &cli.config
         && !config.is_file()
     {
@@ -746,7 +840,7 @@ async fn run() -> Result<()> {
                 .ok_or("--remote requires an ACP endpoint URL")?;
             remote::run(url, &cli.token_env).await
         }
-        Mode::Proxy | Mode::Status | Mode::Start | Mode::Stop | Mode::Gateway => {
+        Mode::Proxy | Mode::Status | Mode::Start | Mode::Stop | Mode::Manage | Mode::Gateway => {
             let runtime_dir = runtime_dir(cli.runtime_dir.as_deref())?;
             let path = endpoint_path(&runtime_dir);
             run_local_mode(&cli, &path).await
@@ -802,6 +896,7 @@ async fn run_local_mode(cli: &Cli, path: &Path) -> Result<()> {
             println!("stopped");
             Ok(())
         }
+        Mode::Manage => manage(cli, path),
         Mode::Gateway => {
             ensure_running(cli, path)?;
             let workspace = cli
@@ -845,6 +940,57 @@ mod process_tests {
     #[test]
     fn current_process_is_not_reported_as_exited() {
         assert!(!wait_for_process_exit(std::process::id(), Duration::ZERO).unwrap());
+    }
+
+    #[test]
+    fn portable_layout_uses_executable_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        fs::create_dir_all(root.join("resources")).unwrap();
+        fs::write(
+            root.join("resources").join("default-config.yaml"),
+            b"models: []\n",
+        )
+        .unwrap();
+        assert_eq!(
+            portable_root_for(&root.join("deerflow-acp.exe")),
+            Some(root.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn management_request_roundtrips_json_and_large_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let handshake = read_line(&mut stream, 4096).unwrap();
+            assert_eq!(handshake, "DFACP/1 secret MANAGE");
+            stream.write_all(b"OK\n").unwrap();
+            let request = read_line(&mut stream, MANAGEMENT_REQUEST_LIMIT).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap(),
+                serde_json::json!({"operation": "proposal.list"})
+            );
+            let response = serde_json::json!({
+                "ok": true,
+                "data": {"diff": "x".repeat(128 * 1024)},
+            });
+            writeln!(stream, "{response}").unwrap();
+        });
+        let endpoint = Endpoint {
+            host: address.ip().to_string(),
+            port: address.port(),
+            token: "secret".into(),
+            pid: 1,
+            build_id: "test".into(),
+            config_path: "config.yaml".into(),
+        };
+
+        let response = management_request(&endpoint, br#"{"operation":"proposal.list"}"#).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["data"]["diff"].as_str().unwrap().len(), 128 * 1024);
+        server.join().unwrap();
     }
 }
 
