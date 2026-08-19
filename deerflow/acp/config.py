@@ -13,15 +13,74 @@ from dotenv import load_dotenv
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# Files whose presence identifies a portable distribution root. Stored as a
+# tuple of path segments so it can be joined onto candidate roots with /.
+_PORTABLE_MARKER = ("resources", "default-config.yaml")
+
+
+def _portable_root() -> Path | None:
+    """Locate the portable distribution root for this installation.
+
+    Resolution order:
+    1. ``DEER_FLOW_PORTABLE_ROOT`` environment variable (set by wrappers).
+    2. Layout probe: when this module lives under a ``site-packages``
+       directory (portable runtime), walk upward looking for the
+       ``resources/default-config.yaml`` marker that identifies the root.
+    Returns None for source/editable installs, where the project root's
+       ``config.yaml`` remains the correct fallback.
+    """
+    marker_path = Path(*_PORTABLE_MARKER)
+    raw = os.getenv("DEER_FLOW_PORTABLE_ROOT")
+    if raw:
+        root = Path(raw).expanduser().resolve()
+        if (root / marker_path).is_file():
+            return root
+        return None
+    module_path = Path(__file__).resolve()
+    for parent in module_path.parents:
+        if parent.name != "site-packages":
+            continue
+        for ancestor in parent.parents:
+            if (ancestor / marker_path).is_file():
+                return ancestor
+        break
+    return None
+
+
+def _portable_config_path(root: Path) -> Path:
+    """Resolve (and seed on first run) the user config inside a portable root."""
+    config_dir = root / "user-data" / "config"
+    config_path = config_dir / "config.yaml"
+    if config_path.is_file():
+        return config_path
+    template = root / Path(*_PORTABLE_MARKER)
+    if template.is_file():
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path.write_bytes(template.read_bytes())
+    return config_path
+
 
 def _resolve_config_path(config_path: str | None) -> Path:
     """Resolve config without consulting the ACP client's process cwd."""
 
     raw = config_path or os.getenv("DEER_FLOW_CONFIG_PATH")
-    path = Path(raw).expanduser() if raw else _PROJECT_ROOT / "config.yaml"
-    if not path.is_absolute():
-        path = _PROJECT_ROOT / path
-    path = path.resolve()
+    if raw:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = _PROJECT_ROOT / path
+        path = path.resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"DeerFlow configuration file not found: {path}")
+        return path
+    root = _portable_root()
+    if root is not None:
+        path = _portable_config_path(root)
+        if path.is_file():
+            return path
+        raise FileNotFoundError(
+            f"DeerFlow configuration file not found: {path} (portable root: {root})"
+        )
+    path = _PROJECT_ROOT / "config.yaml"
     if not path.exists():
         raise FileNotFoundError(f"DeerFlow configuration file not found: {path}")
     return path

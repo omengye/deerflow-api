@@ -25,6 +25,10 @@ from langchain.agents.middleware.types import ModelCallResult, ModelRequest, Mod
 from langchain_core.messages import HumanMessage
 from langgraph.runtime import Runtime
 
+from deerflow.agents.image_inputs import (
+    INPUT_IMAGES_KEY,
+    normalize_input_image_metadata,
+)
 from deerflow.config.paths import Paths, get_paths
 from deerflow.utils.file_conversion import CONVERTIBLE_EXTENSIONS, extract_outline
 
@@ -366,6 +370,13 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
 
         new_files = self._files_from_kwargs(last_message, uploads_dir) or []
         new_filenames = {f["filename"] for f in new_files}
+        direct_image_filenames = {
+            Path(str(image["virtual_path"])).name
+            for image in normalize_input_image_metadata(
+                (last_message.additional_kwargs or {}).get(INPUT_IMAGES_KEY)
+            )
+        }
+        current_filenames = new_filenames | direct_image_filenames
 
         historical_names: list[str] = []
         if uploads_dir and uploads_dir.is_dir():
@@ -374,7 +385,8 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
             historical_names = sorted(
                 p.name
                 for p in entries
-                if p.name not in new_filenames and not _is_conversion_artifact(p, names)
+                if p.name not in current_filenames
+                and not _is_conversion_artifact(p, names)
             )
 
         if uploads_dir:

@@ -1159,6 +1159,58 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(streaming_tool_calls), 1, "Bug: historical AI tool calls re-emitted")
         self.assertEqual(len(streaming_tool_results), 1, "Bug: historical tool results re-emitted")
 
+    async def test_last_lead_usage_tracks_top_level_only(self) -> None:
+        """Context-window telemetry must ignore subagent (namespaced) model calls."""
+        from langchain_core.messages import AIMessage
+
+        client_module = _reload_module("deerflow.client")
+        DeerFlowClient = client_module.DeerFlowClient
+        _StreamProcessingState = client_module._StreamProcessingState
+
+        stream_state = _StreamProcessingState()
+
+        lead_chunk = AIMessageChunk(
+            content="",
+            id="lead-1",
+            usage_metadata={"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+        )
+        sub_chunk = AIMessageChunk(
+            content="",
+            id="sub-1",
+            usage_metadata={"input_tokens": 500, "output_tokens": 50, "total_tokens": 550},
+        )
+
+        # Top-level events carry an empty LangGraph namespace; subagent events
+        # arrive with a non-empty namespace tuple.
+        client = object.__new__(DeerFlowClient)
+        list(
+            client._events_from_stream_item(
+                ((), "messages", (lead_chunk, {})), stream_state
+            )
+        )
+        list(
+            client._events_from_stream_item(
+                (("task:sub-1",), "messages", (sub_chunk, {})), stream_state
+            )
+        )
+
+        self.assertEqual(
+            stream_state.last_lead_usage,
+            {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+        )
+
+    async def test_lead_usage_normalization_sums_input_and_output(self) -> None:
+        client_module = _reload_module("deerflow.client")
+        DeerFlowClient = client_module.DeerFlowClient
+
+        usage = DeerFlowClient._lead_usage_from_metadata(
+            {"input_tokens": 900, "output_tokens": 100, "total_tokens": 1000}
+        )
+        self.assertEqual(
+            usage,
+            {"input_tokens": 900, "output_tokens": 100, "total_tokens": 1000},
+        )
+
     async def test_client_manager_async_client_uses_async_checkpointer(self) -> None:
         manager = ClientManager()
         async_checkpointer = InMemorySaver()

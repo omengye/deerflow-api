@@ -52,3 +52,31 @@ def test_factory_adds_tracing_callback_to_existing_manager() -> None:
 
     assert model.callbacks is manager
     assert manager.handlers == [existing, tracing]
+
+
+def test_factory_excludes_context_window_from_model_kwargs() -> None:
+    class _CapturingChatModel:
+        def __init__(self, **kwargs) -> None:
+            self.init_kwargs = kwargs
+            self.callbacks = None
+
+    config = AppConfig(
+        sandbox=SandboxConfig(use="test"),
+        models=[
+            ModelConfig(
+                name="test-model-with-cw",
+                use="tests.fake:CapturingChatModel",
+                model="provider-model",
+                context_window=131072,
+            )
+        ],
+    )
+    with (
+        patch.object(factory_module, "get_app_config", return_value=config),
+        patch.object(factory_module, "resolve_class", return_value=_CapturingChatModel),
+        patch.object(factory_module, "build_tracing_callbacks", return_value=[]),
+    ):
+        model = factory_module.create_chat_model(name="test-model-with-cw")
+        assert "context_window" not in model.init_kwargs
+        assert model.init_kwargs.get("model") == "provider-model"
+

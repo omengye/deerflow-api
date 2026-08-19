@@ -9,6 +9,15 @@ from pathlib import Path
 
 def test_real_stdio_initialize_new_and_list(tmp_path: Path) -> None:
     project_root = Path(__file__).resolve().parents[1]
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config_path = config_dir / "config.yaml"
+    config_path.write_bytes(
+        (project_root / "resources" / "default-config.yaml").read_bytes()
+    )
+    (config_dir / "extensions_config.json").write_text(
+        json.dumps({"mcpServers": {}, "skills": {}}), encoding="utf-8"
+    )
     environment = os.environ.copy()
     environment["DEER_FLOW_ACP_CHECKPOINTER_PATH"] = str(tmp_path / "checkpoints.db")
     environment["DEER_FLOW_ACP_SESSION_STORE_PATH"] = str(tmp_path / "sessions.db")
@@ -16,7 +25,7 @@ def test_real_stdio_initialize_new_and_list(tmp_path: Path) -> None:
         [str(project_root), environment.get("PYTHONPATH", "")]
     ).rstrip(os.pathsep)
     process = subprocess.Popen(
-        [sys.executable, "-m", "deerflow.acp", "--config", str(project_root / "config.yaml")],
+        [sys.executable, "-m", "deerflow.acp", "--config", str(config_path)],
         # Simulate Zed launching the agent from an unrelated user workspace.
         cwd=tmp_path,
         env=environment,
@@ -37,7 +46,11 @@ def test_real_stdio_initialize_new_and_list(tmp_path: Path) -> None:
             + "\n"
         )
         process.stdin.flush()
-        return json.loads(process.stdout.readline())
+        response = process.stdout.readline()
+        if not response:
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            raise AssertionError(f"ACP stdio process exited before replying: {stderr}")
+        return json.loads(response)
 
     initialized = request(
         1,
@@ -45,6 +58,10 @@ def test_real_stdio_initialize_new_and_list(tmp_path: Path) -> None:
         {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "test", "version": "1"}},
     )
     assert initialized["result"]["protocolVersion"] == 1  # type: ignore[index]
+    assert (
+        initialized["result"]["agentCapabilities"]["promptCapabilities"]["image"]  # type: ignore[index]
+        is True
+    )
 
     created = request(
         2,

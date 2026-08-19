@@ -385,31 +385,6 @@ class ACPDaemon:
             await _close_writer(writer)
 
 
-async def _warm_wsl_sandbox() -> None:
-    from deerflow.config import get_app_config
-    from deerflow.sandbox.provider_paths import (
-        WSL_SANDBOX_PROVIDER_PATH,
-        normalize_sandbox_provider_path,
-    )
-
-    app_config = get_app_config()
-    if (
-        normalize_sandbox_provider_path(app_config.sandbox.use)
-        != WSL_SANDBOX_PROVIDER_PATH
-    ):
-        return
-    from deerflow.sandbox.sandbox_provider import get_sandbox_provider
-
-    provider = get_sandbox_provider()
-    sandbox_id = provider.acquire()
-    sandbox = provider.get(sandbox_id)
-    if sandbox is None:
-        raise RuntimeError("WSL sandbox warmup did not return a sandbox")
-    result = await asyncio.to_thread(sandbox.execute_command, "true")
-    if "Exit Code:" in result:
-        raise RuntimeError(f"WSL sandbox warmup failed: {result}")
-
-
 def _install_signal_handlers(daemon: ACPDaemon) -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -425,13 +400,13 @@ async def _run_daemon(
     runtime_dir: Path,
     *,
     warmup: bool,
-    warmup_sandbox: bool,
 ) -> None:
     config = LocalACPConfig.from_file(config_path)
     config.prepare_environment()
+    runtime = LocalACPRuntime(config)
+    runtime.validate_sandbox_provider()
     store = LocalACPSessionStore(config.session_store_path)
     store.setup()
-    runtime = LocalACPRuntime(config)
     daemon = ACPDaemon(config, store, runtime, runtime_dir)
     try:
         await runtime.open()
@@ -444,9 +419,6 @@ async def _run_daemon(
         if warmup:
             logger.info("Warming DeerFlow agent graph")
             await runtime.warmup()
-        if warmup_sandbox:
-            logger.info("Warming configured WSL sandbox")
-            await _warm_wsl_sandbox()
         await daemon.start()
         _install_signal_handlers(daemon)
         await daemon.wait()
@@ -492,11 +464,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-warmup", action="store_true", help="Skip agent graph warmup"
     )
-    parser.add_argument(
-        "--no-sandbox-warmup",
-        action="store_true",
-        help="Skip the harmless WSL startup probe",
-    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -521,10 +488,6 @@ def main() -> None:
                         not args.no_warmup
                         and _env_enabled("DEER_FLOW_ACP_DAEMON_WARMUP")
                     ),
-                    warmup_sandbox=(
-                        not args.no_sandbox_warmup
-                        and _env_enabled("DEER_FLOW_ACP_DAEMON_SANDBOX_WARMUP")
-                    ),
                 )
             )
     except DaemonAlreadyRunning as exc:
@@ -532,6 +495,13 @@ def main() -> None:
         raise SystemExit(2) from exc
     except KeyboardInterrupt:
         pass
+    except BaseException:
+        # Startup failures (bad config, missing keys, import errors) otherwise
+        # surface only on stderr, which the bridge redirects to NUL when it
+        # spawns the daemon -- leaving clients with an opaque timeout. Log the
+        # traceback to daemon.log so the failure is diagnosable.
+        logger.exception("ACP daemon failed to start")
+        raise
 
 
 if __name__ == "__main__":

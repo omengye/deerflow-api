@@ -36,6 +36,10 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 
 from deerflow.agents.date_context import get_current_date
+from deerflow.agents.image_inputs import (
+    INPUT_IMAGES_KEY,
+    normalize_input_image_metadata,
+)
 from deerflow.agents.lead_agent.agent import _build_middlewares
 from deerflow.agents.lead_agent.prompt import apply_prompt_template
 from deerflow.agents.middlewares.subagent_limit_middleware import clamp_subagent_limit
@@ -121,6 +125,10 @@ class _StreamProcessingState:
     cumulative_usage: dict[str, int] = field(
         default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     )
+    # usage_metadata of the LAST top-level (lead) model call. input_tokens of
+    # the most recent call approximates the current thread context occupancy;
+    # subagent calls (non-empty LangGraph namespaces) are excluded on purpose.
+    last_lead_usage: dict[str, int] | None = None
 
 
 class DeerFlowClient:
@@ -643,7 +651,17 @@ class DeerFlowClient:
                 "status": getattr(msg, "status", "success"),
             }
         if isinstance(msg, HumanMessage):
-            return {"type": "human", "content": msg.content, "id": getattr(msg, "id", None)}
+            serialized = {
+                "type": "human",
+                "content": msg.content,
+                "id": getattr(msg, "id", None),
+            }
+            input_images = normalize_input_image_metadata(
+                (msg.additional_kwargs or {}).get(INPUT_IMAGES_KEY)
+            )
+            if input_images:
+                serialized["input_images"] = input_images
+            return serialized
         if isinstance(msg, SystemMessage):
             return {"type": "system", "content": msg.content, "id": getattr(msg, "id", None)}
         return {"type": "unknown", "content": str(msg), "id": getattr(msg, "id", None)}
@@ -785,7 +803,16 @@ class DeerFlowClient:
         if self._agent is None:
             raise RuntimeError("Agent was not initialized")
 
-        state: dict[str, Any] = {"messages": [HumanMessage(content=message)]}
+        input_images = normalize_input_image_metadata(kwargs.get("input_images"))
+        additional_kwargs = {INPUT_IMAGES_KEY: input_images} if input_images else {}
+        state: dict[str, Any] = {
+            "messages": [
+                HumanMessage(
+                    content=message,
+                    additional_kwargs=additional_kwargs,
+                )
+            ]
+        }
         context = {
             "thread_id": thread_id,
             "loop_detection_scope_id": f"{thread_id}:{uuid.uuid4().hex}",
@@ -802,6 +829,61 @@ class DeerFlowClient:
         if kwargs.get("workspace_path") is not None:
             context["workspace_path"] = str(kwargs["workspace_path"])
         return config, state, context
+
+    @staticmethod
+    def _lead_usage_from_metadata(usage: Any) -> dict[str, int]:
+        """Normalize one usage_metadata snapshot into a lead-context usage dict.
+
+        LangChain's ``usage_metadata.input_tokens`` already includes cached
+        tokens (``input_token_details`` is a subset breakdown), so
+        ``input_tokens + output_tokens`` is the full prompt + completion size
+        of that model call — a good proxy for current thread context usage.
+        """
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        }
+
+    def _model_context_window(self) -> int | None:
+        """Resolve the configured context window for this client's model.
+
+        Mirrors make_lead_agent's resolution order (requested -> agent config ->
+        default) so the reported window matches the model actually in use.
+        Returns None when the model or its ``context_window`` is unconfigured;
+        callers must treat that as "do not report usage percentage".
+        """
+        try:
+            from deerflow.agents.lead_agent.agent import _resolve_model_name
+
+            agent_model = (
+                self._agent_config.model
+                if self._agent_config is not None and self._agent_config.model
+                else None
+            )
+            model_name = _resolve_model_name(self._model_name, agent_model)
+            model_config = self._app_config.get_model_config(model_name)
+            window = getattr(model_config, "context_window", None) if model_config else None
+            return int(window) if window else None
+        except Exception:
+            logger.debug("Failed to resolve model context window", exc_info=True)
+            return None
+
+    def _end_event(self, stream_state: "_StreamProcessingState") -> "StreamEvent":
+        """Build the terminal stream event with usage and context telemetry."""
+        data: dict[str, Any] = {"usage": stream_state.cumulative_usage}
+        # Context-window telemetry for the lead thread. ``last_usage`` is the
+        # final top-level model call's usage snapshot; ``context_window`` is
+        # resolved from the model config. Consumers (e.g. the ACP event
+        # mapper) report a usage percentage only when both are present.
+        if stream_state.last_lead_usage is not None:
+            data["last_usage"] = stream_state.last_lead_usage
+        context_window = self._model_context_window()
+        if context_window is not None:
+            data["context_window"] = context_window
+        return StreamEvent(type="end", data=data)
 
     @staticmethod
     def _account_usage(
@@ -836,13 +918,15 @@ class DeerFlowClient:
         """Convert one LangGraph stream item into DeerFlow stream events."""
         mode: str
         chunk: Any
+        is_top_level = True
         if isinstance(item, tuple) and len(item) == 3:
             # subgraphs=True: LangGraph yields (namespace_tuple, mode, chunk)
             # Namespace identifies which subgraph emitted the event; we strip it
             # so the rest of the handler treats subgraph events identically to
             # top-level events.  This is intentional — callers see a flat stream.
-            _, mode, chunk = item
+            namespace, mode, chunk = item
             mode = str(mode)
+            is_top_level = not namespace
         elif isinstance(item, tuple) and len(item) == 2:
             mode, chunk = item
             mode = str(mode)
@@ -866,6 +950,10 @@ class DeerFlowClient:
                 text = self._extract_text(msg_chunk.content)
                 reasoning = msg_chunk.additional_kwargs.get("reasoning_content")
                 counted_usage = self._account_usage(stream_state, msg_id, msg_chunk.usage_metadata)
+                if is_top_level and msg_chunk.usage_metadata:
+                    stream_state.last_lead_usage = self._lead_usage_from_metadata(
+                        msg_chunk.usage_metadata
+                    )
 
                 if text or reasoning:
                     if msg_id:
@@ -906,12 +994,20 @@ class DeerFlowClient:
             if msg_id and msg_id in stream_state.streamed_ids:
                 if isinstance(msg, AIMessage):
                     self._account_usage(stream_state, msg_id, getattr(msg, "usage_metadata", None))
+                    if is_top_level and msg.usage_metadata:
+                        stream_state.last_lead_usage = self._lead_usage_from_metadata(
+                            msg.usage_metadata
+                        )
                     if msg.tool_calls:
                         yield self._ai_tool_calls_event(msg_id, msg.tool_calls)
                 continue
 
             if isinstance(msg, AIMessage):
                 counted_usage = self._account_usage(stream_state, msg_id, msg.usage_metadata)
+                if is_top_level and msg.usage_metadata:
+                    stream_state.last_lead_usage = self._lead_usage_from_metadata(
+                        msg.usage_metadata
+                    )
                 reasoning = msg.additional_kwargs.get("reasoning_content")
 
                 if msg.tool_calls:
@@ -1227,7 +1323,7 @@ class DeerFlowClient:
                 )
                 yield self._recursion_limit_event()
 
-        yield StreamEvent(type="end", data={"usage": stream_state.cumulative_usage})
+        yield self._end_event(stream_state)
 
     async def astream(
         self,
@@ -1274,7 +1370,7 @@ class DeerFlowClient:
                 )
                 yield self._recursion_limit_event()
 
-        yield StreamEvent(type="end", data={"usage": stream_state.cumulative_usage})
+        yield self._end_event(stream_state)
 
     def chat(self, message: str, *, thread_id: str | None = None, **kwargs) -> str:
         """Send a message and return the final text response.
@@ -1333,6 +1429,7 @@ class DeerFlowClient:
                     "supports_thinking": getattr(model, "supports_thinking", False),
                     "supports_reasoning_effort": getattr(model, "supports_reasoning_effort", False),
                     "supports_vision": getattr(model, "supports_vision", False),
+                    "context_window": getattr(model, "context_window", None),
                 }
                 for model in self._app_config.models
             ],

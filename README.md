@@ -240,7 +240,7 @@ Zed 的 `settings.json` 可添加一个 custom agent server。Windows 示例（�
 
 ### daemon 生命周期
 
-Zed 第一次连接时会自动启动 daemon。若希望登录 Windows 后提前完成 graph 和 WSL2 预热，可把下面的 `--start-daemon` 命令放入当前用户的登录任务：
+Zed 第一次连接时会自动启动 daemon。若希望登录 Windows 后提前完成 graph 预热，可把下面的 `--start-daemon` 命令放入当前用户的登录任务：
 
 ```powershell
 # 启动、查看状态、重启和停止
@@ -268,7 +268,7 @@ Zed 第一次连接时会自动启动 daemon。若希望登录 Windows 后提前
 
 `--stop-daemon` 会先请求优雅关闭，并等待 endpoint 中记录的 daemon PID 真正退出；默认等待 10 秒，超时后会强制终止已通过 token 验证的旧进程。可用 `DEER_FLOW_ACP_DAEMON_STOP_TIMEOUT_MS` 调整优雅关闭等待时间。
 
-默认启动会预构建 agent graph，并在配置为 WSL Sandbox 时执行一次无副作用的 `true` 探针。排障时可分别设置 `DEER_FLOW_ACP_DAEMON_WARMUP=0`、`DEER_FLOW_ACP_DAEMON_SANDBOX_WARMUP=0`；调整启动等待时间可设置 `DEER_FLOW_ACP_DAEMON_START_TIMEOUT_MS`。
+默认启动会预构建 agent graph。便携 ACP 仅支持 `LocalSandboxProvider`；排障时可设置 `DEER_FLOW_ACP_DAEMON_WARMUP=0` 跳过 graph 预热，调整启动等待时间可设置 `DEER_FLOW_ACP_DAEMON_START_TIMEOUT_MS`。
 
 ### 直接 stdio 回退
 
@@ -292,8 +292,8 @@ uv run deerflow-acp
 - 工具面由同一份有效能力策略过滤。可用 `tool_allowlist` 设置硬白名单、用 `tool_denylist` 追加禁用项；外部 `invoke_acp_agent` 和持久化 scheduled-task 工具在本地 ACP 中始终不可用，避免提示词宣告并不存在或缺少后台服务的能力。
 - `permission_mode` 支持 `off`、`dangerous` 和 `all`。默认 `dangerous`：读取/本地搜索/思考类工具直接执行，编辑、删除、移动、命令、网络访问及未知类型工具先通过 ACP `requestPermission` 请求客户端批准；`allow always` / `reject always` 只在当前 session 和工具名范围内记忆。客户端没有权限处理器或连接已断开时，受保护工具默认拒绝。
 - 可用 `local_acp.subagent_enabled: true` 开启内部 DeerFlow subagent，并用 `max_concurrent_subagents` 限制并发。subagent 继承父 Agent 的工具组、Skill 白名单、ACP allow/deny 策略和 permission middleware，不允许递归委派；其 token usage 会计入 ACP 响应，父 turn 被取消时会向后台任务发送协作式取消信号。外部 ACP agent 仍不开放。
-- 工作区访问直接使用本机路径，不调用 ACP client 的文件系统或终端接口。默认不暴露 `bash`；受信任的本地客户端可设置 `local_acp.enable_bash: true`，或环境变量 `DEER_FLOW_ACP_ENABLE_BASH=1`，通过配置的 Sandbox 启用。Bash 可访问网络及 Sandbox 可见的文件系统；WSL 的 Windows 挂载盘不构成严格的项目隔离边界。
-- 该模式要求 `LocalSandboxProvider` 或 `LocalWslProvider`；AIO/Docker sandbox 不会静默回退到 DeerFlow 内部 workspace。
+- 工作区访问直接使用本机路径，不调用 ACP client 的文件系统或终端接口。默认不暴露 `bash`；受信任的本地客户端可设置 `local_acp.enable_bash: true`，或环境变量 `DEER_FLOW_ACP_ENABLE_BASH=1`，并同时显式开启 `sandbox.allow_host_bash`。Bash 会以当前用户权限在宿主机运行，因此 Local 模式不是操作系统级隔离边界。
+- 便携 ACP 仅支持 `LocalSandboxProvider`；WSL、AIO/Docker 和自定义 Provider 会在 daemon 启动时被拒绝，不会静默回退。
 - client MCP 默认拒绝。受信任的本地客户端可设置 `local_acp.accept_client_mcp_servers: true`，或环境变量 `DEER_FLOW_ACP_ACCEPT_CLIENT_MCP_SERVERS=1`，启用按会话隔离、仅驻留内存的 stdio、SSE 和 HTTP（Streamable HTTP）MCP。远程 MCP URL 和 Header 均由客户端提供；这些 session 临时工具不会自动下放给内部 subagent。该开关会增加外部命令、出站连接和工具面，并退出严格的“仅项目目录文件操作”边界，当前文件模式不应开启。
 - Memory 默认按规范化后的 workspace 隔离，也可通过 `memory_scope: global | workspace | session` 改为全局共享或每 session 独立；daemon/runtime 优雅关闭时会等待 Memory 更新队列 flush。
 - DeerFlow 的 uploads、outputs、ACP 外部 agent workspace 和会话状态仍保存在自己的线程目录中，不会混入客户端项目。

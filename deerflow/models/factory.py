@@ -111,6 +111,7 @@ def create_chat_model(
             "when_thinking_disabled",
             "thinking",
             "supports_vision",
+            "context_window",
         },
     )
     # Compute effective when_thinking_enabled by merging in the `thinking` shortcut field.

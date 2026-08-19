@@ -146,6 +146,7 @@ class ACPEventMapper:
                         "total_tokens": max(0, int(usage.get("total_tokens", 0) or 0)),
                     }
                     self._refresh_usage()
+                await self._send_usage_update(data)
             else:
                 await self._handle_live_unlocked({"type": event_type, **data})
 
@@ -405,6 +406,37 @@ class ACPEventMapper:
             key: self._lead_usage[key] + self._subagent_usage[key]
             for key in ("input_tokens", "output_tokens", "total_tokens")
         }
+
+    async def _send_usage_update(self, end_data: dict[str, Any]) -> None:
+        """Push an ACP usage_update with the lead thread's context occupancy.
+
+        ``size`` comes from the model's configured ``context_window`` and
+        ``used`` from the last top-level model call's usage snapshot (its
+        input_tokens approximates the prompt size the next turn will carry).
+        Skipped when either value is missing — ACP clients then simply keep
+        their previous context indicator.
+        """
+        context_window = end_data.get("context_window")
+        last_usage = end_data.get("last_usage")
+        if not isinstance(context_window, int) or context_window <= 0:
+            return
+        if not isinstance(last_usage, dict):
+            return
+        try:
+            used = max(
+                0,
+                int(last_usage.get("input_tokens", 0) or 0)
+                + int(last_usage.get("output_tokens", 0) or 0),
+            )
+            await self._send(
+                schema.UsageUpdate(
+                    session_update="usage_update",
+                    size=context_window,
+                    used=used,
+                )
+            )
+        except Exception:
+            logger.debug("Failed to send ACP usage_update", exc_info=True)
 
     async def close_open_tools(self, *, cancelled: bool) -> None:
         async with self._lock:

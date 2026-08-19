@@ -35,9 +35,10 @@ async def _run(config_path: str | None) -> None:
     from .runtime import LocalACPRuntime
     from .session_store import LocalACPSessionStore
 
+    runtime = LocalACPRuntime(config)
+    runtime.validate_sandbox_provider()
     store = LocalACPSessionStore(config.session_store_path)
     store.setup()
-    runtime = LocalACPRuntime(config)
     await runtime.open()
     purged = await store.purge_closed(
         retention_days=config.closed_session_retention_days

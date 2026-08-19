@@ -2,20 +2,30 @@
 
 import asyncio
 import base64
+import hashlib
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Awaitable, Callable, override
+from typing import override
 
-from langchain.agents.middleware import AgentMiddleware, ModelCallResult, ModelRequest, ModelResponse
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    ModelCallResult,
+    ModelRequest,
+    ModelResponse,
+)
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
 
+from deerflow.agents.image_inputs import (
+    INPUT_IMAGES_KEY,
+    MAX_INPUT_IMAGE_BYTES,
+    detect_image_mime,
+    normalize_input_image_metadata,
+)
 from deerflow.agents.thread_state import ThreadState
 
 logger = logging.getLogger(__name__)
-
-_MAX_IMAGE_BYTES = 20 * 1024 * 1024
-
 
 class ViewImageMiddlewareState(ThreadState):
     """Reuse the thread state so reducer-backed keys keep their annotations."""
@@ -104,16 +114,105 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
         thread_data = state.get("thread_data")
         if not isinstance(thread_data, dict):
             raise ValueError("Thread data is unavailable for image injection")
-        from deerflow.sandbox.tools import resolve_and_validate_user_data_path, validate_local_tool_path
+        from deerflow.sandbox.tools import (
+            resolve_and_validate_user_data_path,
+            validate_local_tool_path,
+        )
 
         validate_local_tool_path(image_path, thread_data, read_only=True)
         actual_path = Path(resolve_and_validate_user_data_path(image_path, thread_data))
         if not actual_path.is_file():
             raise FileNotFoundError(image_path)
         size = actual_path.stat().st_size
-        if size > _MAX_IMAGE_BYTES:
-            raise ValueError(f"Image exceeds {_MAX_IMAGE_BYTES} bytes")
-        return base64.b64encode(actual_path.read_bytes()).decode("ascii")
+        if size > MAX_INPUT_IMAGE_BYTES:
+            raise ValueError(f"Image exceeds {MAX_INPUT_IMAGE_BYTES} bytes")
+        image_bytes = actual_path.read_bytes()
+        detected_mime = detect_image_mime(image_bytes)
+        expected_mime = image_data.get("mime_type")
+        if detected_mime is None or (
+            isinstance(expected_mime, str) and detected_mime != expected_mime
+        ):
+            raise ValueError("Image contents do not match the expected format")
+        expected_sha256 = image_data.get("sha256")
+        if isinstance(expected_sha256, str) and (
+            hashlib.sha256(image_bytes).hexdigest() != expected_sha256
+        ):
+            raise ValueError("Image contents changed after the prompt was accepted")
+        return base64.b64encode(image_bytes).decode("ascii")
+
+    def _patch_direct_input_images(
+        self,
+        state: ViewImageMiddlewareState,
+        messages: list,
+    ) -> list | None:
+        """Add checkpoint-safe input images to the latest user turn ephemerally."""
+
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if not isinstance(message, HumanMessage) or message.name:
+                continue
+            images = normalize_input_image_metadata(
+                (message.additional_kwargs or {}).get(INPUT_IMAGES_KEY)
+            )
+            if not images:
+                return None
+
+            if isinstance(message.content, list):
+                content_blocks: list[str | dict] = list(message.content)
+            elif isinstance(message.content, str) and message.content:
+                content_blocks = [{"type": "text", "text": message.content}]
+            else:
+                content_blocks = [
+                    {
+                        "type": "text",
+                        "text": "Analyze the attached image(s) and respond helpfully.",
+                    }
+                ]
+
+            injected_count = 0
+            for image in images:
+                image_path = str(image["virtual_path"])
+                mime_type = str(image["mime_type"])
+                try:
+                    base64_data = self._image_base64(image_path, image, state)
+                except Exception:
+                    logger.warning(
+                        "Skipping unavailable direct input image: %s",
+                        image_path,
+                        exc_info=True,
+                    )
+                    continue
+                content_blocks.append(
+                    {
+                        "type": "text",
+                        "text": f"\nAttached image: {image['name']} ({mime_type})",
+                    }
+                )
+                content_blocks.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{base64_data}",
+                        },
+                    }
+                )
+                injected_count += 1
+
+            if not injected_count:
+                return None
+            additional_kwargs = dict(message.additional_kwargs or {})
+            additional_kwargs["_input_image_injection"] = True
+            patched_message = message.model_copy(
+                update={
+                    "content": content_blocks,
+                    "additional_kwargs": additional_kwargs,
+                }
+            )
+            patched_messages = list(messages)
+            patched_messages[index] = patched_message
+            logger.debug("Injecting %d direct input image(s)", injected_count)
+            return patched_messages
+        return None
 
     def _create_image_details_message(self, state: ViewImageMiddlewareState) -> list[str | dict]:
         """Create a formatted message with all viewed image details.
@@ -203,9 +302,12 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
         return True
 
     def _ephemeral_messages(self, state: ViewImageMiddlewareState, messages: list) -> list | None:
-        """Append image data for one model call without checkpointing it."""
+        """Inject direct and tool-viewed images without checkpointing image bytes."""
+
+        direct_messages = self._patch_direct_input_images(state, messages)
+        effective_messages = direct_messages or messages
         if not self._should_inject_image_message(state):
-            return None
+            return direct_messages
 
         # Create the image details message with text and image content
         image_content = self._create_image_details_message(state)
@@ -218,7 +320,7 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
         )
 
         logger.debug("Injecting ephemeral image details before LLM call")
-        return [*messages, human_msg]
+        return [*effective_messages, human_msg]
 
     @override
     def wrap_model_call(

@@ -465,6 +465,44 @@ fn find_daemon(cli: &Cli) -> DaemonCommand {
             return python_daemon(python);
         }
     }
+    // Development layouts: a pip-installed entry-point wrapper sits directly
+    // next to its interpreter (.venv\Scripts), and cargo build outputs live
+    // under bridge\target\<profile> with the repo root a few levels up.
+    if let Ok(executable) = env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        let sibling_python = if cfg!(windows) {
+            parent.join("python.exe")
+        } else {
+            parent.join("python3")
+        };
+        if sibling_python.is_file() {
+            return python_daemon(sibling_python);
+        }
+        let python_name = if cfg!(windows) {
+            Path::new("Scripts").join("python.exe")
+        } else {
+            Path::new("bin").join("python3")
+        };
+        let mut dir = parent.to_path_buf();
+        for _ in 0..4 {
+            let runtime_python = if cfg!(windows) {
+                dir.join("runtime").join("python.exe")
+            } else {
+                dir.join("runtime").join("bin").join("python3")
+            };
+            if runtime_python.is_file() {
+                return python_daemon(runtime_python);
+            }
+            let venv_python = dir.join(".venv").join(&python_name);
+            if venv_python.is_file() {
+                return python_daemon(venv_python);
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
     if let Ok(executable) = env::current_exe()
         && let Some(parent) = executable.parent()
     {

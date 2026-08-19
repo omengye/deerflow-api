@@ -44,6 +44,19 @@ class LocalACPRuntime:
         self._client_lock = asyncio.Lock()
         self._run_slots = asyncio.Semaphore(config.max_active_runs)
 
+    def validate_sandbox_provider(self) -> None:
+        """Require the host-local provider supported by portable ACP."""
+
+        from deerflow.config import get_app_config
+        from deerflow.sandbox.provider_paths import is_local_sandbox_provider_path
+
+        provider_path = get_app_config().sandbox.use
+        if not is_local_sandbox_provider_path(provider_path):
+            raise RuntimeError(
+                "Portable ACP supports only LocalSandboxProvider; "
+                f"configured provider: {provider_path}"
+            )
+
     def bind_permission_handler(
         self, connection_id: str, handler: PermissionHandler
     ) -> None:
@@ -265,19 +278,11 @@ class LocalACPRuntime:
         message: str,
         *,
         live_event_callback: LiveEventCallback,
+        input_images: list[dict[str, str | int]] | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
-        from deerflow.config import get_app_config
-        from deerflow.sandbox.provider_paths import is_host_fs_sandbox_provider_path
-
         from .workspace import normalize_workspace_cwd, workspace_paths_equal
 
-        provider_path = get_app_config().sandbox.use
-        if not is_host_fs_sandbox_provider_path(provider_path):
-            raise RuntimeError(
-                "Local ACP cwd workspaces require LocalSandboxProvider or "
-                "LocalWslProvider; the configured sandbox cannot mount the "
-                "client working directory"
-            )
+        self.validate_sandbox_provider()
         try:
             workspace_path = normalize_workspace_cwd(session.cwd)
         except ValueError as exc:
@@ -289,12 +294,17 @@ class LocalACPRuntime:
             )
         client = await self._client_for(session)
         async with self._run_slots:
+            client_kwargs: dict[str, Any] = {
+                "thread_id": session.session_id,
+                "live_event_callback": live_event_callback,
+                "workspace_path": workspace_path,
+                "user_id": self._memory_user_id(session, workspace_path),
+            }
+            if input_images:
+                client_kwargs["input_images"] = input_images
             async for event in client.astream(
                 message,
-                thread_id=session.session_id,
-                live_event_callback=live_event_callback,
-                workspace_path=workspace_path,
-                user_id=self._memory_user_id(session, workspace_path),
+                **client_kwargs,
             ):
                 yield event
 

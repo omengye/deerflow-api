@@ -4,7 +4,10 @@ param(
     [string]$Configuration = "Release",
     [string]$PythonVersion = "3.12.10",
     [string]$OutputDirectory = "dist\portable\DeerFlow",
-    [switch]$SkipZip
+    [switch]$SkipZip,
+    # Also build the client-facing ACP agent archive (deerflow-acp.zip) in
+    # dist\portable next to the portable zip. Skipped when -SkipZip is set.
+    [switch]$SkipAcpZip
 )
 
 $ErrorActionPreference = "Stop"
@@ -94,12 +97,30 @@ $sitePackages = Join-Path $runtimeRoot "Lib\site-packages"
 New-Item -ItemType Directory -Path $sitePackages -Force | Out-Null
 Write-Host "Installing DeerFlow and its locked runtime dependencies..."
 $requirements = Join-Path $cacheRoot "deerflow-portable-requirements.txt"
-& uv export --quiet --frozen --no-dev --no-emit-project --output-file $requirements
+& uv export --quiet --frozen --no-dev --no-emit-project --extra rustfs --prune agent-sandbox --output-file $requirements
 if ($LASTEXITCODE -ne 0) { throw "Locked dependency export failed" }
 & uv pip install --quiet --target $sitePackages --python-version ($PythonVersion.Split('.')[0..1] -join '.') --python-platform x86_64-pc-windows-msvc --link-mode copy --requirements $requirements
 if ($LASTEXITCODE -ne 0) { throw "Embedded Python dependency installation failed" }
 & uv pip install --quiet --target $sitePackages --python-version ($PythonVersion.Split('.')[0..1] -join '.') --python-platform x86_64-pc-windows-msvc --link-mode copy --no-deps $repoRoot
 if ($LASTEXITCODE -ne 0) { throw "DeerFlow package installation failed" }
+
+$forbiddenRuntimePackages = @(
+    "agent_sandbox"
+    "agent_sandbox-*.dist-info"
+    "volcenginesdk*"
+    "volcengine_python_sdk-*.dist-info"
+)
+foreach ($pattern in $forbiddenRuntimePackages) {
+    if (Get-ChildItem -LiteralPath $sitePackages -Filter $pattern -Force) {
+        throw "Portable Local-only runtime unexpectedly contains: $pattern"
+    }
+}
+
+Write-Host "Pre-compiling Python bytecode (.pyc)..."
+$pythonExe = Join-Path $runtimeRoot "python.exe"
+$libRoot = Join-Path $runtimeRoot "Lib"
+& $pythonExe -m compileall -q $libRoot
+if ($LASTEXITCODE -ne 0) { throw "Python bytecode pre-compilation failed" }
 
 $pythonLicenseCache = Join-Path $cacheRoot "python-$PythonVersion-LICENSE.txt"
 Get-CachedRemoteFile -Urls @(
@@ -113,7 +134,7 @@ foreach ($relative in @("config", "data", "skills", "logs", "backups", "runtime\
 }
 
 Write-Host "Validating embedded Python modules..."
-& (Join-Path $runtimeRoot "python.exe") -c "import deerflow.config_tool; import deerflow.acp.daemon; print('embedded runtime ok')"
+& (Join-Path $runtimeRoot "python.exe") -c "import importlib.util; import boto3; import botocore.config; import deerflow.config_tool; import deerflow.acp.daemon; assert importlib.util.find_spec('agent_sandbox') is None; print('embedded Local-only runtime ok')"
 if ($LASTEXITCODE -ne 0) { throw "Embedded Python validation failed" }
 
 if (-not $SkipZip) {
@@ -123,5 +144,6 @@ if (-not $SkipZip) {
     }
     Compress-Archive -LiteralPath $outputRoot -DestinationPath $zipPath -CompressionLevel Optimal
     Write-Host "Portable ZIP: $zipPath"
+
 }
 Write-Host "Portable directory: $outputRoot"

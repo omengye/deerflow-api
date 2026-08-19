@@ -1,13 +1,17 @@
 import base64
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from deerflow.agents.image_inputs import INPUT_IMAGES_KEY
 from deerflow.agents.middlewares.view_image_middleware import ViewImageMiddleware
-from deerflow.tools.builtins.view_image_tool import _sanitize_image_error, view_image_tool
-
+from deerflow.tools.builtins.view_image_tool import (
+    _sanitize_image_error,
+    view_image_tool,
+)
 
 IMAGE_PATH = "/mnt/user-data/uploads/test.png"
 
@@ -75,6 +79,85 @@ def test_view_image_middleware_injects_image_only_for_model_call(tmp_path: Path)
     assert state["messages"] is persisted_messages
     assert len(persisted_messages) == 3
     assert "base64" not in state["viewed_images"][IMAGE_PATH]
+
+
+def test_view_image_middleware_injects_direct_input_without_checkpointing_base64(
+    tmp_path: Path,
+) -> None:
+    image_bytes = b"\x89PNG\r\n\x1a\ndirect-input"
+    tmp_path.joinpath("direct.png").write_bytes(image_bytes)
+    metadata = {
+        "name": "direct.png",
+        "mime_type": "image/png",
+        "virtual_path": "/mnt/user-data/uploads/direct.png",
+        "size": len(image_bytes),
+        "sha256": hashlib.sha256(image_bytes).hexdigest(),
+    }
+    original = HumanMessage(
+        content="Inspect this screenshot",
+        additional_kwargs={INPUT_IMAGES_KEY: [metadata]},
+    )
+    state = {
+        "messages": [original],
+        "thread_data": {"uploads_path": str(tmp_path)},
+    }
+    seen_request: ModelRequest | None = None
+
+    def handler(request: ModelRequest) -> AIMessage:
+        nonlocal seen_request
+        seen_request = request
+        return AIMessage(content="analysis")
+
+    ViewImageMiddleware().wrap_model_call(_request(state), handler)
+
+    assert seen_request is not None
+    assert len(seen_request.messages) == 1
+    injected = seen_request.messages[0]
+    assert isinstance(injected, HumanMessage)
+    assert injected is not original
+    assert injected.content[0] == {"type": "text", "text": "Inspect this screenshot"}
+    assert injected.content[-1] == {
+        "type": "image_url",
+        "image_url": {
+            "url": "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
+        },
+    }
+    assert original.content == "Inspect this screenshot"
+    assert base64.b64encode(image_bytes).decode("ascii") not in str(
+        original.additional_kwargs
+    )
+
+
+def test_view_image_middleware_skips_tampered_direct_input(tmp_path: Path) -> None:
+    image_bytes = b"\x89PNG\r\n\x1a\ntampered"
+    tmp_path.joinpath("direct.png").write_bytes(image_bytes)
+    original = HumanMessage(
+        content="Inspect this screenshot",
+        additional_kwargs={
+            INPUT_IMAGES_KEY: [
+                {
+                    "name": "direct.png",
+                    "mime_type": "image/png",
+                    "virtual_path": "/mnt/user-data/uploads/direct.png",
+                    "size": len(image_bytes),
+                    "sha256": "0" * 64,
+                }
+            ]
+        },
+    )
+    state = {
+        "messages": [original],
+        "thread_data": {"uploads_path": str(tmp_path)},
+    }
+    seen_messages: list = []
+
+    def handler(request: ModelRequest) -> AIMessage:
+        seen_messages.extend(request.messages)
+        return AIMessage(content="analysis")
+
+    ViewImageMiddleware().wrap_model_call(_request(state), handler)
+
+    assert seen_messages == [original]
 
 
 def test_view_image_middleware_clears_lightweight_state_after_model(tmp_path: Path) -> None:

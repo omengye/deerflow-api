@@ -97,9 +97,9 @@ api:
 # Neither mode requires the HTTP API service to be running.
 # session/new.cwd is the real host-backed workspace for file tools. Client
 # filesystem/terminal callbacks and additional directories are not used.
-# The persistent daemon warms the agent graph and configured WSL sandbox before
-# publishing its endpoint. Set DEER_FLOW_ACP_DAEMON_WARMUP=0 or
-# DEER_FLOW_ACP_DAEMON_SANDBOX_WARMUP=0 only for diagnostics.
+# The persistent daemon warms the agent graph before publishing its endpoint.
+# Portable ACP supports LocalSandboxProvider only. Set
+# DEER_FLOW_ACP_DAEMON_WARMUP=0 only for diagnostics.
 local_acp:
   checkpointer_path: ./data/acp-checkpoints.db
   session_store_path: ./data/acp-sessions.db
@@ -141,11 +141,10 @@ local_acp:
   recursion_limit: 200
   agent_name: null
   # session/new.cwd is mounted as /mnt/user-data/workspace for this local
-  # Agent. This requires LocalSandboxProvider or LocalWslProvider. The local
-  # ACP runtime omits bash by default. Trusted local clients may opt in; Bash
-  # then runs through the configured sandbox and can access the network and any
-  # filesystem locations visible to that sandbox. WSL is not a strict project
-  # boundary because mounted Windows drives remain reachable.
+  # Agent. Portable ACP requires LocalSandboxProvider. The runtime omits bash
+  # by default. Trusted local clients may opt in; Bash then runs on the host
+  # and can access the network and any filesystem locations visible to the
+  # current user, so Local mode is not an operating-system isolation boundary.
   enable_bash: false
   # External ACP-agent and persistent scheduler tools remain unavailable.
   # Trusted local clients only. When enabled, ACP stdio, SSE, and HTTP
@@ -197,6 +196,11 @@ models:
   # skipped/warned-and-degraded at run time) for models that don't declare
   # support; (2) the actual on/off switch is `thinking_enabled` (top-level
   # runtime setting, or a per-agent override under `subagents:`).
+  # `context_window` is a positive integer declaring the model's total context
+  # capacity (prompt + completion) in tokens. It powers the "% context used"
+  # indicator (ACP usage_update / API end event telemetry) and is distinct
+  # from `max_tokens`, the per-call output cap. Leave it unset when the
+  # provider limit is unknown; the percentage is then not reported.
   # `deerflow.models.vllm_provider:VllmChatModel` also accepts
   # `cumulative_stream_usage: true` when its vLLM endpoint reports cumulative
   # token snapshots on every streaming chunk.
@@ -207,6 +211,7 @@ models:
     api_key: "YOUR_DASHSCOPE_API_KEY"
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     supports_thinking: true
+    context_window: 262144
 
 default_model: qwen3.6-plus
 

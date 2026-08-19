@@ -406,8 +406,15 @@ async def test_runtime_queues_distinct_sessions_and_cancels_waiter_cleanly(
 
 
 @pytest.mark.asyncio
-async def test_runtime_rejects_container_provider_for_client_cwd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "provider_path",
+    [
+        "deerflow.sandbox.aio:AioSandboxProvider",
+        "deerflow.sandbox.local:LocalWslProvider",
+    ],
+)
+async def test_runtime_rejects_non_local_provider_for_client_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider_path: str
 ) -> None:
     monkeypatch.setattr(
         "deerflow.config.get_app_config",
@@ -418,7 +425,7 @@ async def test_runtime_rejects_container_provider_for_client_cwd(
                 "sandbox": type(
                     "SandboxConfig",
                     (),
-                    {"use": "deerflow.sandbox.aio:AioSandboxProvider"},
+                    {"use": provider_path},
                 )()
             },
         )(),
@@ -445,7 +452,7 @@ async def test_runtime_rejects_container_provider_for_client_cwd(
     )
 
     with pytest.raises(
-        RuntimeError, match="require LocalSandboxProvider or LocalWslProvider"
+        RuntimeError, match="Portable ACP supports only LocalSandboxProvider"
     ):
         async for _ in runtime.astream(
             session,

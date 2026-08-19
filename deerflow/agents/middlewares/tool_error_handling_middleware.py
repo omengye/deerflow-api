@@ -125,11 +125,9 @@ def _build_runtime_middlewares(
         middlewares.append(GuardrailMiddleware(provider, fail_closed=guardrails_config.fail_closed, passport=guardrails_config.passport))
 
     from deerflow.agents.middlewares.sandbox_audit_middleware import SandboxAuditMiddleware
-    from deerflow.agents.middlewares.token_usage_middleware import TokenUsageMiddleware
 
     middlewares.append(SandboxAuditMiddleware())
     middlewares.append(ToolErrorHandlingMiddleware())
-    middlewares.append(TokenUsageMiddleware(stream_callback=stream_callback))
     return middlewares
 
 
@@ -148,9 +146,20 @@ def build_subagent_runtime_middlewares(
     stream_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[AgentMiddleware]:
     """Middlewares shared by subagent runtime before subagent-only middlewares."""
-    return _build_runtime_middlewares(
+    middlewares = _build_runtime_middlewares(
         include_uploads=False,
         include_dangling_tool_call_patch=True,
         lazy_init=lazy_init,
         stream_callback=stream_callback,
     )
+    # TokenUsageMiddleware is composed here for subagents only (the callback
+    # forwards usage into the isolated subagent thread). The lead agent adds
+    # its own instance in lead_agent/agent.py; adding it in both places made
+    # create_agent reject the chain as duplicate middleware when
+    # token_usage.enabled was true.
+    from deerflow.agents.middlewares.token_usage_middleware import TokenUsageMiddleware
+    from deerflow.config import get_app_config
+
+    if get_app_config().token_usage.enabled:
+        middlewares.append(TokenUsageMiddleware(stream_callback=stream_callback))
+    return middlewares

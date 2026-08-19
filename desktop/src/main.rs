@@ -1,11 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use iced::theme::Palette;
+mod ui;
+
 use iced::widget::{
     button, checkbox, column, container, pick_list, row, rule, scrollable, text, text_editor,
     text_input,
 };
-use iced::{Color, Element, Fill, Length, Size, Task, Theme, window};
+use iced::{Element, Fill, Length, Size, Task, window};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -14,14 +15,23 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+const PORTABLE_LOCAL_SANDBOX_PROVIDER: &str = "deerflow.sandbox.local:LocalSandboxProvider";
+const PORTABLE_LOCAL_SANDBOX_OPTIONS: &[&str] = &[
+    "mounts",
+    "bash_output_max_chars",
+    "read_file_output_max_chars",
+    "ls_output_max_chars",
+];
+
 fn main() -> iced::Result {
     configure_graphics_backend();
 
     iced::application(App::new, App::update, App::view)
         .title("DeerFlow Config")
-        .theme(app_theme())
+        .theme(ui::app_theme())
         .window(window::Settings {
             size: Size::new(1180.0, 760.0),
+            min_size: Some(Size::new(980.0, 680.0)),
             icon: Some(app_icon()),
             ..window::Settings::default()
         })
@@ -70,6 +80,57 @@ impl Page {
         (Self::Runtime, "Runtime / ACP"),
         (Self::Diagnostics, "诊断"),
     ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Dashboard => "概览",
+            Self::Models => "模型配置",
+            Self::Agents => "Agent 配置",
+            Self::Skills => "Skills",
+            Self::SandboxTools => "Sandbox / Tools",
+            Self::Runtime => "Runtime / ACP",
+            Self::Diagnostics => "诊断",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Dashboard => "运行状态、资源概览与 Daemon 生命周期管理",
+            Self::Models => "管理模型 Provider、访问凭据与能力声明",
+            Self::Agents => "配置任务型 Subagent 与可选的主 Agent",
+            Self::Skills => "管理 Skill、改进候选和自进化安全边界",
+            Self::SandboxTools => "控制执行边界、本地工具与 ACP 工具策略",
+            Self::Runtime => "设置 ACP 会话的模型、权限与并发限制",
+            Self::Diagnostics => "检查便携目录、运行时和关键文件位置",
+        }
+    }
+
+    fn icon(self) -> ui::Icon {
+        match self {
+            Self::Dashboard => ui::Icon::Dashboard,
+            Self::Models => ui::Icon::Models,
+            Self::Agents => ui::Icon::Agents,
+            Self::Skills => ui::Icon::Skills,
+            Self::SandboxTools => ui::Icon::Tools,
+            Self::Runtime => ui::Icon::Runtime,
+            Self::Diagnostics => ui::Icon::Diagnostics,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+enum AgentSection {
+    #[default]
+    Subagents,
+    CustomAgents,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+enum SkillsSection {
+    #[default]
+    Proposals,
+    Evolution,
+    Catalog,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -92,6 +153,8 @@ struct ConfigDocument {
     tool_groups_editor: text_editor::Content,
     #[serde(skip)]
     tools_editor: text_editor::Content,
+    #[serde(skip)]
+    portable_sandbox_migration_pending: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -239,6 +302,53 @@ struct SandboxDocument {
     advanced_editor: text_editor::Content,
 }
 
+impl SandboxDocument {
+    fn enforce_portable_local_mode(&mut self) -> bool {
+        let original_provider = self.use_path.clone();
+        let original_option_count = self.advanced.len();
+        self.use_path = PORTABLE_LOCAL_SANDBOX_PROVIDER.into();
+        self.advanced
+            .retain(|key, _| PORTABLE_LOCAL_SANDBOX_OPTIONS.contains(&key.as_str()));
+        original_provider != self.use_path || original_option_count != self.advanced.len()
+    }
+}
+
+#[cfg(test)]
+mod portable_sandbox_tests {
+    use super::{PORTABLE_LOCAL_SANDBOX_PROVIDER, SandboxDocument};
+    use iced::widget::text_editor;
+    use serde_json::{Map, Value, json};
+
+    #[test]
+    fn portable_mode_forces_local_and_removes_container_options() {
+        let mut advanced = Map::new();
+        advanced.insert("mounts".into(), json!([]));
+        advanced.insert("bash_output_max_chars".into(), json!(12_000));
+        advanced.insert("image".into(), json!("sandbox:latest"));
+        advanced.insert("wsl_distro".into(), json!("Ubuntu"));
+        advanced.insert("environment".into(), json!({"TOKEN": "secret"}));
+        let mut sandbox = SandboxDocument {
+            use_path: "wsl".into(),
+            allow_host_bash: false,
+            allow_host_tools: false,
+            advanced,
+            advanced_editor: text_editor::Content::new(),
+        };
+
+        assert!(sandbox.enforce_portable_local_mode());
+
+        assert_eq!(sandbox.use_path, PORTABLE_LOCAL_SANDBOX_PROVIDER);
+        assert_eq!(
+            sandbox.advanced.keys().collect::<Vec<_>>(),
+            vec!["bash_output_max_chars", "mounts"]
+        );
+        assert_eq!(
+            sandbox.advanced.get("bash_output_max_chars"),
+            Some(&Value::from(12_000))
+        );
+    }
+}
+
 impl ConfigDocument {
     fn prepare_editor_state(&mut self) {
         self.runtime.connections_input = self.runtime.max_active_connections.to_string();
@@ -262,6 +372,7 @@ impl ConfigDocument {
             text_editor::Content::with_text(&pretty_json_object(&self.subagents.agents));
         self.subagents.custom_agents_editor =
             text_editor::Content::with_text(&pretty_json_object(&self.subagents.custom_agents));
+        self.portable_sandbox_migration_pending = self.sandbox.enforce_portable_local_mode();
         self.sandbox.advanced_editor =
             text_editor::Content::with_text(&pretty_json_object(&self.sandbox.advanced));
         self.tool_groups_editor =
@@ -334,6 +445,7 @@ impl ConfigDocument {
     fn sync_sandbox_tool_editors(&mut self) -> Result<(), String> {
         self.sandbox.advanced =
             parse_json_object(&self.sandbox.advanced_editor.text(), "Sandbox 高级配置")?;
+        self.sandbox.enforce_portable_local_mode();
         self.tool_groups = parse_json_object_array(&self.tool_groups_editor.text(), "Tool Groups")?;
         self.tools = parse_json_object_array(&self.tools_editor.text(), "Tools")?;
         Ok(())
@@ -595,13 +707,71 @@ enum DaemonStatus {
 }
 
 impl DaemonStatus {
-    fn label(&self) -> String {
+    fn summary_label(&self) -> &'static str {
         match self {
-            Self::Checking => "正在检查…".into(),
-            Self::Running(details) => format!("运行中 · {details}"),
-            Self::Stopped => "已停止".into(),
-            Self::Error(error) => format!("检查失败 · {error}"),
+            Self::Checking => "正在检查",
+            Self::Running(_) => "运行中",
+            Self::Stopped => "已停止",
+            Self::Error(_) => "检查失败",
         }
+    }
+
+    fn detail_label(&self) -> String {
+        match self {
+            Self::Checking => "正在读取本地 Daemon 状态".into(),
+            Self::Running(details) => compact_daemon_details(details),
+            Self::Stopped => "Daemon 未启动".into(),
+            Self::Error(error) => format!("错误：{}", truncate_text(error, 30)),
+        }
+    }
+}
+
+fn compact_daemon_details(details: &str) -> String {
+    let field = |name: &str| {
+        details
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(name))
+    };
+    match (field("pid="), field("endpoint=")) {
+        (Some(pid), Some(endpoint)) => format!("PID {pid} · {endpoint}"),
+        (Some(pid), None) => format!("PID {pid}"),
+        (None, Some(endpoint)) => endpoint.to_owned(),
+        (None, None) => truncate_text(details, 36),
+    }
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_owned()
+    } else {
+        let mut shortened = value
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        shortened.push('…');
+        shortened
+    }
+}
+
+#[cfg(test)]
+mod daemon_status_tests {
+    use super::{compact_daemon_details, truncate_text};
+
+    #[test]
+    fn running_status_keeps_only_pid_and_endpoint() {
+        let details = "running pid=24412 build=dev-012345 endpoint=127.0.0.1:54283 (OK)";
+        assert_eq!(
+            compact_daemon_details(details),
+            "PID 24412 · 127.0.0.1:54283"
+        );
+    }
+
+    #[test]
+    fn truncation_is_unicode_safe() {
+        assert_eq!(
+            truncate_text("检查失败：连接端点不可用", 8),
+            "检查失败：连接…"
+        );
     }
 }
 
@@ -612,6 +782,8 @@ struct App {
     document: Option<ConfigDocument>,
     selected_model: usize,
     selected_agent: usize,
+    agent_section: AgentSection,
+    skills_section: SkillsSection,
     evolution_proposals: Vec<EvolutionProposal>,
     selected_evolution_proposal: Option<EvolutionProposal>,
     proposal_diff_editor: text_editor::Content,
@@ -623,6 +795,7 @@ struct App {
     proposal_confirmation: Option<ProposalReviewAction>,
     daemon: DaemonStatus,
     busy: bool,
+    dirty: bool,
     notice: Option<String>,
     error: Option<String>,
 }
@@ -630,6 +803,8 @@ struct App {
 #[derive(Debug, Clone)]
 enum Message {
     Navigate(Page),
+    AgentSection(AgentSection),
+    SkillsSection(SkillsSection),
     Reload,
     Loaded(Result<ConfigDocument, String>),
     DaemonChecked(DaemonStatus),
@@ -669,7 +844,6 @@ enum Message {
     SubagentsAgentsEdit(text_editor::Action),
     SubagentsCustomEdit(text_editor::Action),
     SubagentModel(String, String, String),
-    SandboxUse(String),
     SandboxAllowHostBash(bool),
     SandboxAllowHostTools(bool),
     SandboxAdvancedEdit(text_editor::Action),
@@ -724,6 +898,84 @@ enum Message {
     OpenFolder(PathBuf),
 }
 
+impl Message {
+    fn changes_config(&self) -> bool {
+        matches!(
+            self,
+            Self::AddModel
+                | Self::RemoveModel
+                | Self::ModelName(_)
+                | Self::ModelDisplayName(_)
+                | Self::ModelDescription(_)
+                | Self::ModelUse(_)
+                | Self::ModelId(_)
+                | Self::ModelApiKey(_)
+                | Self::ModelClearKey(_)
+                | Self::ModelBaseUrl(_)
+                | Self::ModelThinking(_)
+                | Self::ModelReasoning(_)
+                | Self::ModelVision(_)
+                | Self::DefaultModel(_)
+                | Self::AddAgent
+                | Self::RemoveAgent
+                | Self::AgentName(_)
+                | Self::AgentDescription(_)
+                | Self::AgentModel(_)
+                | Self::AgentToolGroups(_)
+                | Self::AgentSkills(_)
+                | Self::AgentSoul(_)
+                | Self::SubagentsEnabled(_)
+                | Self::SubagentsTimeout(_)
+                | Self::SubagentsMaxTurns(_)
+                | Self::SubagentsAgentsEdit(_)
+                | Self::SubagentsCustomEdit(_)
+                | Self::SubagentModel(_, _, _)
+                | Self::SandboxAllowHostBash(_)
+                | Self::SandboxAllowHostTools(_)
+                | Self::SandboxAdvancedEdit(_)
+                | Self::ToolGroupsEdit(_)
+                | Self::ToolsEdit(_)
+                | Self::RuntimeToolAllowlist(_)
+                | Self::RuntimeToolDenylist(_)
+                | Self::SkillsEnabled(_)
+                | Self::SkillEnabled(_, _)
+                | Self::EvolutionEnabled(_)
+                | Self::EvolutionMode(_)
+                | Self::EvolutionStoragePath(_)
+                | Self::EvolutionGenerationModel(_)
+                | Self::EvolutionModerationModel(_)
+                | Self::EvolutionEvaluationModel(_)
+                | Self::EvolutionSecurityFailClosed(_)
+                | Self::EvolutionDiscoveryEnabled(_)
+                | Self::EvolutionMinToolCalls(_)
+                | Self::EvolutionRepeatThreshold(_)
+                | Self::EvolutionRepeatWindowDays(_)
+                | Self::EvolutionCooldownHours(_)
+                | Self::EvolutionMaxDailyProposals(_)
+                | Self::EvolutionMaxPendingProposals(_)
+                | Self::EvolutionMaxFiles(_)
+                | Self::EvolutionMaxTotalBytes(_)
+                | Self::EvolutionMaxFileBytes(_)
+                | Self::EvolutionMaxChangedLines(_)
+                | Self::EvolutionProbationUses(_)
+                | Self::EvolutionRollbackFailures(_)
+                | Self::RuntimeModel(_)
+                | Self::RuntimeAgent(_)
+                | Self::RuntimeThinking(_)
+                | Self::RuntimePlan(_)
+                | Self::RuntimeSubagents(_)
+                | Self::RuntimeBash(_)
+                | Self::RuntimePermission(_)
+                | Self::RuntimeMemory(_)
+                | Self::RuntimeConnections(_)
+                | Self::RuntimeRuns(_)
+                | Self::RuntimeSubagentCount(_)
+                | Self::RuntimeTimeout(_)
+                | Self::RuntimeOverlay(_)
+        )
+    }
+}
+
 impl App {
     fn new() -> (Self, Task<Message>) {
         let paths = ProductPaths::discover();
@@ -736,6 +988,8 @@ impl App {
                 document: None,
                 selected_model: 0,
                 selected_agent: 0,
+                agent_section: AgentSection::Subagents,
+                skills_section: SkillsSection::Proposals,
                 evolution_proposals: Vec::new(),
                 selected_evolution_proposal: None,
                 proposal_diff_editor: text_editor::Content::new(),
@@ -747,6 +1001,7 @@ impl App {
                 proposal_confirmation: None,
                 daemon: DaemonStatus::Checking,
                 busy: true,
+                dirty: false,
                 notice: None,
                 error: None,
             },
@@ -761,6 +1016,10 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if message.changes_config() {
+            self.dirty = true;
+            self.notice = None;
+        }
         match message {
             Message::Navigate(page) => {
                 self.page = page;
@@ -770,6 +1029,8 @@ impl App {
                     return self.proposal_list_task();
                 }
             }
+            Message::AgentSection(section) => self.agent_section = section,
+            Message::SkillsSection(section) => self.skills_section = section,
             Message::Reload => {
                 self.busy = true;
                 self.error = None;
@@ -780,10 +1041,16 @@ impl App {
                 self.busy = false;
                 match result {
                     Ok(document) => {
+                        let migration_pending = document.portable_sandbox_migration_pending;
                         self.document = Some(document);
+                        self.dirty = migration_pending;
                         self.selected_model = 0;
                         self.selected_agent = 0;
-                        self.notice = Some("配置已加载".into());
+                        self.notice = Some(if migration_pending {
+                            "检测到非 Local Sandbox 配置；保存后将迁移为便携 Local 模式".into()
+                        } else {
+                            "配置已加载".into()
+                        });
                         self.error = None;
                     }
                     Err(error) => self.error = Some(error),
@@ -831,6 +1098,7 @@ impl App {
                 match result {
                     Ok((document, status, restarted)) => {
                         self.document = Some(document);
+                        self.dirty = false;
                         self.daemon = status;
                         self.notice = Some(if restarted {
                             "配置已保存，Daemon 已安全重启".into()
@@ -969,7 +1237,6 @@ impl App {
                     self.notice = Some("Subagent 模型分配已更新，保存配置后生效".into());
                 }
             }
-            Message::SandboxUse(value) => self.sandbox_mut(|item| item.use_path = value),
             Message::SandboxAllowHostBash(value) => {
                 self.sandbox_mut(|item| item.allow_host_bash = value)
             }
@@ -1371,52 +1638,150 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         let sidebar = Page::ALL.into_iter().fold(
-            column![text("DEERFLOW").size(26), text("ACP CONFIG").size(13)].spacing(8),
+            column![
+                column![
+                    text("DEERFLOW").size(23).color(ui::TEXT_PRIMARY),
+                    text("PORTABLE ACP").size(11).color(ui::ACCENT),
+                ]
+                .spacing(3)
+                .padding(10),
+            ]
+            .spacing(5),
             |menu, (page, label)| {
-                let marker = if self.page == page { "● " } else { "  " };
-                menu.push(
-                    button(text(format!("{marker}{label}")))
-                        .on_press(Message::Navigate(page))
-                        .width(Fill),
-                )
+                menu.push(ui::sidebar_item(
+                    page.icon(),
+                    label,
+                    self.page == page,
+                    Message::Navigate(page),
+                ))
             },
         );
-        let sidebar = container(sidebar.spacing(10).padding(18))
-            .width(Length::Fixed(210.0))
-            .height(Fill);
+        let sidebar = container(
+            column![
+                sidebar,
+                iced::widget::Space::new().height(Fill),
+                container(
+                    column![
+                        text("LOCAL MODE").size(10).color(ui::TEXT_MUTED),
+                        text("配置保存在便携目录")
+                            .size(11)
+                            .color(ui::TEXT_SECONDARY),
+                    ]
+                    .spacing(4),
+                )
+                .padding(11)
+                .width(Fill)
+                .style(ui::inset_card),
+            ]
+            .padding(14),
+        )
+        .style(ui::sidebar)
+        .width(Length::Fixed(224.0))
+        .height(Fill);
 
-        let status = row![
-            text(self.daemon.label()).size(14),
-            text(if self.busy {
-                "正在处理…"
-            } else {
-                "就绪"
-            })
-            .size(13),
-            button("刷新").on_press_maybe((!self.busy).then_some(Message::Reload)),
-            button("保存配置")
-                .on_press_maybe((!self.busy && self.document.is_some()).then_some(Message::Save)),
+        let (daemon_color, daemon_icon) = match &self.daemon {
+            DaemonStatus::Running(_) => (ui::SUCCESS, ui::Icon::Check),
+            DaemonStatus::Stopped => (ui::TEXT_MUTED, ui::Icon::Stop),
+            DaemonStatus::Checking => (ui::ACCENT, ui::Icon::Activity),
+            DaemonStatus::Error(_) => (ui::DANGER, ui::Icon::Alert),
+        };
+
+        let status_actions = row![
+            button(
+                row![
+                    ui::icon_view(ui::Icon::Refresh, 15.0, ui::TEXT_SECONDARY),
+                    text("刷新"),
+                ]
+                .spacing(7)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding([8, 12])
+            .style(ui::secondary_button)
+            .on_press_maybe((!self.busy).then_some(Message::Reload)),
+            button(
+                row![
+                    ui::icon_view(ui::Icon::Save, 15.0, ui::ACCENT_TEXT),
+                    text("保存配置"),
+                ]
+                .spacing(7)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding([8, 13])
+            .style(ui::primary_button)
+            .on_press_maybe(
+                (!self.busy && self.document.is_some() && self.dirty).then_some(Message::Save),
+            ),
         ]
-        .spacing(12)
-        .align_y(iced::Alignment::Center);
+        .spacing(9);
+        let daemon_detail = self.daemon.detail_label();
+        let status_detail = if self.busy {
+            "正在处理配置…".to_owned()
+        } else if self.dirty {
+            "存在未保存修改".to_owned()
+        } else {
+            daemon_detail
+        };
+        let status = container(
+            row![
+                container(ui::page_header(self.page.title(), self.page.description())).width(Fill),
+                column![
+                    ui::status_pill(self.daemon.summary_label(), daemon_color, daemon_icon),
+                    text(status_detail)
+                        .size(11)
+                        .width(Length::Fixed(210.0))
+                        .wrapping(text::Wrapping::None)
+                        .align_x(iced::Alignment::End)
+                        .color(if self.busy {
+                            ui::ACCENT
+                        } else if self.dirty {
+                            ui::WARNING
+                        } else {
+                            ui::TEXT_MUTED
+                        }),
+                ]
+                .spacing(5)
+                .align_x(iced::Alignment::End),
+                status_actions,
+            ]
+            .spacing(14)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding([13, 15])
+        .style(ui::topbar);
 
-        let mut body = column![status, rule::horizontal(1)].spacing(14);
+        let mut body = column![status].spacing(14);
         if let Some(error) = &self.error {
             body = body.push(
                 container(
                     row![
-                        text(format!("错误：{error}"))
+                        ui::icon_view(ui::Icon::Alert, 17.0, ui::DANGER),
+                        text(format!("配置错误：{error}"))
                             .width(Fill)
+                            .color(ui::TEXT_PRIMARY)
                             .wrapping(text::Wrapping::WordOrGlyph),
-                        button("重新加载").on_press_maybe((!self.busy).then_some(Message::Reload)),
+                        button("重新加载")
+                            .style(ui::danger_button)
+                            .on_press_maybe((!self.busy).then_some(Message::Reload)),
                     ]
                     .spacing(10)
                     .align_y(iced::Alignment::Center),
                 )
-                .padding(10),
+                .padding(11)
+                .style(ui::error_callout),
             );
         } else if let Some(notice) = &self.notice {
-            body = body.push(container(text(notice)).padding(10));
+            body = body.push(
+                container(
+                    row![
+                        ui::icon_view(ui::Icon::Check, 17.0, ui::SUCCESS),
+                        text(notice).color(ui::TEXT_PRIMARY),
+                    ]
+                    .spacing(9)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding(11)
+                .style(ui::success_callout),
+            );
         }
         let page = match self.page {
             Page::Dashboard => self.dashboard_view(),
@@ -1428,45 +1793,117 @@ impl App {
             Page::Diagnostics => self.diagnostics_view(),
         };
         body = body.push(page);
-        row![
+        container(row![
             sidebar,
-            container(body.padding(22)).width(Fill).height(Fill)
-        ]
+            container(body.padding(18)).width(Fill).height(Fill)
+        ])
+        .width(Fill)
+        .height(Fill)
+        .style(ui::app_background)
         .into()
     }
 
     fn dashboard_view(&self) -> Element<'_, Message> {
         let Some(document) = &self.document else {
-            return container(text("正在初始化便携配置…").size(22)).into();
+            return container(
+                row![
+                    ui::icon_view(ui::Icon::Activity, 20.0, ui::ACCENT),
+                    text("正在初始化便携配置…")
+                        .size(18)
+                        .color(ui::TEXT_SECONDARY),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding(20)
+            .style(ui::accent_card)
+            .into();
         };
         let enabled_skills = document.skills.iter().filter(|skill| skill.enabled).count();
         let cards = row![
-            metric("模型", document.models.len().to_string()),
-            metric("Agents", document.agents.len().to_string()),
-            metric(
-                "Skills",
-                format!("{enabled_skills}/{}", document.skills.len())
+            ui::metric(
+                ui::Icon::Models,
+                "模型",
+                document.models.len().to_string(),
+                "已配置 Provider"
             ),
-            metric("Tools", document.tools.len().to_string()),
+            ui::metric(
+                ui::Icon::Agents,
+                "Agents",
+                document.agents.len().to_string(),
+                "Custom Agents"
+            ),
+            ui::metric(
+                ui::Icon::Skills,
+                "Skills",
+                format!("{enabled_skills}/{}", document.skills.len()),
+                "启用 / 总数"
+            ),
+            ui::metric(
+                ui::Icon::Tools,
+                "Tools",
+                document.tools.len().to_string(),
+                "本地工具定义"
+            ),
         ]
         .spacing(14);
         let controls = row![
-            button("启动 Daemon").on_press_maybe((!self.busy).then_some(Message::StartDaemon)),
-            button("停止 Daemon").on_press_maybe((!self.busy).then_some(Message::StopDaemon)),
-            button("重启 Daemon").on_press_maybe((!self.busy).then_some(Message::RestartDaemon)),
+            button(
+                row![
+                    ui::icon_view(ui::Icon::Play, 16.0, ui::ACCENT_TEXT),
+                    text("启动 Daemon"),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding([9, 14])
+            .style(ui::success_button)
+            .on_press_maybe((!self.busy && !self.dirty).then_some(Message::StartDaemon)),
+            button(
+                row![
+                    ui::icon_view(ui::Icon::Stop, 16.0, ui::DANGER),
+                    text("停止 Daemon"),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding([9, 14])
+            .style(ui::danger_button)
+            .on_press_maybe((!self.busy).then_some(Message::StopDaemon)),
+            button(
+                row![
+                    ui::icon_view(ui::Icon::Restart, 16.0, ui::WARNING),
+                    text("重启 Daemon"),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding([9, 14])
+            .style(ui::warning_button)
+            .on_press_maybe((!self.busy && !self.dirty).then_some(Message::RestartDaemon)),
         ]
         .spacing(12);
-        column![
-            text("DeerFlow ACP").size(30),
-            text("本地模型、Agent、Skill 配置与 Daemon 生命周期管理。"),
-            cards,
-            text("Daemon 控制").size(20),
-            controls,
-            text("配置保存时，如 Daemon 正在运行会自动安全重启；不会自动连接或测试 Waku/Zed。")
-                .size(13),
-        ]
-        .spacing(18)
-        .into()
+        let daemon_control = ui::section(
+            "Daemon 控制",
+            "保存配置时，正在运行的 Daemon 会安全重启；本工具不会自动连接或测试 Waku / Zed。",
+            column![
+                controls,
+                container(
+                    row![
+                        ui::icon_view(ui::Icon::Alert, 16.0, ui::WARNING),
+                        text("停止或重启会影响当前正在使用此便携实例的 ACP 会话。")
+                            .size(12)
+                            .color(ui::TEXT_SECONDARY),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding(10)
+                .style(ui::warning_callout),
+            ]
+            .spacing(12),
+        );
+        column![cards, daemon_control].spacing(16).into()
     }
 
     fn models_view(&self) -> Element<'_, Message> {
@@ -1478,25 +1915,33 @@ impl App {
             .iter()
             .enumerate()
             .fold(
-                column![text("模型列表").size(18)].spacing(8),
+                column![text("模型列表").size(17).color(ui::TEXT_PRIMARY)].spacing(8),
                 |list, (index, model)| {
-                    let marker = if index == self.selected_model {
-                        "● "
-                    } else {
-                        "  "
-                    };
                     list.push(
-                        button(text(format!("{marker}{}", model.name)))
+                        button(text(&model.name))
                             .on_press(Message::SelectModel(index))
+                            .padding([9, 11])
+                            .style(ui::list_button(index == self.selected_model))
                             .width(Fill),
                     )
                 },
             )
-            .push(button("＋ 新增模型").on_press(Message::AddModel));
+            .push(
+                button("＋ 新增模型")
+                    .padding([8, 11])
+                    .style(ui::secondary_button)
+                    .on_press(Message::AddModel),
+            );
         let Some(model) = document.models.get(self.selected_model) else {
-            return row![container(choices).width(220), text("请选择模型")]
-                .spacing(18)
-                .into();
+            return row![
+                container(choices).padding(14).width(230).style(ui::card),
+                container(text("请选择模型").color(ui::TEXT_SECONDARY))
+                    .padding(18)
+                    .width(Fill)
+                    .style(ui::card),
+            ]
+            .spacing(18)
+            .into();
         };
         let key_hint = if model.api_key_literal && model.api_key.is_empty() {
             "已保存密钥（留空则保留）"
@@ -1509,7 +1954,7 @@ impl App {
             .map(|item| item.name.clone())
             .collect();
         let form = column![
-            text("模型配置").size(24),
+            text("模型详情").size(20).color(ui::TEXT_PRIMARY),
             labeled_input("名称", &model.name, "唯一名称", Message::ModelName),
             labeled_input(
                 "显示名称",
@@ -1534,9 +1979,11 @@ impl App {
                 text("API Key").size(13),
                 text_input(key_hint, &model.api_key)
                     .on_input(Message::ModelApiKey)
+                    .style(ui::input_style)
                     .secure(true),
                 checkbox(model.clear_api_key)
                     .label("清除已保存的 API Key")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::ModelClearKey),
             ]
             .spacing(6),
@@ -1549,12 +1996,15 @@ impl App {
             row![
                 checkbox(model.supports_thinking)
                     .label("Thinking")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::ModelThinking),
                 checkbox(model.supports_reasoning_effort)
                     .label("Reasoning effort")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::ModelReasoning),
                 checkbox(model.supports_vision)
                     .label("Vision")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::ModelVision),
             ]
             .spacing(16),
@@ -1564,8 +2014,10 @@ impl App {
                     model_names,
                     Some(document.default_model.clone()),
                     Message::DefaultModel
-                ),
+                )
+                .style(ui::pick_list_style),
                 button("删除当前模型")
+                    .style(ui::danger_button)
                     .on_press_maybe((document.models.len() > 1).then_some(Message::RemoveModel)),
             ]
             .spacing(12)
@@ -1574,9 +2026,11 @@ impl App {
         .spacing(12);
         row![
             container(scrollable(choices).spacing(6))
-                .width(220)
+                .padding(14)
+                .style(ui::card)
+                .width(230)
                 .height(Fill),
-            scrollable(container(form).padding(4))
+            scrollable(container(form).padding(18).style(ui::card))
                 .spacing(8)
                 .width(Fill)
                 .height(Fill),
@@ -1598,29 +2052,41 @@ impl App {
                 let kind = assignment.kind.clone();
                 let name = assignment.name.clone();
                 list.push(
-                    row![
-                        column![
-                            row![
-                                text(assignment.name.clone()).size(16),
-                                text(assignment.kind_label.clone()).size(12),
+                    container(
+                        row![
+                            column![
+                                row![
+                                    text(assignment.name.clone())
+                                        .size(16)
+                                        .color(ui::TEXT_PRIMARY),
+                                    text(assignment.kind_label.clone())
+                                        .size(12)
+                                        .color(ui::ACCENT),
+                                ]
+                                .spacing(10)
+                                .align_y(iced::Alignment::Center),
+                                text(assignment.description.clone())
+                                    .size(12)
+                                    .color(ui::TEXT_SECONDARY)
+                                    .width(Fill),
                             ]
-                            .spacing(10)
-                            .align_y(iced::Alignment::Center),
-                            text(assignment.description.clone()).size(12).width(Fill),
+                            .spacing(4)
+                            .width(Fill),
+                            column![
+                                text("执行模型").size(12).color(ui::TEXT_SECONDARY),
+                                pick_list(choices, Some(selected), move |model| {
+                                    Message::SubagentModel(kind.clone(), name.clone(), model)
+                                })
+                                .style(ui::pick_list_style),
+                            ]
+                            .spacing(5)
+                            .width(Length::Fixed(260.0)),
                         ]
-                        .spacing(4)
-                        .width(Fill),
-                        column![
-                            text("执行模型").size(12),
-                            pick_list(choices, Some(selected), move |model| {
-                                Message::SubagentModel(kind.clone(), name.clone(), model)
-                            }),
-                        ]
-                        .spacing(5)
-                        .width(Length::Fixed(260.0)),
-                    ]
-                    .spacing(16)
-                    .align_y(iced::Alignment::Center),
+                        .spacing(16)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding(12)
+                    .style(ui::inset_card),
                 )
             },
         );
@@ -1631,12 +2097,14 @@ impl App {
         };
 
         let subagent_settings = column![
-            text("Subagents 配置").size(28),
+            text("Subagents 配置").size(21).color(ui::TEXT_PRIMARY),
             text("对应 Admin 的 Subagents 全局配置、模型分配和高级 JSON。全局开关与 Runtime / ACP 页的会话级 Subagents 开关需同时启用。")
-                .size(13),
+                .size(13)
+                .color(ui::TEXT_SECONDARY),
             row![
                 checkbox(subagents.enabled)
                     .label("启用 Subagent 系统")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::SubagentsEnabled),
                 labeled_input(
                     "默认超时（秒）",
@@ -1689,19 +2157,21 @@ impl App {
             .fold(
                 column![text("Custom Agents").size(18)].spacing(8),
                 |list, (index, agent)| {
-                    let marker = if index == self.selected_agent {
-                        "● "
-                    } else {
-                        "  "
-                    };
                     list.push(
-                        button(text(format!("{marker}{}", agent.name)))
+                        button(text(&agent.name))
                             .on_press(Message::SelectAgent(index))
+                            .padding([9, 11])
+                            .style(ui::list_button(index == self.selected_agent))
                             .width(Fill),
                     )
                 },
             )
-            .push(button("＋ 新增 Agent").on_press(Message::AddAgent));
+            .push(
+                button("＋ 新增 Agent")
+                    .padding([8, 11])
+                    .style(ui::secondary_button)
+                    .on_press(Message::AddAgent),
+            );
         let custom_agent_editor: Element<'_, Message> =
             if let Some(agent) = document.agents.get(self.selected_agent) {
                 let model_names = std::iter::once(String::new())
@@ -1723,7 +2193,8 @@ impl App {
                     ),
                     column![
                         text("模型（留空继承默认模型）").size(13),
-                        pick_list(model_names, agent.model.clone(), Message::AgentModel),
+                        pick_list(model_names, agent.model.clone(), Message::AgentModel)
+                            .style(ui::pick_list_style),
                     ]
                     .spacing(6),
                     labeled_input(
@@ -1741,21 +2212,30 @@ impl App {
                     column![
                         text("SOUL.md").size(13),
                         text_input("Agent personality / behavior", &agent.soul)
-                            .on_input(Message::AgentSoul),
+                            .on_input(Message::AgentSoul)
+                            .style(ui::input_style),
                     ]
                     .spacing(6),
-                    button("删除当前 Agent").on_press(Message::RemoveAgent),
+                    button("删除当前 Agent")
+                        .style(ui::danger_button)
+                        .on_press(Message::RemoveAgent),
                 ]
                 .spacing(12);
                 row![
-                    container(choices).width(220),
+                    container(choices)
+                        .padding(14)
+                        .width(230)
+                        .style(ui::inset_card),
                     container(form).padding(4).width(Fill),
                 ]
                 .spacing(20)
                 .into()
             } else {
                 row![
-                    container(choices).width(220),
+                    container(choices)
+                        .padding(14)
+                        .width(230)
+                        .style(ui::inset_card),
                     column![
                         text("还没有 Custom Agent").size(24),
                         text("点击左侧“新增 Agent”创建一个；ACP 也可以不指定 Agent。")
@@ -1766,21 +2246,45 @@ impl App {
                 .into()
             };
 
-        scrollable(
-            column![
-                subagent_settings,
-                rule::horizontal(1),
-                text("Custom Agents").size(28),
-                text("这些 Agent 以独立目录保存，可直接作为 ACP 的主 Agent；它们与上面的任务型 Subagent 配置相互独立。")
-                    .size(13),
-                custom_agent_editor,
-            ]
-            .spacing(18),
-        )
-        .spacing(8)
-        .width(Fill)
-        .height(Fill)
-        .into()
+        let tabs = row![
+            button("Subagents")
+                .padding([8, 13])
+                .style(ui::tab_button(
+                    self.agent_section == AgentSection::Subagents
+                ))
+                .on_press(Message::AgentSection(AgentSection::Subagents)),
+            button("Custom Agents")
+                .padding([8, 13])
+                .style(ui::tab_button(
+                    self.agent_section == AgentSection::CustomAgents
+                ))
+                .on_press(Message::AgentSection(AgentSection::CustomAgents)),
+        ]
+        .spacing(8);
+        let active: Element<'_, Message> = match self.agent_section {
+            AgentSection::Subagents => container(subagent_settings)
+                .padding(18)
+                .style(ui::card)
+                .width(Fill)
+                .into(),
+            AgentSection::CustomAgents => container(
+                column![
+                    text("Custom Agents").size(21).color(ui::TEXT_PRIMARY),
+                    text("这些 Agent 以独立目录保存，可直接作为 ACP 的主 Agent；它们与任务型 Subagent 配置相互独立。")
+                        .size(13)
+                        .color(ui::TEXT_SECONDARY),
+                    custom_agent_editor,
+                ]
+                .spacing(16),
+            )
+            .padding(18)
+            .style(ui::card)
+            .width(Fill)
+            .into(),
+        };
+        column![tabs, scrollable(active).spacing(8).height(Fill)]
+            .spacing(12)
+            .into()
     }
 
     fn proposal_review_view(&self) -> Element<'_, Message> {
@@ -1789,6 +2293,7 @@ impl App {
         } else {
             "刷新待审批"
         })
+        .style(ui::secondary_button)
         .on_press_maybe((!self.proposal_busy).then_some(Message::RefreshEvolutionProposals));
 
         let proposal_list = if self.evolution_proposals.is_empty() {
@@ -1822,6 +2327,8 @@ impl App {
                             .wrapping(text::Wrapping::WordOrGlyph),
                         )
                         .width(Fill)
+                        .padding([8, 10])
+                        .style(ui::list_button(selected))
                         .on_press_maybe(
                             (!self.proposal_busy)
                                 .then_some(Message::SelectEvolutionProposal(proposal.id.clone())),
@@ -1863,14 +2370,22 @@ impl App {
                             .size(13),
                             row![
                                 button(text(format!("确认{}", action.label())))
+                                    .style(if action == ProposalReviewAction::Approve {
+                                        ui::success_button
+                                    } else {
+                                        ui::danger_button
+                                    })
                                     .on_press(Message::ConfirmProposalReview),
-                                button("取消").on_press(Message::CancelProposalReview),
+                                button("取消")
+                                    .style(ui::secondary_button)
+                                    .on_press(Message::CancelProposalReview),
                             ]
                             .spacing(10),
                         ]
                         .spacing(8),
                     )
                     .padding(12)
+                    .style(ui::warning_callout)
                     .into()
                 } else {
                     container(column![]).into()
@@ -1946,16 +2461,19 @@ impl App {
                 column![
                     text("审批备注（可选，最多 4000 字符）").size(13),
                     text_input("说明批准或拒绝原因", &self.proposal_review_note)
-                        .on_input(Message::ProposalReviewNote),
+                        .on_input(Message::ProposalReviewNote)
+                        .style(ui::input_style),
                 ]
                 .spacing(6),
                 row![
-                    button("批准并发布").on_press_maybe(
-                        (!self.proposal_busy && proposal.status == "pending_review").then_some(
-                            Message::RequestProposalReview(ProposalReviewAction::Approve,)
+                    button("批准并发布")
+                        .style(ui::success_button)
+                        .on_press_maybe(
+                            (!self.proposal_busy && proposal.status == "pending_review").then_some(
+                                Message::RequestProposalReview(ProposalReviewAction::Approve,)
+                            ),
                         ),
-                    ),
-                    button("拒绝").on_press_maybe(
+                    button("拒绝").style(ui::danger_button).on_press_maybe(
                         (!self.proposal_busy && proposal.status == "pending_review").then_some(
                             Message::RequestProposalReview(ProposalReviewAction::Reject,)
                         ),
@@ -2018,12 +2536,14 @@ impl App {
         };
 
         let evolution_settings = column![
-            text("Self Improving / 自进化").size(22),
+            text("Self Improving / 自进化").size(21).color(ui::TEXT_PRIMARY),
             text("配置 Agent 如何发现 Skill 改进机会、生成候选并在发布后观察失败。Signal 和历史归档仍由 Admin 页面管理。")
-                .size(13),
+                .size(13)
+                .color(ui::TEXT_SECONDARY),
             row![
                 checkbox(evolution.enabled)
                     .label("启用 Self Improving")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::EvolutionEnabled),
                 column![
                     text("发布模式").size(13),
@@ -2031,12 +2551,14 @@ impl App {
                         vec!["review".into(), "auto_patch".into()],
                         Some(evolution.mode.clone()),
                         Message::EvolutionMode
-                    ),
+                    )
+                    .style(ui::pick_list_style),
                 ]
                 .spacing(6)
                 .width(Fill),
                 checkbox(evolution.security_fail_closed)
                     .label("安全扫描不可用时阻止候选")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::EvolutionSecurityFailClosed),
             ]
             .spacing(16)
@@ -2056,7 +2578,8 @@ impl App {
                         model_names.clone(),
                         evolution.generation_model_name.clone(),
                         Message::EvolutionGenerationModel
-                    ),
+                    )
+                    .style(ui::pick_list_style),
                 ]
                 .spacing(6)
                 .width(Fill),
@@ -2066,7 +2589,8 @@ impl App {
                         model_names.clone(),
                         evolution.moderation_model_name.clone(),
                         Message::EvolutionModerationModel
-                    ),
+                    )
+                    .style(ui::pick_list_style),
                 ]
                 .spacing(6)
                 .width(Fill),
@@ -2076,7 +2600,8 @@ impl App {
                         model_names,
                         evolution.evaluation_model_name.clone(),
                         Message::EvolutionEvaluationModel
-                    ),
+                    )
+                    .style(ui::pick_list_style),
                 ]
                 .spacing(6)
                 .width(Fill),
@@ -2087,6 +2612,7 @@ impl App {
                 text("自动发现").size(18),
                 checkbox(evolution.discovery.enabled)
                     .label("启用自动发现")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::EvolutionDiscoveryEnabled),
             ]
             .spacing(16)
@@ -2195,6 +2721,7 @@ impl App {
                 text("Skill 状态").size(22),
                 checkbox(document.skills_enabled)
                     .label("启用 Skill 系统")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::SkillsEnabled),
                 text("这里只管理 Skill 启用状态；不管理 MCP。保存时会原样保留已有 mcpServers。")
                     .size(13),
@@ -2202,31 +2729,62 @@ impl App {
             .spacing(12),
             |list, (index, skill)| {
                 list.push(
-                    column![
-                        checkbox(skill.enabled)
-                            .label(format!("{}  [{}]", skill.name, skill.category))
-                            .on_toggle(move |enabled| Message::SkillEnabled(index, enabled)),
-                        text(&skill.description).size(13),
-                    ]
-                    .spacing(4),
+                    container(
+                        column![
+                            checkbox(skill.enabled)
+                                .label(format!("{}  [{}]", skill.name, skill.category))
+                                .style(ui::checkbox_style)
+                                .on_toggle(move |enabled| Message::SkillEnabled(index, enabled)),
+                            text(&skill.description).size(13).color(ui::TEXT_SECONDARY),
+                        ]
+                        .spacing(4),
+                    )
+                    .padding(11)
+                    .style(ui::inset_card),
                 )
             },
         );
-        scrollable(
-            column![
-                text("Skills").size(28),
-                self.proposal_review_view(),
-                rule::horizontal(1),
-                evolution_settings,
-                rule::horizontal(1),
-                skill_list,
-            ]
-            .spacing(18),
-        )
-        .spacing(8)
-        .width(Fill)
-        .height(Fill)
-        .into()
+        let tabs = row![
+            button("Proposal 审批")
+                .padding([8, 13])
+                .style(ui::tab_button(
+                    self.skills_section == SkillsSection::Proposals
+                ))
+                .on_press(Message::SkillsSection(SkillsSection::Proposals)),
+            button("自进化设置")
+                .padding([8, 13])
+                .style(ui::tab_button(
+                    self.skills_section == SkillsSection::Evolution
+                ))
+                .on_press(Message::SkillsSection(SkillsSection::Evolution)),
+            button("Skill 状态")
+                .padding([8, 13])
+                .style(ui::tab_button(
+                    self.skills_section == SkillsSection::Catalog
+                ))
+                .on_press(Message::SkillsSection(SkillsSection::Catalog)),
+        ]
+        .spacing(8);
+        let active: Element<'_, Message> = match self.skills_section {
+            SkillsSection::Proposals => container(self.proposal_review_view())
+                .padding(18)
+                .style(ui::card)
+                .width(Fill)
+                .into(),
+            SkillsSection::Evolution => container(evolution_settings)
+                .padding(18)
+                .style(ui::card)
+                .width(Fill)
+                .into(),
+            SkillsSection::Catalog => container(skill_list)
+                .padding(18)
+                .style(ui::card)
+                .width(Fill)
+                .into(),
+        };
+        column![tabs, scrollable(active).spacing(8).height(Fill)]
+            .spacing(12)
+            .into()
     }
 
     fn sandbox_tools_view(&self) -> Element<'_, Message> {
@@ -2263,32 +2821,57 @@ impl App {
             .count();
         let runtime = &document.runtime;
         let content = column![
-            text("Sandbox / Tools").size(28),
-            text("配置 Sandbox Provider、主机执行能力、ACP 工具过滤策略和本地工具定义。保存时会使用 DeerFlow 原生配置模型校验。")
-                .size(13),
-            rule::horizontal(1),
-            text("Sandbox 安全边界").size(22),
-            labeled_input(
-                "Provider（local、wsl、aio 或 module:Class）",
-                &sandbox.use_path,
-                "local",
-                Message::SandboxUse
-            ),
+            text("Sandbox 安全边界").size(20).color(ui::TEXT_PRIMARY),
+            text("便携 ACP 固定使用 Local Provider，并对主机执行能力实施独立开关。")
+                .size(13)
+                .color(ui::TEXT_SECONDARY),
+            container(
+                row![
+                    ui::icon_view(ui::Icon::Check, 18.0, ui::SUCCESS),
+                    column![
+                        text("Local Sandbox").size(14).color(ui::TEXT_PRIMARY),
+                        text("便携 ACP 固定使用 LocalSandboxProvider")
+                            .size(12)
+                            .color(ui::TEXT_SECONDARY),
+                    ]
+                    .spacing(3),
+                    iced::widget::Space::new().width(Fill),
+                    text("LOCAL ONLY").size(10).color(ui::SUCCESS),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding(12)
+            .style(ui::inset_card),
             row![
                 checkbox(sandbox.allow_host_bash)
                     .label("允许 Host Bash（高风险）")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::SandboxAllowHostBash),
                 checkbox(sandbox.allow_host_tools)
                     .label("允许 Host Tools（高风险）")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::SandboxAllowHostTools),
             ]
             .spacing(20),
-            text("Local/WSL Provider 共享宿主机文件系统，不是隔离边界。Host Tools 会在 API 主机进程中执行或复用宿主机登录凭据，仅应在完全可信的本地环境启用。")
-                .size(13),
+            container(
+                row![
+                    ui::icon_view(ui::Icon::Alert, 17.0, ui::WARNING),
+                    text("Local Provider 共享宿主机文件系统，不是操作系统级隔离边界。Host Bash 与 Host Tools 仅应在完全可信的本地环境启用。")
+                        .size(13)
+                        .color(ui::TEXT_SECONDARY)
+                        .width(Fill)
+                        .wrapping(text::Wrapping::WordOrGlyph),
+                ]
+                .spacing(9)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding(11)
+            .style(ui::warning_callout),
             row![
                 column![
-                    text("Sandbox 高级配置").size(18),
-                    text("编辑 WSL、Docker、挂载、环境变量和输出限制；Provider 与两个 Host 开关由上方字段管理。")
+                    text("Local 高级配置").size(18),
+                    text("仅保留 mounts 和本地文件工具输出限制；WSL、Docker 与容器环境配置不会写入便携版。")
                         .size(12),
                     text_editor(&sandbox.advanced_editor)
                         .placeholder("{}")
@@ -2319,7 +2902,7 @@ impl App {
             ]
             .spacing(14),
             rule::horizontal(1),
-            text("ACP 本地工具策略").size(22),
+            text("ACP 本地工具策略").size(20).color(ui::TEXT_PRIMARY),
             text("Allowlist 使用 * 表示允许全部已配置工具；留空表示不允许任何工具。Denylist 始终优先。")
                 .size(13),
             row![
@@ -2342,7 +2925,7 @@ impl App {
                 document.tools.len(), sandbox_tool_count, host_tool_count
             ))
             .size(13),
-            text("Tools 高级 JSON").size(22),
+            text("Tools 高级 JSON").size(20).color(ui::TEXT_PRIMARY),
             text("敏感字段会显示为 __DEERFLOW_REDACTED__；保持占位符即可保留原值，也可以输入新值替换。工具名称必须唯一，且 group 必须引用上方已配置的 Tool Group。")
                 .size(13),
             text_editor(&document.tools_editor)
@@ -2351,7 +2934,7 @@ impl App {
                 .height(Length::Fixed(420.0)),
         ]
         .spacing(14);
-        scrollable(content)
+        scrollable(container(content).padding(18).style(ui::card))
             .spacing(8)
             .width(Fill)
             .height(Fill)
@@ -2370,18 +2953,22 @@ impl App {
             .chain(document.agents.iter().map(|item| item.name.clone()))
             .collect::<Vec<_>>();
         let form = column![
-            text("Runtime / ACP").size(28),
-            text("runtime-dir 自动使用解压目录下的 user-data/runtime/acp，无需配置。"),
+            text("会话默认值").size(20).color(ui::TEXT_PRIMARY),
+            text("runtime-dir 自动使用解压目录下的 user-data/runtime/acp，无需配置。")
+                .size(13)
+                .color(ui::TEXT_SECONDARY),
             row![
                 column![
                     text("ACP 模型（留空使用默认模型）").size(13),
                     pick_list(models, runtime.model_name.clone(), Message::RuntimeModel)
+                        .style(ui::pick_list_style)
                 ]
                 .spacing(6)
                 .width(Fill),
                 column![
                     text("Custom Agent（可选）").size(13),
                     pick_list(agents, runtime.agent_name.clone(), Message::RuntimeAgent)
+                        .style(ui::pick_list_style)
                 ]
                 .spacing(6)
                 .width(Fill),
@@ -2390,15 +2977,19 @@ impl App {
             row![
                 checkbox(runtime.thinking_enabled)
                     .label("Thinking")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::RuntimeThinking),
                 checkbox(runtime.plan_mode)
                     .label("Plan mode")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::RuntimePlan),
                 checkbox(runtime.subagent_enabled)
                     .label("Subagents")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::RuntimeSubagents),
                 checkbox(runtime.enable_bash)
                     .label("Bash（高风险）")
+                    .style(ui::checkbox_style)
                     .on_toggle(Message::RuntimeBash),
             ]
             .spacing(16),
@@ -2410,6 +3001,7 @@ impl App {
                         Some(runtime.permission_mode.clone()),
                         Message::RuntimePermission
                     )
+                    .style(ui::pick_list_style)
                 ]
                 .spacing(6)
                 .width(Fill),
@@ -2420,6 +3012,7 @@ impl App {
                         Some(runtime.memory_scope.clone()),
                         Message::RuntimeMemory
                     )
+                    .style(ui::pick_list_style)
                 ]
                 .spacing(6)
                 .width(Fill),
@@ -2455,12 +3048,17 @@ impl App {
             column![
                 text("Prompt Overlay").size(13),
                 text_input("追加到 ACP Agent 的服务端提示词", &runtime.prompt_overlay)
-                    .on_input(Message::RuntimeOverlay),
+                    .on_input(Message::RuntimeOverlay)
+                    .style(ui::input_style),
             ]
             .spacing(6),
         ]
         .spacing(16);
-        scrollable(form).spacing(8).width(Fill).height(Fill).into()
+        scrollable(container(form).padding(18).style(ui::card))
+            .spacing(8)
+            .width(Fill)
+            .height(Fill)
+            .into()
     }
 
     fn diagnostics_view(&self) -> Element<'_, Message> {
@@ -2473,57 +3071,65 @@ impl App {
             ("Runtime", self.paths.runtime.clone()),
         ]
         .into_iter()
-        .fold(
-            column![text("诊断").size(28)].spacing(10),
-            |list, (label, path)| {
-                let folder = if path.is_dir() {
-                    path.clone()
-                } else {
-                    path.parent().unwrap_or(Path::new(".")).to_path_buf()
-                };
-                list.push(
+        .fold(column![].spacing(9), |list, (label, path)| {
+            let folder = if path.is_dir() {
+                path.clone()
+            } else {
+                path.parent().unwrap_or(Path::new(".")).to_path_buf()
+            };
+            list.push(
+                container(
                     row![
-                        text(label).width(Length::Fixed(110.0)),
+                        text(label)
+                            .size(13)
+                            .color(ui::TEXT_SECONDARY)
+                            .width(Length::Fixed(100.0)),
                         text(path.display().to_string())
+                            .size(13)
+                            .color(ui::TEXT_PRIMARY)
                             .width(Fill)
                             .wrapping(text::Wrapping::WordOrGlyph),
-                        button("打开目录").on_press(Message::OpenFolder(folder)),
+                        button(
+                            row![
+                                ui::icon_view(ui::Icon::Folder, 15.0, ui::TEXT_SECONDARY),
+                                text("打开目录"),
+                            ]
+                            .spacing(7)
+                            .align_y(iced::Alignment::Center),
+                        )
+                        .style(ui::secondary_button)
+                        .on_press(Message::OpenFolder(folder)),
                     ]
                     .spacing(12)
                     .align_y(iced::Alignment::Center),
                 )
-            },
-        );
-        column![
-            path_rows,
-            rule::horizontal(1),
-            text("本工具不包含 Waku/Zed 连通性测试；请在客户端配置 deerflow-acp.exe 后手动验证。")
-                .size(13),
-        ]
-        .spacing(16)
+                .padding(11)
+                .style(ui::inset_card),
+            )
+        });
+        container(
+            column![
+                text("便携路径").size(20).color(ui::TEXT_PRIMARY),
+                path_rows,
+                container(
+                    row![
+                        ui::icon_view(ui::Icon::Alert, 16.0, ui::ACCENT),
+                        text("本工具不包含 Waku / Zed 连通性测试；请在客户端配置 deerflow-acp.exe 后手动验证。")
+                            .size(13)
+                            .color(ui::TEXT_SECONDARY),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding(10)
+                .style(ui::accent_card),
+            ]
+            .spacing(14),
+        )
+        .padding(18)
+        .style(ui::card)
         .into()
     }
-}
-
-fn app_theme() -> Theme {
-    Theme::custom(
-        "DeerFlow",
-        Palette {
-            background: Color::from_rgb8(0x0f, 0x17, 0x2a),
-            text: Color::from_rgb8(0xf8, 0xfa, 0xfc),
-            primary: Color::from_rgb8(0x64, 0x74, 0x8b),
-            success: Color::from_rgb8(0x22, 0xc5, 0x5e),
-            warning: Color::from_rgb8(0xf5, 0x9e, 0x0b),
-            danger: Color::from_rgb8(0xef, 0x44, 0x44),
-        },
-    )
-}
-
-fn metric<'a>(label: &'a str, value: String) -> Element<'a, Message> {
-    container(column![text(value).size(28), text(label).size(13)].spacing(6))
-        .padding(16)
-        .width(Fill)
-        .into()
 }
 
 fn labeled_input<'a>(
@@ -2533,8 +3139,10 @@ fn labeled_input<'a>(
     on_input: fn(String) -> Message,
 ) -> Element<'a, Message> {
     column![
-        text(label).size(13),
-        text_input(placeholder, value).on_input(on_input),
+        text(label).size(13).color(ui::TEXT_SECONDARY),
+        text_input(placeholder, value)
+            .on_input(on_input)
+            .style(ui::input_style),
     ]
     .spacing(6)
     .width(Fill)

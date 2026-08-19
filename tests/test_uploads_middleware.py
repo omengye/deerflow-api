@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage
 
+from deerflow.agents.image_inputs import INPUT_IMAGES_KEY
 from deerflow.agents.middlewares.uploads_middleware import UploadsMiddleware
 from deerflow.config.paths import Paths
 from deerflow.tools.builtins.list_uploaded_files_tool import list_uploaded_files_tool
@@ -453,3 +454,26 @@ def test_wrap_model_call_no_uploads_dir_and_no_new_files_is_a_no_op(tmp_path):
 
     assert response.content == "hello"
     assert messages == [turn1]
+
+
+def test_direct_input_image_is_not_duplicated_as_a_historical_upload(tmp_path):
+    uploads = _uploads_dir(tmp_path)
+    filename = "acp-image-1.png"
+    image_data = b"\x89PNG\r\n\x1a\nimage"
+    (uploads / filename).write_bytes(image_data)
+    message = HumanMessage(
+        content="inspect image",
+        additional_kwargs={
+            INPUT_IMAGES_KEY: [
+                {
+                    "name": "screen.png",
+                    "mime_type": "image/png",
+                    "virtual_path": f"/mnt/user-data/uploads/{filename}",
+                    "size": len(image_data),
+                    "sha256": "a" * 64,
+                }
+            ]
+        },
+    )
+
+    assert _middleware(tmp_path)._build_injected_messages([message], _runtime()) is None

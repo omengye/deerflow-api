@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ class FakeRuntime:
         self.client_mcp_bindings: dict[str, Any] = {}
         self.released_client_mcp: list[str] = []
         self.prompt_messages: list[str] = []
+        self.prompt_images: list[list[dict[str, str | int]]] = []
 
     async def bind_client_mcp(self, session_id: str, binding: Any) -> None:
         if binding is None:
@@ -44,9 +46,17 @@ class FakeRuntime:
         self.client_mcp_bindings.pop(session_id, None)
         self.released_client_mcp.append(session_id)
 
-    async def astream(self, session: Any, message: str, *, live_event_callback: Any):
+    async def astream(
+        self,
+        session: Any,
+        message: str,
+        *,
+        live_event_callback: Any,
+        input_images: list[dict[str, str | int]] | None = None,
+    ):
         del session
         self.prompt_messages.append(message)
+        self.prompt_images.append(input_images or [])
         self.started.set()
         if self.block:
             await asyncio.Event().wait()
@@ -80,11 +90,13 @@ def configured_models(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             name="model-a",
             display_name="Model A",
             description="First test model",
+            supports_vision=False,
         ),
         SimpleNamespace(
             name="model-b",
             display_name=None,
             description=None,
+            supports_vision=False,
         ),
     ]
     app_config = SimpleNamespace(
@@ -282,6 +294,20 @@ async def test_initialize_advertises_remote_transports_when_client_mcp_is_enable
 
     assert response.agent_capabilities.mcp_capabilities.http is True
     assert response.agent_capabilities.mcp_capabilities.sse is True
+
+
+@pytest.mark.asyncio
+async def test_initialize_advertises_images_when_a_vision_model_is_configured(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+    configured_models: SimpleNamespace,
+) -> None:
+    configured_models.models[0].supports_vision = True
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, FakeRuntime())
+
+    response = await agent.initialize(protocol_version=1)
+
+    assert response.agent_capabilities.prompt_capabilities.image is True
 
 
 @pytest.mark.asyncio
@@ -964,6 +990,239 @@ async def test_prompt_accepts_workspace_resource_links(
 
 
 @pytest.mark.asyncio
+async def test_prompt_persists_native_image_and_passes_only_metadata(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+    configured_models: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured_models.models[1].supports_vision = True
+    uploads = tmp_path / "uploads"
+    monkeypatch.setattr(
+        "deerflow.agents.image_inputs.ensure_uploads_dir",
+        lambda _thread_id: uploads.mkdir(parents=True, exist_ok=True) or uploads,
+    )
+    image_bytes = b"\x89PNG\r\n\x1a\nacp-native-image"
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    runtime = FakeRuntime()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    response = await agent.prompt(
+        [acp.text_block("What is in this image?"), acp.image_block(encoded, "image/png")],
+        created.session_id,
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert encoded not in runtime.prompt_messages[0]
+    assert len(runtime.prompt_images[0]) == 1
+    metadata = runtime.prompt_images[0][0]
+    assert metadata["mime_type"] == "image/png"
+    assert metadata["size"] == len(image_bytes)
+    assert str(metadata["virtual_path"]).startswith("/mnt/user-data/uploads/acp-image-")
+    stored = uploads / Path(str(metadata["virtual_path"])).name
+    assert stored.read_bytes() == image_bytes
+
+
+@pytest.mark.asyncio
+async def test_prompt_copies_local_image_resource_into_session_uploads(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+    configured_models: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured_models.models[1].supports_vision = True
+    resource = tmp_path / "diagram.png"
+    image_bytes = b"\x89PNG\r\n\x1a\nresource-image"
+    resource.write_bytes(image_bytes)
+    uploads = tmp_path / "uploads"
+    monkeypatch.setattr(
+        "deerflow.agents.image_inputs.ensure_uploads_dir",
+        lambda _thread_id: uploads.mkdir(parents=True, exist_ok=True) or uploads,
+    )
+    runtime = FakeRuntime()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    await agent.prompt(
+        [
+            acp.resource_link_block(
+                "diagram.png",
+                resource.as_uri(),
+                mime_type="image/png",
+                size=len(image_bytes),
+            )
+        ],
+        created.session_id,
+    )
+
+    assert len(runtime.prompt_images[0]) == 1
+    metadata = runtime.prompt_images[0][0]
+    assert metadata["name"] == "diagram.png"
+    assert (uploads / Path(str(metadata["virtual_path"])).name).read_bytes() == image_bytes
+    assert "/mnt/user-data/uploads/" in runtime.prompt_messages[0]
+
+
+@pytest.mark.asyncio
+async def test_prompt_rejects_image_for_non_vision_session_model(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+    encoded = base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode("ascii")
+
+    with pytest.raises(RequestError) as error:
+        await agent.prompt(
+            [acp.image_block(encoded, "image/png")],
+            created.session_id,
+        )
+
+    assert error.value.code == -32602
+    assert "does not support image input" in str(error.value.data)
+    assert runtime.prompt_messages == []
+
+
+@pytest.mark.asyncio
+async def test_prompt_accepts_image_for_agent_profile_vision_model(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+    configured_models: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured_models.models[0].supports_vision = True
+    monkeypatch.setattr(
+        "deerflow.acp.agent.load_agent_config",
+        lambda _name: SimpleNamespace(model="model-a"),
+    )
+    runtime = FakeRuntime()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+    await agent.set_config_option("agent_profile", created.session_id, "vision-profile")
+    encoded = base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode("ascii")
+
+    response = await agent.prompt(
+        [acp.image_block(encoded, "image/png")],
+        created.session_id,
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert len(runtime.prompt_images[0]) == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_non_vision_model_overrides_agent_profile_vision_model(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+    configured_models: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured_models.models[0].supports_vision = True
+    monkeypatch.setattr(
+        "deerflow.acp.agent.load_agent_config",
+        lambda _name: SimpleNamespace(model="model-a"),
+    )
+    runtime = FakeRuntime()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+    await agent.set_config_option("agent_profile", created.session_id, "vision-profile")
+    await agent.set_config_option("model", created.session_id, "model-b")
+    encoded = base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode("ascii")
+
+    with pytest.raises(RequestError) as error:
+        await agent.prompt(
+            [acp.image_block(encoded, "image/png")],
+            created.session_id,
+        )
+
+    assert error.value.code == -32602
+    assert "model-b" in str(error.value.data)
+    assert runtime.prompt_messages == []
+
+
+@pytest.mark.asyncio
+async def test_prompt_rejects_remote_image_resource_until_safe_download_exists(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+    configured_models: SimpleNamespace,
+) -> None:
+    configured_models.models[1].supports_vision = True
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, FakeRuntime())
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    with pytest.raises(RequestError) as error:
+        await agent.prompt(
+            [
+                acp.resource_link_block(
+                    "remote.png",
+                    "https://example.test/remote.png",
+                    mime_type="image/png",
+                )
+            ],
+            created.session_id,
+        )
+
+    assert error.value.code == -32602
+    assert "not downloaded" in str(error.value.data)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("data", "mime_type", "message"),
+    [
+        ("not-base64", "image/png", "valid base64"),
+        (
+            base64.b64encode(b"\xff\xd8\xffjpeg").decode("ascii"),
+            "image/png",
+            "contents are image/jpeg",
+        ),
+    ],
+)
+async def test_prompt_rejects_invalid_native_images(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+    configured_models: SimpleNamespace,
+    data: str,
+    mime_type: str,
+    message: str,
+) -> None:
+    configured_models.models[1].supports_vision = True
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, FakeRuntime())
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    with pytest.raises(RequestError) as error:
+        await agent.prompt(
+            [acp.image_block(data, mime_type)],
+            created.session_id,
+        )
+
+    assert error.value.code == -32602
+    assert message in str(error.value.data)
+
+
+@pytest.mark.asyncio
+async def test_prompt_limits_images_per_turn_before_writing_files(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+    configured_models: SimpleNamespace,
+) -> None:
+    configured_models.models[1].supports_vision = True
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, FakeRuntime())
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+    encoded = base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode("ascii")
+
+    with pytest.raises(RequestError) as error:
+        await agent.prompt(
+            [acp.image_block(encoded, "image/png") for _ in range(9)],
+            created.session_id,
+        )
+
+    assert error.value.code == -32602
+    assert "at most 8 images" in str(error.value.data)
+
+
+@pytest.mark.asyncio
 async def test_close_session_marks_it_unavailable_and_releases_resources(
     tmp_path: Path,
     store: LocalACPSessionStore,
@@ -1136,6 +1395,71 @@ async def test_event_mapper_adds_subagent_usage_to_prompt_usage() -> None:
     )
 
     assert mapper.usage == {"input_tokens": 8, "output_tokens": 11, "total_tokens": 19}
+
+
+@pytest.mark.asyncio
+async def test_event_mapper_sends_usage_update_on_end() -> None:
+    updates: list[Any] = []
+
+    async def send(update: Any) -> None:
+        updates.append(update)
+
+    mapper = ACPEventMapper("session-1", send)
+    await mapper.handle(
+        SimpleNamespace(
+            type="end",
+            data={
+                "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                "last_usage": {
+                    "input_tokens": 900,
+                    "output_tokens": 100,
+                    "total_tokens": 1000,
+                },
+                "context_window": 4096,
+            },
+        )
+    )
+
+    usage_updates = [
+        update for update in updates if isinstance(update, schema.UsageUpdate)
+    ]
+    assert len(usage_updates) == 1
+    assert usage_updates[0].session_update == "usage_update"
+    assert usage_updates[0].size == 4096
+    assert usage_updates[0].used == 1000
+    # Lead usage accounting is unaffected by the extra telemetry fields.
+    assert mapper.usage == {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+
+
+@pytest.mark.asyncio
+async def test_event_mapper_skips_usage_update_without_context_window() -> None:
+    updates: list[Any] = []
+
+    async def send(update: Any) -> None:
+        updates.append(update)
+
+    mapper = ACPEventMapper("session-1", send)
+    # No context_window configured (or no model call this turn) -> no update.
+    await mapper.handle(
+        SimpleNamespace(
+            type="end",
+            data={
+                "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                "last_usage": {"input_tokens": 900, "output_tokens": 100},
+            },
+        )
+    )
+    await mapper.handle(
+        SimpleNamespace(
+            type="end",
+            data={
+                "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                "context_window": 4096,
+            },
+        )
+    )
+
+    assert not [u for u in updates if isinstance(u, schema.UsageUpdate)]
 
 
 @pytest.mark.asyncio

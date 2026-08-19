@@ -124,7 +124,6 @@ sandbox:
             "--runtime-dir",
             str(runtime_dir),
             "--no-warmup",
-            "--no-sandbox-warmup",
         ],
         cwd=project_root,
         env=environment,
@@ -235,13 +234,13 @@ def test_native_bridge_auto_starts_and_stops_daemon(tmp_path: Path) -> None:
 
     config = tmp_path / "config.yaml"
     config.write_text(
-        "api:\n  data_dir: ./data\nlocal_acp:\n  session_store_path: ./data/sessions.db\n",
+        "api:\n  data_dir: ./data\nlocal_acp:\n  session_store_path: ./data/sessions.db\n"
+        "sandbox:\n  use: deerflow.sandbox.local:LocalSandboxProvider\n",
         encoding="utf-8",
     )
     runtime_dir = tmp_path / "runtime"
     environment = os.environ.copy()
     environment["DEER_FLOW_ACP_DAEMON_WARMUP"] = "0"
-    environment["DEER_FLOW_ACP_DAEMON_SANDBOX_WARMUP"] = "0"
     environment["DEER_FLOW_ACP_DAEMON_START_TIMEOUT_MS"] = "20000"
 
     started = subprocess.run(
@@ -295,13 +294,13 @@ def test_native_bridge_concurrent_auto_start_converges_on_one_daemon(
 
     config = tmp_path / "config.yaml"
     config.write_text(
-        "api:\n  data_dir: ./data\nlocal_acp:\n  session_store_path: ./data/sessions.db\n",
+        "api:\n  data_dir: ./data\nlocal_acp:\n  session_store_path: ./data/sessions.db\n"
+        "sandbox:\n  use: deerflow.sandbox.local:LocalSandboxProvider\n",
         encoding="utf-8",
     )
     runtime_dir = tmp_path / "runtime"
     environment = os.environ.copy()
     environment["DEER_FLOW_ACP_DAEMON_WARMUP"] = "0"
-    environment["DEER_FLOW_ACP_DAEMON_SANDBOX_WARMUP"] = "0"
     environment["DEER_FLOW_ACP_DAEMON_START_TIMEOUT_MS"] = "20000"
     command = [
         str(bridge),

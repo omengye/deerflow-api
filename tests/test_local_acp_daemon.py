@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from deerflow.acp.config import LocalACPConfig
+from deerflow.acp import daemon as daemon_module
 from deerflow.acp import daemon_endpoint
 from deerflow.acp.daemon import ACPDaemon
 from deerflow.acp.daemon_endpoint import (
@@ -96,6 +97,39 @@ def test_runtime_dir_uses_portable_product_root(
     monkeypatch.delenv("DEER_FLOW_ACP_RUNTIME_DIR", raising=False)
     monkeypatch.setattr(daemon_endpoint, "_portable_root", lambda: tmp_path)
     assert get_runtime_dir() == (tmp_path / "user-data" / "runtime" / "acp").resolve()
+
+
+@pytest.mark.asyncio
+async def test_daemon_rejects_non_local_sandbox_before_opening_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepared = False
+
+    class FakeConfig:
+        def prepare_environment(self) -> None:
+            nonlocal prepared
+            prepared = True
+
+    class RejectingRuntime:
+        def __init__(self, _config: FakeConfig) -> None:
+            pass
+
+        def validate_sandbox_provider(self) -> None:
+            raise RuntimeError("Portable ACP supports only LocalSandboxProvider")
+
+    monkeypatch.setattr(
+        daemon_module.LocalACPConfig,
+        "from_file",
+        staticmethod(lambda _path: FakeConfig()),
+    )
+    monkeypatch.setattr(daemon_module, "LocalACPRuntime", RejectingRuntime)
+
+    with pytest.raises(
+        RuntimeError, match="Portable ACP supports only LocalSandboxProvider"
+    ):
+        await daemon_module._run_daemon(None, tmp_path / "runtime", warmup=False)
+
+    assert prepared is True
 
 
 @pytest.mark.asyncio

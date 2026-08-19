@@ -57,6 +57,12 @@ DeerFlow 使用标准 ACP stdio 协议。将 ACP Client 的启动命令设置为
 
 不要通过 `cmd /c` 或 PowerShell 包装该命令，否则包装层可能干扰 ACP stdio、进程退出和取消信号。
 
+### 图片输入
+
+DeerFlow ACP 支持客户端发送标准 `ImageContentBlock`，也支持引用当前 session 工作目录内图片的本地 `file://` ResourceLink。支持 JPG、PNG、WebP 和 GIF；单张最大 20 MB，每轮最多 8 张且总计不超过 40 MB。图片会保存到对应会话的 uploads 目录，checkpoint 只记录文件元数据，不保存 Base64。
+
+图片输入要求当前会话选择的模型配置了 `supports_vision: true`。如果当前模型不支持视觉，ACP 会拒绝该轮输入并提示可选的视觉模型，不会静默切换模型。HTTP/HTTPS 图片 ResourceLink 暂不自动下载；远程图片请由客户端作为 `ImageContentBlock` 发送。
+
 ### 启动与排障
 
 第一次连接前应先运行一次 `deerflow-config.exe` 并保存模型配置。Daemon 可以由 ACP Client 首次连接时自动启动，也可以从配置工具的概览页提前启动。
@@ -92,7 +98,7 @@ DeerFlow 使用标准 ACP stdio 协议。将 ACP Client 的启动命令设置为
 
 ## Sandbox 与本地工具
 
-“Sandbox / Tools”页面可以配置 Sandbox Provider、Host Bash/Host Tools 安全开关、Tool Groups、Tools，以及 ACP 会话的工具 Allowlist/Denylist。Local 和 WSL Provider 共享宿主机文件系统，不应当作隔离边界；Host 权限仅适用于完全可信的本地环境。
+“Sandbox / Tools”页面固定使用 Local Sandbox，可以配置 Host Bash/Host Tools 安全开关、本地挂载与输出限制、Tool Groups、Tools，以及 ACP 会话的工具 Allowlist/Denylist。便携 ACP 不包含 Agent Sandbox、WSL 或 Docker Provider。Local Provider 共享宿主机文件系统，不是操作系统级隔离边界；Host 权限仅适用于完全可信的本地环境。
 
 Sandbox 与 Tool JSON 中的字面量密钥会显示为 `__DEERFLOW_REDACTED__`。保留占位符会继续使用原值，输入新值则会替换原值。工具名称必须唯一，并且每个工具必须引用已配置的 Tool Group。
 

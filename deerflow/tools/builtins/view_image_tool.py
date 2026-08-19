@@ -6,6 +6,11 @@ from langchain.tools import InjectedToolCallId, ToolRuntime, tool
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+from deerflow.agents.image_inputs import (
+    IMAGE_EXTENSION_TO_MIME,
+    MAX_INPUT_IMAGE_BYTES,
+    detect_image_mime,
+)
 from deerflow.agents.thread_state import AgentContext, ThreadDataState, ThreadState
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
 
@@ -15,32 +20,8 @@ _ALLOWED_IMAGE_VIRTUAL_ROOTS = (
     f"{VIRTUAL_PATH_PREFIX}/outputs",
 )
 _ALLOWED_IMAGE_VIRTUAL_ROOTS_TEXT = ", ".join(_ALLOWED_IMAGE_VIRTUAL_ROOTS)
-_MAX_IMAGE_BYTES = 20 * 1024 * 1024
-_EXTENSION_TO_MIME = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-}
-
-
 def _is_allowed_image_virtual_path(image_path: str) -> bool:
     return any(image_path == root or image_path.startswith(f"{root}/") for root in _ALLOWED_IMAGE_VIRTUAL_ROOTS)
-
-
-def _detect_image_mime(image_data: bytes) -> str | None:
-    if image_data.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if image_data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if len(image_data) >= 12 and image_data.startswith(b"RIFF") and image_data[8:12] == b"WEBP":
-        return "image/webp"
-    if image_data.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    return None
-
-
 def _sanitize_image_error(
     error: Exception,
     thread_data: ThreadDataState | None,
@@ -115,10 +96,10 @@ def view_image_tool(
         )
 
     # Validate image extension
-    expected_mime_type = _EXTENSION_TO_MIME.get(path.suffix.lower())
+    expected_mime_type = IMAGE_EXTENSION_TO_MIME.get(path.suffix.lower())
     if expected_mime_type is None:
         return Command(
-            update={"messages": [ToolMessage(f"Error: Unsupported image format: {path.suffix}. Supported formats: {', '.join(_EXTENSION_TO_MIME)}", tool_call_id=tool_call_id)]},
+            update={"messages": [ToolMessage(f"Error: Unsupported image format: {path.suffix}. Supported formats: {', '.join(IMAGE_EXTENSION_TO_MIME)}", tool_call_id=tool_call_id)]},
         )
 
     # Detect MIME type from file extension
@@ -132,9 +113,9 @@ def view_image_tool(
         return Command(
             update={"messages": [ToolMessage(f"Error reading image metadata: {_sanitize_image_error(e, thread_data, runtime)}", tool_call_id=tool_call_id)]},
         )
-    if image_size > _MAX_IMAGE_BYTES:
+    if image_size > MAX_INPUT_IMAGE_BYTES:
         return Command(
-            update={"messages": [ToolMessage(f"Error: Image file is too large: {image_size} bytes. Maximum supported size is {_MAX_IMAGE_BYTES} bytes", tool_call_id=tool_call_id)]},
+            update={"messages": [ToolMessage(f"Error: Image file is too large: {image_size} bytes. Maximum supported size is {MAX_INPUT_IMAGE_BYTES} bytes", tool_call_id=tool_call_id)]},
         )
 
     # Read image file and convert to base64
@@ -146,7 +127,7 @@ def view_image_tool(
             update={"messages": [ToolMessage(f"Error reading image file: {_sanitize_image_error(e, thread_data, runtime)}", tool_call_id=tool_call_id)]},
         )
 
-    detected_mime_type = _detect_image_mime(image_data)
+    detected_mime_type = detect_image_mime(image_data)
     if detected_mime_type is None:
         return Command(
             update={"messages": [ToolMessage("Error: File contents do not match a supported image format", tool_call_id=tool_call_id)]},
