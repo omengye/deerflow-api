@@ -486,6 +486,7 @@ pub enum Icon {
     Dashboard,
     Models,
     Agents,
+    Memory,
     Skills,
     Tools,
     Runtime,
@@ -519,6 +520,9 @@ impl Icon {
             }
             Self::Agents => {
                 r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="8" cy="16" r="1"/><circle cx="16" cy="16" r="1"/><path d="M12 2v4M8 7h8"/></svg>"#
+            }
+            Self::Memory => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"/></svg>"#
             }
             Self::Skills => {
                 r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.9 4.6L5 9.5l4 3.1L7.8 18l4.2-2.7 4.2 2.7-1.2-5.4 4-3.1-5.1-1.9L12 3Z"/></svg>"#

@@ -12,6 +12,7 @@ from typing import Any, Callable
 from acp import schema
 
 from deerflow.config.paths import get_paths
+from deerflow.sandbox.output_paths import resolve_outputs_virtual_path
 
 from .config import LocalACPArtifactConfig
 
@@ -76,14 +77,29 @@ class RustFSArtifactPublisher:
             self._client = self._client_factory()
         return self._client
 
-    def _resolve(self, session_id: str, virtual_path: str) -> tuple[Path, str, str, int]:
+    def _resolve(
+        self,
+        session_id: str,
+        virtual_path: str,
+        outputs_path: str | None = None,
+    ) -> tuple[Path, str, str, int]:
         if not virtual_path.startswith(_OUTPUT_PREFIX):
             raise ArtifactPublishError(
                 f"Only files under {_OUTPUT_PREFIX} can be published: {virtual_path}"
             )
         try:
-            host_path = get_paths().resolve_virtual_path(session_id, virtual_path).resolve()
-            outputs_dir = get_paths().sandbox_outputs_dir(session_id).resolve()
+            if outputs_path is None:
+                host_path = get_paths().resolve_virtual_path(
+                    session_id,
+                    virtual_path,
+                ).resolve()
+                outputs_dir = get_paths().sandbox_outputs_dir(session_id).resolve()
+            else:
+                outputs_dir = Path(outputs_path).resolve()
+                host_path = resolve_outputs_virtual_path(
+                    str(outputs_dir),
+                    virtual_path,
+                )
             host_path.relative_to(outputs_dir)
         except (OSError, ValueError) as exc:
             raise ArtifactPublishError(f"Artifact path is invalid: {virtual_path}") from exc
@@ -103,8 +119,13 @@ class RustFSArtifactPublisher:
         session_id: str,
         run_id: str,
         virtual_path: str,
+        outputs_path: str | None = None,
     ) -> schema.ResourceContentBlock:
-        host_path, name, mime_type, size = self._resolve(session_id, virtual_path)
+        host_path, name, mime_type, size = self._resolve(
+            session_id,
+            virtual_path,
+            outputs_path,
+        )
         before = host_path.stat()
         sha256 = _sha256(host_path)
         key = "/".join(
@@ -162,10 +183,12 @@ class RustFSArtifactPublisher:
         session_id: str,
         run_id: str,
         virtual_path: str,
+        outputs_path: str | None = None,
     ) -> schema.ResourceContentBlock:
         return await asyncio.to_thread(
             self._publish_sync,
             session_id,
             run_id,
             virtual_path,
+            outputs_path,
         )

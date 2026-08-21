@@ -1,12 +1,18 @@
+import hashlib
 import logging
+import os
 import threading
 from collections import OrderedDict
 from collections.abc import Collection
 from pathlib import Path
 
 from deerflow.sandbox.local.local_sandbox import LocalSandbox, PathMapping
+from deerflow.sandbox.output_paths import workspace_outputs_path
 from deerflow.sandbox.sandbox import Sandbox
-from deerflow.sandbox.sandbox_provider import SandboxProvider
+from deerflow.sandbox.sandbox_provider import (
+    SandboxProvider,
+    normalize_workspace_mount_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,12 +138,21 @@ class LocalSandboxProvider(SandboxProvider):
         ]
 
     @staticmethod
-    def _build_thread_path_mappings(thread_id: str) -> list[PathMapping]:
+    def _build_thread_path_mappings(
+        thread_id: str,
+        workspace_path: str | None = None,
+    ) -> list[PathMapping]:
         """Build per-thread mappings for /mnt/user-data and /mnt/acp-workspace."""
         from deerflow.config.paths import get_paths
 
         paths = get_paths()
         paths.ensure_thread_dirs(thread_id)
+        workspace_root = workspace_path or str(paths.sandbox_work_dir(thread_id))
+        outputs_root = (
+            workspace_outputs_path(workspace_path)
+            if workspace_path is not None
+            else str(paths.sandbox_outputs_dir(thread_id))
+        )
 
         return [
             PathMapping(
@@ -147,7 +162,7 @@ class LocalSandboxProvider(SandboxProvider):
             ),
             PathMapping(
                 container_path=f"{_USER_DATA_VIRTUAL_PREFIX}/workspace",
-                local_path=str(paths.sandbox_work_dir(thread_id)),
+                local_path=workspace_root,
                 read_only=False,
             ),
             PathMapping(
@@ -157,7 +172,7 @@ class LocalSandboxProvider(SandboxProvider):
             ),
             PathMapping(
                 container_path=f"{_USER_DATA_VIRTUAL_PREFIX}/outputs",
-                local_path=str(paths.sandbox_outputs_dir(thread_id)),
+                local_path=outputs_root,
                 read_only=False,
             ),
             PathMapping(
@@ -185,10 +200,14 @@ class LocalSandboxProvider(SandboxProvider):
         thread_id: str | None = None,
         *,
         available_skills: Collection[str] | None = None,
+        workspace_path: str | None = None,
     ) -> str:
         global _singleton
+        workspace_path = normalize_workspace_mount_path(workspace_path)
         projection, skills_mapping = self._projection_mapping(available_skills)
         if thread_id is None:
+            if workspace_path is not None:
+                raise ValueError("A thread_id is required for an external workspace mount")
             sandbox_id = f"local:global:{projection.revision}"
             with self._lock:
                 if self._generic_sandbox is None or self._generic_sandbox.id != sandbox_id:
@@ -199,19 +218,28 @@ class LocalSandboxProvider(SandboxProvider):
                     _singleton = self._generic_sandbox
                 return self._generic_sandbox.id
 
-        cache_key = f"{thread_id}:{projection.revision}"
+        if workspace_path is None:
+            cache_key = f"{thread_id}:{projection.revision}"
+        else:
+            workspace_identity = os.path.normcase(workspace_path).encode("utf-8")
+            workspace_revision = hashlib.sha256(workspace_identity).hexdigest()[:16]
+            cache_key = f"{thread_id}:workspace-{workspace_revision}:{projection.revision}"
         with self._lock:
             cached = self._thread_sandboxes.get(cache_key)
             if cached is not None:
                 self._thread_sandboxes.move_to_end(cache_key)
                 return cached.id
 
-        new_mappings = [*self._path_mappings, skills_mapping, *self._build_thread_path_mappings(thread_id)]
+        new_mappings = [
+            *self._path_mappings,
+            skills_mapping,
+            *self._build_thread_path_mappings(thread_id, workspace_path),
+        ]
 
         with self._lock:
             cached = self._thread_sandboxes.get(cache_key)
             if cached is None:
-                cached = LocalSandbox(f"local:{thread_id}:{projection.revision}", path_mappings=new_mappings)
+                cached = LocalSandbox(f"local:{cache_key}", path_mappings=new_mappings)
                 self._thread_sandboxes[cache_key] = cached
                 self._evict_until_within_cap_locked()
             else:

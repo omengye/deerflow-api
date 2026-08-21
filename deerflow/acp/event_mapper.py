@@ -16,6 +16,7 @@ import acp
 from acp import schema
 
 from deerflow.config.paths import get_paths
+from deerflow.sandbox.output_paths import resolve_outputs_virtual_path
 
 from .policy import tool_kind as _tool_kind
 
@@ -79,9 +80,11 @@ class ACPEventMapper:
         send_update: SendUpdate,
         *,
         artifact_resolver: ArtifactResolver | None = None,
+        outputs_path: str | None = None,
     ):
         self.session_id = session_id
         self._send_update = send_update
+        self._outputs_path = outputs_path
         self._artifact_resolver = artifact_resolver or self._default_artifact_resolver
         self._lock = asyncio.Lock()
         self._reasoning: dict[str, str] = {}
@@ -108,7 +111,16 @@ class ACPEventMapper:
         if not virtual_path.startswith(_OUTPUT_PREFIX):
             return None
         try:
-            host_path = get_paths().resolve_virtual_path(self.session_id, virtual_path).resolve()
+            if self._outputs_path is None:
+                host_path = get_paths().resolve_virtual_path(
+                    self.session_id,
+                    virtual_path,
+                ).resolve()
+            else:
+                host_path = resolve_outputs_virtual_path(
+                    self._outputs_path,
+                    virtual_path,
+                )
         except (OSError, ValueError):
             return None
         name = PurePosixPath(virtual_path).name or "artifact"

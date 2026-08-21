@@ -8,6 +8,7 @@ from langgraph.runtime import Runtime
 
 from deerflow.agents.thread_state import ThreadDataState
 from deerflow.config.paths import Paths, get_paths
+from deerflow.sandbox.output_paths import workspace_outputs_path
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ class ThreadDataMiddleware(AgentMiddleware[ThreadDataMiddlewareState]):
         workspace_path = context.get("workspace_path")
         if workspace_path:
             paths["workspace_path"] = str(workspace_path)
+            paths["outputs_path"] = workspace_outputs_path(str(workspace_path))
 
         return {
             "thread_data": {

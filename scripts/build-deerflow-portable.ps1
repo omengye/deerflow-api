@@ -109,11 +109,20 @@ $forbiddenRuntimePackages = @(
     "agent_sandbox-*.dist-info"
     "volcenginesdk*"
     "volcengine_python_sdk-*.dist-info"
+    "playwright"
+    "playwright-*.dist-info"
+    "patchright"
+    "patchright-*.dist-info"
 )
 foreach ($pattern in $forbiddenRuntimePackages) {
     if (Get-ChildItem -LiteralPath $sitePackages -Filter $pattern -Force) {
         throw "Portable Local-only runtime unexpectedly contains: $pattern"
     }
+}
+
+$pywin32Chm = Join-Path $sitePackages "PyWin32.chm"
+if (Test-Path -LiteralPath $pywin32Chm) {
+    Remove-Item -LiteralPath $pywin32Chm -Force
 }
 
 Write-Host "Pre-compiling Python bytecode (.pyc)..."
@@ -134,7 +143,7 @@ foreach ($relative in @("config", "data", "skills", "logs", "backups", "runtime\
 }
 
 Write-Host "Validating embedded Python modules..."
-& (Join-Path $runtimeRoot "python.exe") -c "import importlib.util; import boto3; import botocore.config; import deerflow.config_tool; import deerflow.acp.daemon; assert importlib.util.find_spec('agent_sandbox') is None; print('embedded Local-only runtime ok')"
+& (Join-Path $runtimeRoot "python.exe") -c "import importlib.util; import boto3; import botocore.config; import deerflow.config_tool; import deerflow.acp.daemon; from deerflow.community.scrapling.tools import web_fetch_tool; assert importlib.util.find_spec('agent_sandbox') is None; assert importlib.util.find_spec('playwright') is None; assert importlib.util.find_spec('patchright') is None; print('embedded Local-only runtime ok')"
 if ($LASTEXITCODE -ne 0) { throw "Embedded Python validation failed" }
 
 if (-not $SkipZip) {

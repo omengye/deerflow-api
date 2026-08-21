@@ -1343,6 +1343,38 @@ async def test_event_mapper_waits_for_async_artifact_publication() -> None:
 
 
 @pytest.mark.asyncio
+async def test_event_mapper_resolves_local_artifact_from_acp_workspace_outputs(
+    tmp_path: Path,
+) -> None:
+    updates: list[Any] = []
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    report = outputs / "report.txt"
+    report.write_text("report", encoding="utf-8")
+
+    async def send(update: Any) -> None:
+        updates.append(update)
+
+    mapper = ACPEventMapper(
+        "session-1",
+        send,
+        outputs_path=str(outputs),
+    )
+    await mapper.handle(
+        SimpleNamespace(
+            type="values",
+            data={"artifacts": ["/mnt/user-data/outputs/report.txt"], "todos": []},
+        )
+    )
+
+    resources = [
+        update for update in updates if isinstance(update, schema.AgentMessageChunk)
+    ]
+    assert len(resources) == 1
+    assert resources[0].content.uri == report.resolve().as_uri()
+
+
+@pytest.mark.asyncio
 async def test_event_mapper_can_start_subagent_from_progress_or_terminal_event() -> (
     None
 ):

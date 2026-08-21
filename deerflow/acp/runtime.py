@@ -144,7 +144,7 @@ class LocalACPRuntime:
             agent_name=self.config.agent_name,
         )
         client = await self._client_for(session)
-        client.warmup()
+        await asyncio.to_thread(client.warmup)
 
     async def _client_for(self, session: LocalACPSession) -> DeerFlowClient:
         if self._checkpointer is None:

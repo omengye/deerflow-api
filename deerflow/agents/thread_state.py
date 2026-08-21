@@ -26,6 +26,7 @@ class SandboxState(TypedDict):
     skills_revision: NotRequired[str]
     skills_path: NotRequired[str]
     available_skills: NotRequired[list[str] | None]
+    workspace_path: NotRequired[str | None]
 
 
 class AgentContext(TypedDict, total=False):

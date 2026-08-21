@@ -135,11 +135,15 @@ class LocalWslProvider(SandboxProvider):
         thread_id: str | None = None,
         *,
         available_skills: Collection[str] | None = None,
+        workspace_path: str | None = None,
     ) -> str:
         global _singleton
         from deerflow.config import get_app_config
         from deerflow.sandbox.local.local_sandbox import PathMapping
         from deerflow.skills.projection import get_skill_projection
+
+        if workspace_path is not None:
+            raise ValueError("LocalWslProvider does not support external workspace mounts")
 
         projection = get_skill_projection(available_skills)
         sandbox_id = f"wsl:{projection.revision}"

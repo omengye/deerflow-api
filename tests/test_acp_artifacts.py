@@ -76,6 +76,7 @@ async def test_rustfs_publisher_uploads_presented_output_and_emits_signed_link(
         "session-1",
         "run-1",
         "/mnt/user-data/outputs/report.txt",
+        str(outputs),
     )
 
     digest = hashlib.sha256(content).hexdigest()

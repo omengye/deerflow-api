@@ -36,7 +36,8 @@ dependencies = [
     "langchain-deepseek>=1.0.1",
     "pyyaml>=6.0.3",
     "readabilipy>=0.3.0",
-    "scrapling[fetchers]>=0.4.0",
+    "scrapling>=0.4.0",
+    "curl-cffi>=0.7.0",
     "json-repair>=0.30.0",
     # IANA timezone database for Windows and minimal container images.
     "tzdata>=2025.2",

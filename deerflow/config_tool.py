@@ -24,6 +24,7 @@ import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from deerflow.config.agents_config import AgentConfig, validate_agent_name
+from deerflow.config.memory_config import MemoryConfig
 from deerflow.config.model_config import ModelConfig
 from deerflow.config.sandbox_config import SandboxConfig
 from deerflow.config.skill_evolution_config import SkillEvolutionConfig
@@ -70,6 +71,44 @@ class RuntimeDocument(BaseModel):
         return value
 
 
+class MemoryDocument(BaseModel):
+    """Editable local DeerMem settings plus lossless source mappings."""
+
+    enabled: bool = True
+    manager_class: str = "deermem"
+    mode: str = "middleware"
+    injection_enabled: bool = True
+    shutdown_flush_timeout_seconds: float = Field(default=30, ge=0.1, le=300)
+    storage_path: str = ""
+    storage_class: str = "deerflow.agents.memory.storage.FileMemoryStorage"
+    debounce_seconds: int = Field(default=30, ge=1, le=300)
+    model_name: str | None = None
+    max_facts: int = Field(default=100, ge=10, le=500)
+    fact_confidence_threshold: float = Field(default=0.7, ge=0, le=1)
+    max_injection_tokens: int = Field(default=2000, ge=100, le=8000)
+    retrieval_enabled: bool = True
+    retrieval_top_k: int = Field(default=12, ge=1, le=100)
+    retrieval_index_path: str = ""
+    advanced: dict[str, Any] = Field(default_factory=dict)
+    backend_advanced: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("manager_class")
+    @classmethod
+    def _local_manager_only(cls, value: str) -> str:
+        value = value.strip()
+        if value != "deermem":
+            raise ValueError("portable configuration currently supports only local DeerMem")
+        return value
+
+    @field_validator("mode")
+    @classmethod
+    def _memory_mode(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"middleware", "tool"}:
+            raise ValueError("must be middleware or tool")
+        return value
+
+
 class SkillEvolutionDocument(SkillEvolutionConfig):
     """Editable evolution settings plus the source mapping for lossless writes."""
 
@@ -98,6 +137,7 @@ class SaveDocument(BaseModel):
     default_model: str
     models: list[dict[str, Any]]
     runtime: RuntimeDocument
+    memory: MemoryDocument
     agents: list[dict[str, Any]]
     subagents: SubagentsDocument
     sandbox: SandboxDocument
@@ -360,6 +400,74 @@ def _runtime_document(data: dict[str, Any]) -> dict[str, Any]:
     ).model_dump()
 
 
+_MEMORY_BACKEND_FIELDS = {
+    "storage_path",
+    "storage_class",
+    "debounce_seconds",
+    "model_name",
+    "max_facts",
+    "fact_confidence_threshold",
+    "max_injection_tokens",
+    "retrieval_enabled",
+    "retrieval_top_k",
+    "retrieval_index_path",
+}
+_MEMORY_TOP_LEVEL_FIELDS = {
+    "enabled",
+    "manager_class",
+    "mode",
+    "injection_enabled",
+    "shutdown_flush_timeout_seconds",
+    "backend_config",
+    *_MEMORY_BACKEND_FIELDS,
+}
+
+
+def _memory_document(data: dict[str, Any]) -> dict[str, Any]:
+    raw: dict[str, Any] = (
+        data.get("memory") if isinstance(data.get("memory"), dict) else {}
+    )
+    config = MemoryConfig.model_validate(raw)
+    if config.manager_class != "deermem":
+        raise ValueError(
+            "Portable deerflow-config currently supports only local DeerMem; "
+            f"found memory.manager_class={config.manager_class!r}"
+        )
+    backend = config.backend_config
+    return MemoryDocument(
+        enabled=config.enabled,
+        manager_class=config.manager_class,
+        mode=config.mode,
+        injection_enabled=config.injection_enabled,
+        shutdown_flush_timeout_seconds=config.shutdown_flush_timeout_seconds,
+        storage_path=config.storage_path,
+        storage_class=config.storage_class,
+        debounce_seconds=config.debounce_seconds,
+        model_name=config.model_name,
+        max_facts=config.max_facts,
+        fact_confidence_threshold=config.fact_confidence_threshold,
+        max_injection_tokens=config.max_injection_tokens,
+        retrieval_enabled=config.retrieval_enabled,
+        retrieval_top_k=config.retrieval_top_k,
+        retrieval_index_path=config.retrieval_index_path,
+        advanced={
+            key: deepcopy(value)
+            for key, value in raw.items()
+            if key not in _MEMORY_TOP_LEVEL_FIELDS
+        },
+        backend_advanced={
+            key: deepcopy(value)
+            for key, value in backend.items()
+            if key not in _MEMORY_BACKEND_FIELDS
+        },
+    ).model_dump()
+
+
+def _memory_data_path(base_dir: Path, configured: str, default_name: str) -> Path:
+    path = Path(configured or default_name).expanduser()
+    return (path if path.is_absolute() else base_dir / path).resolve()
+
+
 def _sandbox_document(data: dict[str, Any]) -> dict[str, Any]:
     raw = data.get("sandbox")
     raw = raw if isinstance(raw, dict) else {}
@@ -478,6 +586,8 @@ def snapshot(config_path: Path, user_data: Path) -> dict[str, Any]:
     extensions = _load_json_object(extensions_path)
     skills_path = _skills_path(config_path, user_data, data)
     agents_dir = _deerflow_home(config_path, user_data, data) / "agents"
+    memory = _memory_document(data)
+    deerflow_home = _deerflow_home(config_path, user_data, data)
     raw_models = data.get("models") if isinstance(data.get("models"), list) else []
     return {
         "config_revision": _sha256(config_path),
@@ -485,6 +595,7 @@ def snapshot(config_path: Path, user_data: Path) -> dict[str, Any]:
         "default_model": str(data.get("default_model") or (raw_models[0].get("name") if raw_models else "")),
         "models": [_redacted_model(model) for model in raw_models if isinstance(model, dict)],
         "runtime": _runtime_document(data),
+        "memory": memory,
         "agents": _agent_documents(agents_dir),
         "subagents": _subagents_document(data),
         "sandbox": _sandbox_document(data),
@@ -503,6 +614,18 @@ def snapshot(config_path: Path, user_data: Path) -> dict[str, Any]:
             "skills": str(skills_path),
             "agents": str(agents_dir),
             "user_data": str(user_data),
+            "memory": str(
+                _memory_data_path(
+                    deerflow_home, str(memory["storage_path"]), "memory.json"
+                )
+            ),
+            "memory_index": str(
+                _memory_data_path(
+                    deerflow_home,
+                    str(memory["retrieval_index_path"]),
+                    "memory-fts5.sqlite3",
+                )
+            ),
         },
     }
 
@@ -641,6 +764,51 @@ def save(config_path: Path, user_data: Path, document: SaveDocument) -> dict[str
     agent_names = {name for _, name, _, _ in agents}
     if runtime.agent_name and runtime.agent_name not in agent_names:
         raise ValueError("The ACP Agent must reference a configured custom Agent")
+    memory_document = document.memory
+    if memory_document.model_name and memory_document.model_name not in model_names:
+        raise ValueError("The memory extraction model must reference a configured model")
+    existing_memory: dict[str, Any] = (
+        data.get("memory") if isinstance(data.get("memory"), dict) else {}
+    )
+    existing_backend: dict[str, Any] = (
+        existing_memory.get("backend_config")
+        if isinstance(existing_memory.get("backend_config"), dict)
+        else {}
+    )
+    memory_backend = _restore_redacted(
+        {
+            **deepcopy(memory_document.backend_advanced),
+            "storage_path": memory_document.storage_path.strip(),
+            "storage_class": memory_document.storage_class.strip(),
+            "debounce_seconds": memory_document.debounce_seconds,
+            "model_name": memory_document.model_name,
+            "max_facts": memory_document.max_facts,
+            "fact_confidence_threshold": memory_document.fact_confidence_threshold,
+            "max_injection_tokens": memory_document.max_injection_tokens,
+            "retrieval_enabled": memory_document.retrieval_enabled,
+            "retrieval_top_k": memory_document.retrieval_top_k,
+            "retrieval_index_path": memory_document.retrieval_index_path.strip(),
+        },
+        existing_backend,
+    )
+    memory = _restore_redacted(
+        {
+            **deepcopy(memory_document.advanced),
+            "enabled": memory_document.enabled,
+            "manager_class": "deermem",
+            "mode": memory_document.mode,
+            "injection_enabled": memory_document.injection_enabled,
+            "shutdown_flush_timeout_seconds": memory_document.shutdown_flush_timeout_seconds,
+            "backend_config": memory_backend,
+        },
+        existing_memory,
+    )
+    if _contains_redacted(memory):
+        raise ValueError("Memory settings contain a redacted value without an existing secret")
+    memory_config = MemoryConfig.model_validate(memory)
+    from deerflow.agents.memory import validate_memory_manager_config
+
+    validate_memory_manager_config(memory_config)
     subagents = deepcopy(document.subagents.advanced)
     subagents_settings = document.subagents.model_dump(
         exclude={"advanced", "builtin_agents"}
@@ -696,6 +864,7 @@ def save(config_path: Path, user_data: Path, document: SaveDocument) -> dict[str
     candidate["sandbox"] = sandbox
     candidate["tool_groups"] = tool_groups
     candidate["tools"] = tools
+    candidate["memory"] = memory
     local = candidate.setdefault("local_acp", {})
     for key, value in runtime.model_dump().items():
         local[key] = value

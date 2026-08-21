@@ -90,6 +90,14 @@ DeerFlow ACP 支持客户端发送标准 `ImageContentBlock`，也支持引用�
 
 “Skills”页面可以查看待审批 Proposal 的详情、Diff、安全扫描和评估结果，并执行批准发布或拒绝。Signal、Probation、归档和完整历史仍在 DeerFlow Admin 页面中管理。
 
+## 长期记忆
+
+“记忆”页面用于配置便携版内置的本地 DeerMem。可以启停长期记忆，选择自动召回（`middleware`）或模型主动搜索（`tool`），并调整提取模型、写入延迟、事实数量、置信度、注入 Token、FTS5 检索和关闭刷新超时。
+
+“ACP 记忆作用域”控制不同客户端会话之间如何共享记忆：`global` 全局共享，`workspace` 按项目目录隔离，`session` 按 ACP 会话隔离。便携版默认使用 `workspace`。
+
+默认记忆数据保存在 `user-data/data/deerflow/memory.json`，可重建的检索索引保存在 `user-data/data/deerflow/memory-fts5.sqlite3`。建议保持相对路径，以便移动整个便携目录时同时迁移记忆。本便携版本的配置工具只支持本地 DeerMem，不提供远程 Mem0 配置。
+
 ## Subagents
 
 “Agent”页面包含与 Admin 一致的 Subagents 全局开关、默认超时、默认最大轮次和模型分配，也可以直接编辑 `agents` 与 `custom_agents` 高级 JSON。Subagent 全局开关和“Runtime / ACP”页面的会话级 Subagents 开关需要同时启用。

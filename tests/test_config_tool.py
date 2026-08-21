@@ -5,13 +5,13 @@ from pathlib import Path
 
 import pytest
 import yaml
+from langchain_core.tools import BaseTool
 
 from deerflow import config_tool
 from deerflow.acp.config import LocalACPConfig
 from deerflow.config.app_config import AppConfig
 from deerflow.config.skills_config import SkillsConfig
 from deerflow.reflection import resolve_variable
-from langchain_core.tools import BaseTool
 
 
 def _layout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -101,6 +101,92 @@ def test_layout_snapshot_and_save_preserve_secrets_and_mcp(tmp_path: Path) -> No
     assert extensions["mcpServers"]["keep"]["command"] == "example"
     assert extensions["skills"]["sample-skill"]["enabled"] is False
     assert Path(saved["backup"]).is_dir()
+
+
+def test_memory_snapshot_save_and_paths_use_portable_deerflow_home(tmp_path: Path) -> None:
+    config_path, user_data, _ = _layout(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["memory"]["future_setting"] = {"keep": True}
+    raw["memory"]["backend_config"]["future_backend_setting"] = 7
+    config_tool._atomic_write_yaml(config_path, raw)
+
+    current = config_tool.snapshot(config_path, user_data)
+    assert current["memory"]["enabled"] is True
+    assert current["memory"]["manager_class"] == "deermem"
+    assert current["memory"]["mode"] == "middleware"
+    assert current["memory"]["advanced"]["future_setting"] == {"keep": True}
+    assert current["memory"]["backend_advanced"]["future_backend_setting"] == 7
+    assert Path(current["paths"]["memory"]) == (
+        user_data / "data" / "deerflow" / "memory.json"
+    ).resolve()
+    assert Path(current["paths"]["memory_index"]) == (
+        user_data / "data" / "deerflow" / "memory-fts5.sqlite3"
+    ).resolve()
+
+    current["memory"].update(
+        {
+            "mode": "tool",
+            "model_name": "openai",
+            "debounce_seconds": 12,
+            "retrieval_top_k": 20,
+            "storage_path": "profile/memory.json",
+            "retrieval_index_path": "profile/memory.sqlite3",
+        }
+    )
+    saved = config_tool.save(
+        config_path,
+        user_data,
+        config_tool.SaveDocument.model_validate(current),
+    )
+
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))["memory"]
+    assert persisted["manager_class"] == "deermem"
+    assert persisted["mode"] == "tool"
+    assert persisted["future_setting"] == {"keep": True}
+    assert persisted["backend_config"]["model_name"] == "openai"
+    assert persisted["backend_config"]["debounce_seconds"] == 12
+    assert persisted["backend_config"]["retrieval_top_k"] == 20
+    assert persisted["backend_config"]["future_backend_setting"] == 7
+    assert Path(saved["paths"]["memory"]) == (
+        user_data / "data" / "deerflow" / "profile" / "memory.json"
+    ).resolve()
+
+
+def test_missing_memory_section_uses_defaults_and_is_written_on_save(tmp_path: Path) -> None:
+    config_path, user_data, _ = _layout(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw.pop("memory")
+    config_tool._atomic_write_yaml(config_path, raw)
+
+    current = config_tool.snapshot(config_path, user_data)
+    assert current["memory"]["enabled"] is True
+    assert current["memory"]["storage_path"] == ""
+    config_tool.save(
+        config_path,
+        user_data,
+        config_tool.SaveDocument.model_validate(current),
+    )
+
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted["memory"]["manager_class"] == "deermem"
+    assert persisted["memory"]["backend_config"]["storage_path"] == ""
+
+
+def test_memory_rejects_unknown_model_and_remote_manager(tmp_path: Path) -> None:
+    config_path, user_data, _ = _layout(tmp_path)
+    current = config_tool.snapshot(config_path, user_data)
+    current["memory"]["model_name"] = "missing-model"
+    with pytest.raises(ValueError, match="memory extraction model"):
+        config_tool.save(
+            config_path,
+            user_data,
+            config_tool.SaveDocument.model_validate(current),
+        )
+
+    current = config_tool.snapshot(config_path, user_data)
+    current["memory"]["manager_class"] = "mem0"
+    with pytest.raises(ValueError, match="only local DeerMem"):
+        config_tool.SaveDocument.model_validate(current)
 
 
 def test_subagent_collections_support_deletion(tmp_path: Path) -> None:
@@ -242,6 +328,9 @@ def test_portable_template_validates_and_resolves_default_tools(tmp_path: Path) 
     local_config = LocalACPConfig.from_file(str(config_path))
 
     assert app_config.get_default_model_name() == "openai"
+    assert app_config.memory.enabled is True
+    assert app_config.memory.manager_class == "deermem"
+    assert app_config.memory.retrieval_enabled is True
     assert local_config.checkpointer_path == (user_data / "data" / "acp-checkpoints.db").resolve()
     for tool in app_config.tools:
         assert resolve_variable(tool.use, BaseTool).name == tool.name

@@ -7,6 +7,7 @@ from langgraph.runtime import Runtime
 
 from deerflow.agents.thread_state import SandboxState, ThreadDataState
 from deerflow.sandbox import get_sandbox_provider
+from deerflow.sandbox.sandbox_provider import workspace_mount_path_from_thread_data
 
 logger = logging.getLogger(__name__)
 
@@ -46,21 +47,30 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
         self,
         thread_id: str,
         available_skills: list[str] | None,
+        workspace_path: str | None,
     ) -> tuple[str, dict]:
         from deerflow.skills.projection import get_skill_projection
 
         projection = get_skill_projection(available_skills)
         provider = get_sandbox_provider()
-        sandbox_id = provider.acquire(
-            thread_id,
-            available_skills=available_skills,
-        )
+        if workspace_path is None:
+            sandbox_id = provider.acquire(
+                thread_id,
+                available_skills=available_skills,
+            )
+        else:
+            sandbox_id = provider.acquire(
+                thread_id,
+                available_skills=available_skills,
+                workspace_path=workspace_path,
+            )
         logger.info(f"Acquiring sandbox {sandbox_id}")
         return sandbox_id, {
             "sandbox_id": sandbox_id,
             "skills_revision": projection.revision,
             "skills_path": str(projection.path),
             "available_skills": available_skills,
+            "workspace_path": workspace_path,
         }
 
     @override
@@ -78,7 +88,14 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
             if raw_skills is None:
                 raw_skills = (runtime.config or {}).get("metadata", {}).get("available_skills")
             available_skills = list(raw_skills) if raw_skills is not None else None
-            sandbox_id, sandbox_state = self._acquire_sandbox(thread_id, available_skills)
+            workspace_path = workspace_mount_path_from_thread_data(
+                state.get("thread_data")
+            )
+            sandbox_id, sandbox_state = self._acquire_sandbox(
+                thread_id,
+                available_skills,
+                workspace_path,
+            )
             logger.info(f"Assigned sandbox {sandbox_id} to thread {thread_id}")
             return {"sandbox": sandbox_state}
         return super().before_agent(state, runtime)

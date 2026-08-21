@@ -16,7 +16,10 @@ from deerflow.sandbox.exceptions import (
 )
 from deerflow.sandbox.file_operation_lock import get_file_operation_lock
 from deerflow.sandbox.sandbox import Sandbox
-from deerflow.sandbox.sandbox_provider import get_sandbox_provider
+from deerflow.sandbox.sandbox_provider import (
+    get_sandbox_provider,
+    workspace_mount_path_from_thread_data,
+)
 from deerflow.sandbox.search import GrepMatch
 from deerflow.sandbox.security import (
     LOCAL_HOST_BASH_DISABLED_MESSAGE,
@@ -1186,12 +1189,20 @@ def ensure_sandbox_initialized(runtime: ToolRuntime[AgentContext, ThreadState] |
     from deerflow.skills.projection import get_skill_projection
 
     projection = get_skill_projection(available_skills)
+    workspace_path = workspace_mount_path_from_thread_data(
+        runtime.state.get("thread_data")
+    )
 
-    # Check if the persisted sandbox is still bound to the current Skill view.
+    # Check if the persisted sandbox is still bound to the current Skill view
+    # and the current external workspace mount.
     sandbox_state = runtime.state.get("sandbox")
     if sandbox_state is not None:
         sandbox_id = sandbox_state.get("sandbox_id")
-        if sandbox_id is not None and sandbox_state.get("skills_revision") == projection.revision:
+        if (
+            sandbox_id is not None
+            and sandbox_state.get("skills_revision") == projection.revision
+            and sandbox_state.get("workspace_path") == workspace_path
+        ):
             sandbox = get_sandbox_provider().get(sandbox_id)
             if sandbox is not None:
                 if runtime.context is not None:
@@ -1207,10 +1218,17 @@ def ensure_sandbox_initialized(runtime: ToolRuntime[AgentContext, ThreadState] |
         raise SandboxRuntimeError("Thread ID not available in runtime context")
 
     provider = get_sandbox_provider()
-    sandbox_id = provider.acquire(
-        thread_id,
-        available_skills=available_skills,
-    )
+    if workspace_path is None:
+        sandbox_id = provider.acquire(
+            thread_id,
+            available_skills=available_skills,
+        )
+    else:
+        sandbox_id = provider.acquire(
+            thread_id,
+            available_skills=available_skills,
+            workspace_path=workspace_path,
+        )
 
     # Update runtime state - this persists across tool calls
     runtime.state["sandbox"] = {
@@ -1218,6 +1236,7 @@ def ensure_sandbox_initialized(runtime: ToolRuntime[AgentContext, ThreadState] |
         "skills_revision": projection.revision,
         "skills_path": str(projection.path),
         "available_skills": available_skills,
+        "workspace_path": workspace_path,
     }
 
     # Retrieve and return the sandbox
@@ -1260,11 +1279,21 @@ def ensure_thread_directories_exist(runtime: ToolRuntime[AgentContext, ThreadSta
     import os
 
     managed_keys = ["uploads_path", "outputs_path"]
-    if thread_data.get("workspace_path_managed", True):
+    workspace_is_managed = thread_data.get("workspace_path_managed", True)
+    if workspace_is_managed:
         managed_keys.insert(0, "workspace_path")
     for key in managed_keys:
         path = thread_data.get(key)
         if path:
+            if key == "outputs_path" and not workspace_is_managed:
+                workspace_path = thread_data.get("workspace_path")
+                if workspace_path and not os.path.isdir(workspace_path):
+                    try:
+                        Path(path).resolve().relative_to(Path(workspace_path).resolve())
+                    except ValueError:
+                        pass
+                    else:
+                        continue
             os.makedirs(path, exist_ok=True)
 
     # Mark as created to avoid redundant operations

@@ -92,6 +92,29 @@ skill_evolution:
     probation_uses: 3
     auto_rollback_consecutive_failures: 2
 
+# Local long-term memory. ACP memory_scope above controls whether these
+# memories are shared globally or isolated by workspace/session.
+memory:
+  enabled: true
+  manager_class: deermem
+  # middleware = automatically recall relevant facts; tool = expose memory_search.
+  # Both modes keep passive post-conversation memory writes enabled.
+  mode: middleware
+  injection_enabled: true
+  shutdown_flush_timeout_seconds: 30
+  backend_config:
+    # Relative paths resolve under user-data/data/deerflow in the portable build.
+    storage_path: memory.json
+    storage_class: deerflow.agents.memory.storage.FileMemoryStorage
+    debounce_seconds: 30
+    model_name: null
+    max_facts: 100
+    fact_confidence_threshold: 0.7
+    max_injection_tokens: 2000
+    retrieval_enabled: true
+    retrieval_top_k: 12
+    retrieval_index_path: memory-fts5.sqlite3
+
 tool_groups:
   - name: file:read
   - name: file:write

@@ -64,6 +64,7 @@ enum Page {
     Dashboard,
     Models,
     Agents,
+    Memory,
     Skills,
     SandboxTools,
     Runtime,
@@ -71,10 +72,11 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [(Self, &'static str); 7] = [
+    const ALL: [(Self, &'static str); 8] = [
         (Self::Dashboard, "概览"),
         (Self::Models, "模型"),
         (Self::Agents, "Agent"),
+        (Self::Memory, "记忆"),
         (Self::Skills, "Skills"),
         (Self::SandboxTools, "Sandbox / Tools"),
         (Self::Runtime, "Runtime / ACP"),
@@ -86,6 +88,7 @@ impl Page {
             Self::Dashboard => "概览",
             Self::Models => "模型配置",
             Self::Agents => "Agent 配置",
+            Self::Memory => "长期记忆",
             Self::Skills => "Skills",
             Self::SandboxTools => "Sandbox / Tools",
             Self::Runtime => "Runtime / ACP",
@@ -98,6 +101,7 @@ impl Page {
             Self::Dashboard => "运行状态、资源概览与 Daemon 生命周期管理",
             Self::Models => "管理模型 Provider、访问凭据与能力声明",
             Self::Agents => "配置任务型 Subagent 与可选的主 Agent",
+            Self::Memory => "配置本地 DeerMem 的提取、召回、检索与持久化",
             Self::Skills => "管理 Skill、改进候选和自进化安全边界",
             Self::SandboxTools => "控制执行边界、本地工具与 ACP 工具策略",
             Self::Runtime => "设置 ACP 会话的模型、权限与并发限制",
@@ -110,6 +114,7 @@ impl Page {
             Self::Dashboard => ui::Icon::Dashboard,
             Self::Models => ui::Icon::Models,
             Self::Agents => ui::Icon::Agents,
+            Self::Memory => ui::Icon::Memory,
             Self::Skills => ui::Icon::Skills,
             Self::SandboxTools => ui::Icon::Tools,
             Self::Runtime => ui::Icon::Runtime,
@@ -140,6 +145,7 @@ struct ConfigDocument {
     default_model: String,
     models: Vec<ModelDocument>,
     runtime: RuntimeDocument,
+    memory: MemoryDocument,
     agents: Vec<AgentDocument>,
     subagents: SubagentsDocument,
     sandbox: SandboxDocument,
@@ -227,6 +233,39 @@ struct RuntimeDocument {
     tool_allowlist_input: String,
     #[serde(skip)]
     tool_denylist_input: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MemoryDocument {
+    enabled: bool,
+    manager_class: String,
+    mode: String,
+    injection_enabled: bool,
+    shutdown_flush_timeout_seconds: f64,
+    storage_path: String,
+    storage_class: String,
+    debounce_seconds: u32,
+    model_name: Option<String>,
+    max_facts: u32,
+    fact_confidence_threshold: f64,
+    max_injection_tokens: u32,
+    retrieval_enabled: bool,
+    retrieval_top_k: u32,
+    retrieval_index_path: String,
+    advanced: Map<String, Value>,
+    backend_advanced: Map<String, Value>,
+    #[serde(skip)]
+    shutdown_flush_input: String,
+    #[serde(skip)]
+    debounce_input: String,
+    #[serde(skip)]
+    max_facts_input: String,
+    #[serde(skip)]
+    confidence_input: String,
+    #[serde(skip)]
+    max_tokens_input: String,
+    #[serde(skip)]
+    retrieval_top_k_input: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -362,6 +401,12 @@ impl ConfigDocument {
             .map(|items| items.join(", "))
             .unwrap_or_else(|| "*".into());
         self.runtime.tool_denylist_input = self.runtime.tool_denylist.join(", ");
+        self.memory.shutdown_flush_input = self.memory.shutdown_flush_timeout_seconds.to_string();
+        self.memory.debounce_input = self.memory.debounce_seconds.to_string();
+        self.memory.max_facts_input = self.memory.max_facts.to_string();
+        self.memory.confidence_input = self.memory.fact_confidence_threshold.to_string();
+        self.memory.max_tokens_input = self.memory.max_injection_tokens.to_string();
+        self.memory.retrieval_top_k_input = self.memory.retrieval_top_k.to_string();
         self.subagents.timeout_input = self.subagents.timeout_seconds.to_string();
         self.subagents.max_turns_input = self
             .subagents
@@ -448,6 +493,26 @@ impl ConfigDocument {
         self.sandbox.enforce_portable_local_mode();
         self.tool_groups = parse_json_object_array(&self.tool_groups_editor.text(), "Tool Groups")?;
         self.tools = parse_json_object_array(&self.tools_editor.text(), "Tools")?;
+        Ok(())
+    }
+
+    fn sync_memory_inputs(&mut self) -> Result<(), String> {
+        self.memory.shutdown_flush_timeout_seconds = parse_bounded_f64(
+            &self.memory.shutdown_flush_input,
+            "关闭刷新超时",
+            0.1,
+            300.0,
+        )?;
+        self.memory.debounce_seconds =
+            parse_bounded_u32(&self.memory.debounce_input, "记忆写入延迟", 1, 300)?;
+        self.memory.max_facts =
+            parse_bounded_u32(&self.memory.max_facts_input, "最大事实数", 10, 500)?;
+        self.memory.fact_confidence_threshold =
+            parse_bounded_f64(&self.memory.confidence_input, "事实置信度阈值", 0.0, 1.0)?;
+        self.memory.max_injection_tokens =
+            parse_bounded_u32(&self.memory.max_tokens_input, "最大注入 Token", 100, 8000)?;
+        self.memory.retrieval_top_k =
+            parse_bounded_u32(&self.memory.retrieval_top_k_input, "检索 Top K", 1, 100)?;
         Ok(())
     }
 
@@ -619,6 +684,8 @@ struct ProductDataPaths {
     skills: String,
     agents: String,
     user_data: String,
+    memory: String,
+    memory_index: String,
 }
 
 #[derive(Debug, Clone)]
@@ -707,6 +774,10 @@ enum DaemonStatus {
 }
 
 impl DaemonStatus {
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running(_))
+    }
+
     fn summary_label(&self) -> &'static str {
         match self {
             Self::Checking => "正在检查",
@@ -829,6 +900,19 @@ enum Message {
     ModelReasoning(bool),
     ModelVision(bool),
     DefaultModel(String),
+    MemoryEnabled(bool),
+    MemoryMode(String),
+    MemoryInjection(bool),
+    MemoryModel(String),
+    MemoryShutdownFlush(String),
+    MemoryStoragePath(String),
+    MemoryDebounce(String),
+    MemoryMaxFacts(String),
+    MemoryConfidence(String),
+    MemoryMaxTokens(String),
+    MemoryRetrieval(bool),
+    MemoryRetrievalTopK(String),
+    MemoryRetrievalIndexPath(String),
     SelectAgent(usize),
     AddAgent,
     RemoveAgent,
@@ -916,6 +1000,19 @@ impl Message {
                 | Self::ModelReasoning(_)
                 | Self::ModelVision(_)
                 | Self::DefaultModel(_)
+                | Self::MemoryEnabled(_)
+                | Self::MemoryMode(_)
+                | Self::MemoryInjection(_)
+                | Self::MemoryModel(_)
+                | Self::MemoryShutdownFlush(_)
+                | Self::MemoryStoragePath(_)
+                | Self::MemoryDebounce(_)
+                | Self::MemoryMaxFacts(_)
+                | Self::MemoryConfidence(_)
+                | Self::MemoryMaxTokens(_)
+                | Self::MemoryRetrieval(_)
+                | Self::MemoryRetrievalTopK(_)
+                | Self::MemoryRetrievalIndexPath(_)
                 | Self::AddAgent
                 | Self::RemoveAgent
                 | Self::AgentName(_)
@@ -1078,6 +1175,7 @@ impl App {
                 if let Err(error) = document
                     .sync_subagent_editors()
                     .and_then(|()| document.sync_sandbox_tool_editors())
+                    .and_then(|()| document.sync_memory_inputs())
                 {
                     self.error = Some(error);
                     self.notice = None;
@@ -1153,6 +1251,35 @@ impl App {
                 if let Some(document) = &mut self.document {
                     document.default_model = value;
                 }
+            }
+            Message::MemoryEnabled(value) => self.memory_mut(|item| item.enabled = value),
+            Message::MemoryMode(value) => self.memory_mut(|item| item.mode = value),
+            Message::MemoryInjection(value) => {
+                self.memory_mut(|item| item.injection_enabled = value)
+            }
+            Message::MemoryModel(value) => {
+                self.memory_mut(|item| item.model_name = non_empty(value))
+            }
+            Message::MemoryShutdownFlush(value) => {
+                self.memory_mut(|item| item.shutdown_flush_input = value)
+            }
+            Message::MemoryStoragePath(value) => self.memory_mut(|item| item.storage_path = value),
+            Message::MemoryDebounce(value) => self.memory_mut(|item| item.debounce_input = value),
+            Message::MemoryMaxFacts(value) => self.memory_mut(|item| item.max_facts_input = value),
+            Message::MemoryConfidence(value) => {
+                self.memory_mut(|item| item.confidence_input = value)
+            }
+            Message::MemoryMaxTokens(value) => {
+                self.memory_mut(|item| item.max_tokens_input = value)
+            }
+            Message::MemoryRetrieval(value) => {
+                self.memory_mut(|item| item.retrieval_enabled = value)
+            }
+            Message::MemoryRetrievalTopK(value) => {
+                self.memory_mut(|item| item.retrieval_top_k_input = value)
+            }
+            Message::MemoryRetrievalIndexPath(value) => {
+                self.memory_mut(|item| item.retrieval_index_path = value)
             }
             Message::SelectAgent(index) => self.selected_agent = index,
             Message::AddAgent => {
@@ -1630,6 +1757,12 @@ impl App {
         }
     }
 
+    fn memory_mut(&mut self, update: impl FnOnce(&mut MemoryDocument)) {
+        if let Some(document) = &mut self.document {
+            update(&mut document.memory);
+        }
+    }
+
     fn evolution_mut(&mut self, update: impl FnOnce(&mut SkillEvolutionDocument)) {
         if let Some(document) = &mut self.document {
             update(&mut document.skill_evolution);
@@ -1787,6 +1920,7 @@ impl App {
             Page::Dashboard => self.dashboard_view(),
             Page::Models => self.models_view(),
             Page::Agents => self.agents_view(),
+            Page::Memory => self.memory_view(),
             Page::Skills => self.skills_view(),
             Page::SandboxTools => self.sandbox_tools_view(),
             Page::Runtime => self.runtime_view(),
@@ -1847,6 +1981,8 @@ impl App {
             ),
         ]
         .spacing(14);
+        let daemon_running = self.daemon.is_running();
+        let daemon_checking = matches!(self.daemon, DaemonStatus::Checking);
         let controls = row![
             button(
                 row![
@@ -1858,7 +1994,10 @@ impl App {
             )
             .padding([9, 14])
             .style(ui::success_button)
-            .on_press_maybe((!self.busy && !self.dirty).then_some(Message::StartDaemon)),
+            .on_press_maybe(
+                (!self.busy && !self.dirty && !daemon_running && !daemon_checking)
+                    .then_some(Message::StartDaemon),
+            ),
             button(
                 row![
                     ui::icon_view(ui::Icon::Stop, 16.0, ui::DANGER),
@@ -1869,7 +2008,7 @@ impl App {
             )
             .padding([9, 14])
             .style(ui::danger_button)
-            .on_press_maybe((!self.busy).then_some(Message::StopDaemon)),
+            .on_press_maybe((!self.busy && daemon_running).then_some(Message::StopDaemon)),
             button(
                 row![
                     ui::icon_view(ui::Icon::Restart, 16.0, ui::WARNING),
@@ -1880,7 +2019,9 @@ impl App {
             )
             .padding([9, 14])
             .style(ui::warning_button)
-            .on_press_maybe((!self.busy && !self.dirty).then_some(Message::RestartDaemon)),
+            .on_press_maybe(
+                (!self.busy && !self.dirty && daemon_running).then_some(Message::RestartDaemon),
+            ),
         ]
         .spacing(12);
         let daemon_control = ui::section(
@@ -2941,6 +3082,164 @@ impl App {
             .into()
     }
 
+    fn memory_view(&self) -> Element<'_, Message> {
+        let Some(document) = &self.document else {
+            return text("尚未加载配置").into();
+        };
+        let memory = &document.memory;
+        let models = std::iter::once(String::new())
+            .chain(document.models.iter().map(|item| item.name.clone()))
+            .collect::<Vec<_>>();
+        let overview = ui::section(
+            "本地 DeerMem",
+            "在对话完成后异步提取稳定事实，并在后续 ACP 对话中按作用域召回。当前便携版仅支持本地 DeerMem。",
+            column![
+                row![
+                    checkbox(memory.enabled)
+                        .label("启用长期记忆")
+                        .style(ui::checkbox_style)
+                        .on_toggle(Message::MemoryEnabled),
+                    checkbox(memory.injection_enabled)
+                        .label("允许提示词注入")
+                        .style(ui::checkbox_style)
+                        .on_toggle(Message::MemoryInjection),
+                    checkbox(memory.retrieval_enabled)
+                        .label("启用 FTS5 相关性检索")
+                        .style(ui::checkbox_style)
+                        .on_toggle(Message::MemoryRetrieval),
+                ]
+                .spacing(18),
+                row![
+                    column![
+                        text("召回模式").size(13).color(ui::TEXT_SECONDARY),
+                        pick_list(
+                            vec!["middleware".into(), "tool".into()],
+                            Some(memory.mode.clone()),
+                            Message::MemoryMode
+                        )
+                        .style(ui::pick_list_style),
+                        text(if memory.mode == "middleware" {
+                            "自动向模型注入相关记忆"
+                        } else {
+                            "由模型主动调用 memory_search"
+                        })
+                        .size(12)
+                        .color(ui::TEXT_MUTED),
+                    ]
+                    .spacing(6)
+                    .width(Fill),
+                    column![
+                        text("记忆提取模型（留空使用默认模型）")
+                            .size(13)
+                            .color(ui::TEXT_SECONDARY),
+                        pick_list(models, memory.model_name.clone(), Message::MemoryModel)
+                            .style(ui::pick_list_style),
+                    ]
+                    .spacing(6)
+                    .width(Fill),
+                    column![
+                        text("ACP 记忆作用域").size(13).color(ui::TEXT_SECONDARY),
+                        pick_list(
+                            vec!["global".into(), "workspace".into(), "session".into()],
+                            Some(document.runtime.memory_scope.clone()),
+                            Message::RuntimeMemory
+                        )
+                        .style(ui::pick_list_style),
+                    ]
+                    .spacing(6)
+                    .width(Fill),
+                ]
+                .spacing(14),
+            ]
+            .spacing(16),
+        );
+        let extraction = ui::section(
+            "提取与注入",
+            "数值限制与 DeerFlow 内核一致；保存前会再次校验。",
+            column![
+                row![
+                    labeled_input(
+                        "写入延迟（秒，1–300）",
+                        &memory.debounce_input,
+                        "30",
+                        Message::MemoryDebounce
+                    ),
+                    labeled_input(
+                        "最大事实数（10–500）",
+                        &memory.max_facts_input,
+                        "100",
+                        Message::MemoryMaxFacts
+                    ),
+                    labeled_input(
+                        "事实置信度（0–1）",
+                        &memory.confidence_input,
+                        "0.7",
+                        Message::MemoryConfidence
+                    ),
+                ]
+                .spacing(12),
+                row![
+                    labeled_input(
+                        "最大注入 Token（100–8000）",
+                        &memory.max_tokens_input,
+                        "2000",
+                        Message::MemoryMaxTokens
+                    ),
+                    labeled_input(
+                        "检索 Top K（1–100）",
+                        &memory.retrieval_top_k_input,
+                        "12",
+                        Message::MemoryRetrievalTopK
+                    ),
+                    labeled_input(
+                        "关闭刷新超时（秒，0.1–300）",
+                        &memory.shutdown_flush_input,
+                        "30",
+                        Message::MemoryShutdownFlush
+                    ),
+                ]
+                .spacing(12),
+            ]
+            .spacing(14),
+        );
+        let storage = ui::section(
+            "本地持久化",
+            "相对路径以 user-data/data/deerflow 为基准。使用相对路径可保持整个目录可移动。",
+            column![
+                row![
+                    labeled_input(
+                        "记忆文件",
+                        &memory.storage_path,
+                        "memory.json",
+                        Message::MemoryStoragePath
+                    ),
+                    labeled_input(
+                        "FTS5 索引",
+                        &memory.retrieval_index_path,
+                        "memory-fts5.sqlite3",
+                        Message::MemoryRetrievalIndexPath
+                    ),
+                ]
+                .spacing(12),
+                text(format!("当前记忆文件：{}", document.paths.memory))
+                    .size(12)
+                    .color(ui::TEXT_SECONDARY),
+                text(format!("当前检索索引：{}", document.paths.memory_index))
+                    .size(12)
+                    .color(ui::TEXT_SECONDARY),
+                text(format!("存储实现：{}", memory.storage_class))
+                    .size(12)
+                    .color(ui::TEXT_MUTED),
+            ]
+            .spacing(8),
+        );
+        scrollable(column![overview, extraction, storage].spacing(16))
+            .spacing(8)
+            .width(Fill)
+            .height(Fill)
+            .into()
+    }
+
     fn runtime_view(&self) -> Element<'_, Message> {
         let Some(document) = &self.document else {
             return text("尚未加载配置").into();
@@ -3062,72 +3361,83 @@ impl App {
     }
 
     fn diagnostics_view(&self) -> Element<'_, Message> {
-        let path_rows = [
+        let mut path_rows = vec![
             ("产品目录", self.paths.root.clone()),
             ("配置文件", self.paths.config.clone()),
             ("用户数据", self.paths.user_data.clone()),
             ("Python", self.paths.python.clone()),
             ("ACP Bridge", self.paths.bridge.clone()),
             ("Runtime", self.paths.runtime.clone()),
-        ]
-        .into_iter()
-        .fold(column![].spacing(9), |list, (label, path)| {
-            let folder = if path.is_dir() {
-                path.clone()
-            } else {
-                path.parent().unwrap_or(Path::new(".")).to_path_buf()
-            };
-            list.push(
-                container(
-                    row![
-                        text(label)
-                            .size(13)
-                            .color(ui::TEXT_SECONDARY)
-                            .width(Length::Fixed(100.0)),
-                        text(path.display().to_string())
-                            .size(13)
-                            .color(ui::TEXT_PRIMARY)
-                            .width(Fill)
-                            .wrapping(text::Wrapping::WordOrGlyph),
-                        button(
-                            row![
-                                ui::icon_view(ui::Icon::Folder, 15.0, ui::TEXT_SECONDARY),
-                                text("打开目录"),
-                            ]
-                            .spacing(7)
-                            .align_y(iced::Alignment::Center),
-                        )
-                        .style(ui::secondary_button)
-                        .on_press(Message::OpenFolder(folder)),
-                    ]
-                    .spacing(12)
-                    .align_y(iced::Alignment::Center),
+            ("Daemon 日志", self.paths.runtime.join("daemon.log")),
+        ];
+        if let Some(document) = &self.document {
+            path_rows.push(("记忆文件", PathBuf::from(&document.paths.memory)));
+            path_rows.push(("记忆索引", PathBuf::from(&document.paths.memory_index)));
+        }
+        let path_rows = path_rows
+            .into_iter()
+            .fold(column![].spacing(9), |list, (label, path)| {
+                let folder = if path.is_dir() {
+                    path.clone()
+                } else {
+                    path.parent().unwrap_or(Path::new(".")).to_path_buf()
+                };
+                list.push(
+                    container(
+                        row![
+                            text(label)
+                                .size(13)
+                                .color(ui::TEXT_SECONDARY)
+                                .width(Length::Fixed(100.0)),
+                            text(path.display().to_string())
+                                .size(13)
+                                .color(ui::TEXT_PRIMARY)
+                                .width(Fill)
+                                .wrapping(text::Wrapping::WordOrGlyph),
+                            button(
+                                row![
+                                    ui::icon_view(ui::Icon::Folder, 15.0, ui::TEXT_SECONDARY),
+                                    text("打开目录"),
+                                ]
+                                .spacing(7)
+                                .align_y(iced::Alignment::Center),
+                            )
+                            .style(ui::secondary_button)
+                            .on_press(Message::OpenFolder(folder)),
+                        ]
+                        .spacing(12)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding(11)
+                    .style(ui::inset_card),
                 )
-                .padding(11)
-                .style(ui::inset_card),
+            });
+        scrollable(
+            container(
+                column![
+                    text("便携路径").size(20).color(ui::TEXT_PRIMARY),
+                    path_rows,
+                    container(
+                        row![
+                            ui::icon_view(ui::Icon::Alert, 16.0, ui::ACCENT),
+                            text("本工具不包含 Waku / Zed 连通性测试；请在客户端配置 deerflow-acp.exe 后手动验证。")
+                                .size(13)
+                                .color(ui::TEXT_SECONDARY),
+                        ]
+                        .spacing(8)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding(10)
+                    .style(ui::accent_card),
+                ]
+                .spacing(14),
             )
-        });
-        container(
-            column![
-                text("便携路径").size(20).color(ui::TEXT_PRIMARY),
-                path_rows,
-                container(
-                    row![
-                        ui::icon_view(ui::Icon::Alert, 16.0, ui::ACCENT),
-                        text("本工具不包含 Waku / Zed 连通性测试；请在客户端配置 deerflow-acp.exe 后手动验证。")
-                            .size(13)
-                            .color(ui::TEXT_SECONDARY),
-                    ]
-                    .spacing(8)
-                    .align_y(iced::Alignment::Center),
-                )
-                .padding(10)
-                .style(ui::accent_card),
-            ]
-            .spacing(14),
+            .padding(18)
+            .style(ui::card),
         )
-        .padding(18)
-        .style(ui::card)
+        .spacing(8)
+        .width(Fill)
+        .height(Fill)
         .into()
     }
 }
@@ -3147,6 +3457,49 @@ fn labeled_input<'a>(
     .spacing(6)
     .width(Fill)
     .into()
+}
+
+fn parse_bounded_u32(value: &str, label: &str, minimum: u32, maximum: u32) -> Result<u32, String> {
+    let parsed = value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| format!("{label}必须是整数"))?;
+    if !(minimum..=maximum).contains(&parsed) {
+        return Err(format!("{label}必须在 {minimum} 到 {maximum} 之间"));
+    }
+    Ok(parsed)
+}
+
+fn parse_bounded_f64(value: &str, label: &str, minimum: f64, maximum: f64) -> Result<f64, String> {
+    let parsed = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| format!("{label}必须是数字"))?;
+    if !parsed.is_finite() || parsed < minimum || parsed > maximum {
+        return Err(format!("{label}必须在 {minimum} 到 {maximum} 之间"));
+    }
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod memory_input_tests {
+    use super::{parse_bounded_f64, parse_bounded_u32};
+
+    #[test]
+    fn accepts_memory_limits_at_their_boundaries() {
+        assert_eq!(parse_bounded_u32("10", "facts", 10, 500), Ok(10));
+        assert_eq!(parse_bounded_u32("500", "facts", 10, 500), Ok(500));
+        assert_eq!(parse_bounded_f64("0", "confidence", 0.0, 1.0), Ok(0.0));
+        assert_eq!(parse_bounded_f64("1", "confidence", 0.0, 1.0), Ok(1.0));
+    }
+
+    #[test]
+    fn rejects_out_of_range_and_non_finite_memory_values() {
+        assert!(parse_bounded_u32("9", "facts", 10, 500).is_err());
+        assert!(parse_bounded_u32("abc", "facts", 10, 500).is_err());
+        assert!(parse_bounded_f64("1.1", "confidence", 0.0, 1.0).is_err());
+        assert!(parse_bounded_f64("NaN", "confidence", 0.0, 1.0).is_err());
+    }
 }
 
 fn non_empty(value: String) -> Option<String> {
@@ -3593,21 +3946,23 @@ fn query_daemon(paths: &ProductPaths) -> DaemonStatus {
 fn daemon_action(paths: &ProductPaths, action: DaemonCommand) -> Result<DaemonStatus, String> {
     match action {
         DaemonCommand::Start => {
-            bridge_command(paths, "--start-daemon")?;
+            let details = bridge_command(paths, "--start-daemon")?;
+            Ok(DaemonStatus::Running(details))
         }
         DaemonCommand::Stop => {
             if matches!(query_daemon(paths), DaemonStatus::Running(_)) {
                 bridge_command(paths, "--stop-daemon")?;
             }
+            Ok(DaemonStatus::Stopped)
         }
         DaemonCommand::Restart => {
             if matches!(query_daemon(paths), DaemonStatus::Running(_)) {
                 bridge_command(paths, "--stop-daemon")?;
             }
-            bridge_command(paths, "--start-daemon")?;
+            let details = bridge_command(paths, "--start-daemon")?;
+            Ok(DaemonStatus::Running(details))
         }
     }
-    Ok(query_daemon(paths))
 }
 
 fn save_and_restart(
@@ -3622,10 +3977,13 @@ fn save_and_restart(
     match saved {
         Ok(mut document) => {
             document.prepare_editor_state();
-            if was_running {
-                bridge_command(paths, "--start-daemon")?;
-            }
-            Ok((document, query_daemon(paths), was_running))
+            let daemon_status = if was_running {
+                let details = bridge_command(paths, "--start-daemon")?;
+                DaemonStatus::Running(details)
+            } else {
+                DaemonStatus::Stopped
+            };
+            Ok((document, daemon_status, was_running))
         }
         Err(error) => {
             if was_running {

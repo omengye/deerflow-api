@@ -27,6 +27,7 @@ from deerflow.agents.image_inputs import (
     validate_image_turn,
 )
 from deerflow.config import get_app_config
+from deerflow.sandbox.output_paths import workspace_outputs_path
 from deerflow.config.agents_config import list_custom_agents, load_agent_config
 
 from .artifact_publisher import RustFSArtifactPublisher
@@ -384,6 +385,7 @@ class DeerFlowACPAgent:
             mapper = ACPEventMapper(
                 session_id,
                 lambda update: self._session_update(session_id, update),
+                outputs_path=workspace_outputs_path(session.cwd),
             )
             for index, message in enumerate(replay_state.get("messages", [])):
                 message_type = message.get("type")
@@ -691,12 +693,14 @@ class DeerFlowACPAgent:
             message = "\n".join(text_parts).strip()
             artifact_run_id = uuid.uuid4().hex
             artifact_publisher = self._artifact_publisher
+            outputs_path = workspace_outputs_path(session.cwd)
             artifact_resolver = (
                 (
                     lambda path: artifact_publisher.publish(
                         session_id,
                         artifact_run_id,
                         path,
+                        outputs_path,
                     )
                 )
                 if artifact_publisher is not None
@@ -706,6 +710,7 @@ class DeerFlowACPAgent:
                 session_id,
                 lambda update: self._session_update(session_id, update),
                 artifact_resolver=artifact_resolver,
+                outputs_path=outputs_path,
             )
             cancelled = False
             try:

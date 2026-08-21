@@ -16,11 +16,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .agent import DeerFlowACPAgent
 
 import acp
 
-from .agent import DeerFlowACPAgent
 from .config import LocalACPConfig
 from .daemon_endpoint import (
     ENDPOINT_FILENAME,
@@ -93,6 +95,23 @@ async def _close_writer(writer: asyncio.StreamWriter) -> None:
         pass
 
 
+def _default_agent_factory(
+    config: LocalACPConfig,
+    store: LocalACPSessionStore,
+    runtime: LocalACPRuntime,
+    *,
+    connection_id: str | None = None,
+) -> DeerFlowACPAgent:
+    from .agent import DeerFlowACPAgent
+
+    return DeerFlowACPAgent(
+        config,
+        store,
+        runtime,
+        connection_id=connection_id,
+    )
+
+
 class ACPDaemon:
     """Serve multiple local ACP clients while reusing the expensive runtime."""
 
@@ -103,7 +122,7 @@ class ACPDaemon:
         runtime: LocalACPRuntime,
         runtime_dir: Path,
         *,
-        agent_factory: Callable[..., DeerFlowACPAgent] = DeerFlowACPAgent,
+        agent_factory: Callable[..., DeerFlowACPAgent] | None = None,
         management_handler: Callable[
             [dict[str, Any]], Awaitable[dict[str, Any]]
         ] = handle_proposal_management_request,
@@ -115,7 +134,7 @@ class ACPDaemon:
         self.runtime_dir = ensure_runtime_dir(runtime_dir)
         self.endpoint_path = self.runtime_dir / ENDPOINT_FILENAME
         self.token = token or secrets.token_urlsafe(32)
-        self.agent_factory = agent_factory
+        self.agent_factory = agent_factory or _default_agent_factory
         self.management_handler = management_handler
         self.endpoint: DaemonEndpoint | None = None
         self._server: asyncio.Server | None = None
@@ -408,6 +427,7 @@ async def _run_daemon(
     store = LocalACPSessionStore(config.session_store_path)
     store.setup()
     daemon = ACPDaemon(config, store, runtime, runtime_dir)
+    warmup_task: asyncio.Task[None] | None = None
     try:
         await runtime.open()
         purged = await store.purge_closed(
@@ -416,13 +436,28 @@ async def _run_daemon(
         await runtime.purge_checkpoints(purged)
         if purged:
             logger.info("Purged %d closed ACP session(s)", len(purged))
-        if warmup:
-            logger.info("Warming DeerFlow agent graph")
-            await runtime.warmup()
         await daemon.start()
         _install_signal_handlers(daemon)
+        if warmup:
+            async def _do_warmup() -> None:
+                try:
+                    logger.info("Warming DeerFlow agent graph in background")
+                    await runtime.warmup()
+                    logger.info("DeerFlow agent graph warmup complete")
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Background agent graph warmup failed")
+
+            warmup_task = asyncio.create_task(_do_warmup())
         await daemon.wait()
     finally:
+        if warmup_task is not None and not warmup_task.done():
+            warmup_task.cancel()
+            try:
+                await warmup_task
+            except asyncio.CancelledError:
+                pass
         await daemon.close()
         await runtime.close()
         store.close()

@@ -608,8 +608,12 @@ class AioSandboxProvider(SandboxProvider):
         thread_id: str | None = None,
         *,
         available_skills: Collection[str] | None = None,
+        workspace_path: str | None = None,
     ) -> str:
         from deerflow.skills.projection import get_skill_projection
+
+        if workspace_path is not None:
+            raise ValueError("AioSandboxProvider does not support external workspace mounts")
 
         safe_thread_id = self._safe_thread_id(thread_id)
         projection = get_skill_projection(available_skills)

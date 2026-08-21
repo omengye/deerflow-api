@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Collection
+from pathlib import Path
 
 from deerflow.config import get_app_config
 from deerflow.reflection import resolve_class
@@ -18,8 +19,13 @@ class SandboxProvider(ABC):
         thread_id: str | None = None,
         *,
         available_skills: Collection[str] | None = None,
+        workspace_path: str | None = None,
     ) -> str:
         """Acquire a sandbox environment and return its ID.
+
+        ``workspace_path`` is an optional existing host directory that should
+        back ``/mnt/user-data/workspace`` for this sandbox. Providers that
+        cannot safely expose host directories should reject it explicitly.
 
         Returns:
             The ID of the acquired sandbox environment.
@@ -54,6 +60,41 @@ class SandboxProvider(ABC):
     def active_skill_revisions(self) -> set[str]:
         """Return Skill projections currently reachable by provider resources."""
         return set()
+
+
+def normalize_workspace_mount_path(workspace_path: str | None) -> str | None:
+    """Validate and canonicalize an external workspace mount source."""
+
+    if workspace_path is None:
+        return None
+    if not isinstance(workspace_path, str) or not workspace_path.strip():
+        raise ValueError("Sandbox workspace_path must be a non-empty path")
+
+    path = Path(workspace_path).expanduser()
+    if not path.is_absolute():
+        raise ValueError("Sandbox workspace_path must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"Sandbox workspace_path does not exist: {workspace_path}"
+        ) from exc
+    if not resolved.is_dir():
+        raise ValueError(
+            f"Sandbox workspace_path is not a directory: {workspace_path}"
+        )
+    return str(resolved)
+
+
+def workspace_mount_path_from_thread_data(thread_data: object) -> str | None:
+    """Return the canonical external workspace requested by thread state."""
+
+    if not isinstance(thread_data, dict):
+        return None
+    if thread_data.get("workspace_path_managed", True):
+        return None
+    value = thread_data.get("workspace_path")
+    return normalize_workspace_mount_path(value if isinstance(value, str) else None)
 
 
 _default_sandbox_provider: SandboxProvider | None = None
