@@ -1,0 +1,84 @@
+name: Release Windows Portable ACP
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-portable-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-portable:
+    name: Build and Upload Windows x64 Portable Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            bridge -> bridge/target
+            desktop -> desktop/target
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.18"
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Build DeerFlow Portable Package
+        shell: pwsh
+        run: |
+          .\scripts\build-deerflow-portable.ps1 -Configuration Release
+
+      - name: Calculate SHA-256 Checksums
+        shell: pwsh
+        run: |
+          $distPortable = Join-Path (Get-Location) "dist\portable"
+          if (Test-Path -LiteralPath $distPortable) {
+            Get-ChildItem -Path $distPortable -Filter "*.zip" | ForEach-Object {
+              $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              $checksumPath = "$($_.FullName).sha256"
+              "$hash  $($_.Name)" | Set-Content -Path $checksumPath -Encoding ascii
+              Write-Host "Generated checksum for $($_.Name): $hash"
+            }
+          } else {
+            throw "dist\portable directory was not found after build!"
+          }
+
+      - name: Upload to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/portable/*.zip
+            dist/portable/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Artifacts to GitHub Actions
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeerFlow-windows-x64-portable
+          path: |
+            dist/portable/*.zip
+            dist/portable/*.sha256
+          if-no-files-found: error
