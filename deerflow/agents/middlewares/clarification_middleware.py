@@ -9,14 +9,94 @@ from typing import Any, override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.graph import END
 from langgraph.prebuilt.tool_node import ToolCallRequest
+from langgraph.runtime import Runtime
 from langgraph.types import Command
 
 logger = logging.getLogger(__name__)
 
+ASK_CLARIFICATION_TOOL_NAME = "ask_clarification"
 _XML_TAG_RE = re.compile(r"</?[A-Za-z_][\w:.-]*(?:\s[^<>]*?)?\s*/?>")
+
+
+def _filter_provider_tool_blocks(
+    content: Any,
+    kept_ids: set[str],
+    kept_names: set[str],
+) -> Any:
+    """Keep provider-native content blocks aligned with structured tool calls."""
+    if not isinstance(content, list):
+        return content
+
+    filtered: list[Any] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") in {"tool_use", "function_call"}:
+            block_id = block.get("id")
+            if isinstance(block_id, str) and block_id:
+                if block_id not in kept_ids:
+                    continue
+            elif block.get("type") == "function_call":
+                name = block.get("name")
+                if not isinstance(name, str) or name not in kept_names:
+                    continue
+        filtered.append(block)
+    return filtered
+
+
+def _clone_with_tool_calls(
+    message: AIMessage,
+    tool_calls: list[dict[str, Any]],
+    *,
+    content: Any,
+) -> AIMessage:
+    """Clone an AI message while synchronizing raw provider tool metadata."""
+    kept_ids = {
+        call["id"]
+        for call in tool_calls
+        if isinstance(call.get("id"), str) and call["id"]
+    }
+    kept_names = {
+        str(call["name"])
+        for call in tool_calls
+        if isinstance(call.get("name"), str) and call["name"]
+    }
+
+    additional_kwargs = dict(message.additional_kwargs or {})
+    raw_tool_calls = additional_kwargs.get("tool_calls")
+    if isinstance(raw_tool_calls, list):
+        retained_raw = [
+            raw
+            for raw in raw_tool_calls
+            if isinstance(raw, dict)
+            and isinstance(raw.get("id"), str)
+            and raw["id"] in kept_ids
+        ]
+        if retained_raw:
+            additional_kwargs["tool_calls"] = retained_raw
+        else:
+            additional_kwargs.pop("tool_calls", None)
+
+    raw_function_call = additional_kwargs.get("function_call")
+    if isinstance(raw_function_call, dict):
+        if raw_function_call.get("name") not in kept_names:
+            additional_kwargs.pop("function_call", None)
+    elif not tool_calls:
+        additional_kwargs.pop("function_call", None)
+
+    response_metadata = dict(message.response_metadata or {})
+    if not tool_calls and response_metadata.get("finish_reason") == "tool_calls":
+        response_metadata["finish_reason"] = "stop"
+
+    return message.model_copy(
+        update={
+            "content": content,
+            "tool_calls": tool_calls,
+            "additional_kwargs": additional_kwargs,
+            "response_metadata": response_metadata,
+        }
+    )
 
 
 class ClarificationMiddlewareState(AgentState):
@@ -39,6 +119,76 @@ class ClarificationMiddleware(AgentMiddleware[ClarificationMiddlewareState]):
     """
 
     state_schema = ClarificationMiddlewareState
+
+    def _drop_parallel_non_clarification_tools(
+        self,
+        state: AgentState,
+    ) -> dict | None:
+        """Keep only clarification calls when a provider batches sibling tools.
+
+        Tool nodes may execute parallel calls before a ``return_direct`` result
+        is routed to the end of the graph.  Rewriting the final AI message in
+        ``after_model`` prevents a sibling write or command from running before
+        the user has answered the clarification.
+        """
+        messages = list(state.get("messages") or [])
+        if not messages or not isinstance(messages[-1], AIMessage):
+            return None
+
+        message = messages[-1]
+        tool_calls = list(message.tool_calls or [])
+        invalid_tool_calls = [
+            call
+            for call in (getattr(message, "invalid_tool_calls", None) or [])
+            if isinstance(call, dict)
+        ]
+        clarification_calls = [
+            call
+            for call in tool_calls
+            if call.get("name") == ASK_CLARIFICATION_TOOL_NAME
+        ]
+        invalid_clarification_calls = [
+            call
+            for call in invalid_tool_calls
+            if call.get("name") == ASK_CLARIFICATION_TOOL_NAME
+        ]
+        if not clarification_calls and not invalid_clarification_calls:
+            return None
+
+        sibling_calls = [
+            call
+            for call in tool_calls
+            if call.get("name") != ASK_CLARIFICATION_TOOL_NAME
+        ]
+        if not sibling_calls:
+            return None
+
+        logger.warning(
+            "ask_clarification was emitted with sibling tool call(s); dropping %s",
+            [str(call.get("name") or "unknown") for call in sibling_calls],
+        )
+        kept_for_content = clarification_calls + invalid_clarification_calls
+        kept_ids = {
+            call["id"]
+            for call in kept_for_content
+            if isinstance(call.get("id"), str) and call["id"]
+        }
+        kept_names = {
+            str(call["name"])
+            for call in kept_for_content
+            if isinstance(call.get("name"), str) and call["name"]
+        }
+        filtered_content = _filter_provider_tool_blocks(
+            message.content,
+            kept_ids,
+            kept_names,
+        )
+        patched = _clone_with_tool_calls(
+            message,
+            clarification_calls,
+            content=filtered_content,
+        )
+        return {"messages": [patched]}
 
     def _stable_message_id(self, tool_call_id: str, formatted_message: str) -> str:
         """Build a deterministic message ID so retried clarification calls replace, not append."""
@@ -203,7 +353,7 @@ class ClarificationMiddleware(AgentMiddleware[ClarificationMiddlewareState]):
             Command that interrupts execution with the formatted clarification message
         """
         # Check if this is an ask_clarification tool call
-        if request.tool_call.get("name") != "ask_clarification":
+        if request.tool_call.get("name") != ASK_CLARIFICATION_TOOL_NAME:
             # Not a clarification call, execute normally
             return handler(request)
 
@@ -225,8 +375,16 @@ class ClarificationMiddleware(AgentMiddleware[ClarificationMiddlewareState]):
             Command that interrupts execution with the formatted clarification message
         """
         # Check if this is an ask_clarification tool call
-        if request.tool_call.get("name") != "ask_clarification":
+        if request.tool_call.get("name") != ASK_CLARIFICATION_TOOL_NAME:
             # Not a clarification call, execute normally
             return await handler(request)
 
         return self._handle_clarification(request)
+
+    @override
+    def after_model(self, state: AgentState, runtime: Runtime) -> dict | None:
+        return self._drop_parallel_non_clarification_tools(state)
+
+    @override
+    async def aafter_model(self, state: AgentState, runtime: Runtime) -> dict | None:
+        return self._drop_parallel_non_clarification_tools(state)

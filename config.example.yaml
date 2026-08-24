@@ -66,6 +66,8 @@ api:
   scheduler_db_path: ./data/scheduled_tasks.db
   scheduler_poll_interval_seconds: 5
   scheduler_timezone: Asia/Shanghai
+  # Independent graph budget for unattended runs; defaults to recursion_limit.
+  scheduler_recursion_limit: 200
   scheduler_max_concurrent_runs: 4
   # Occurrences use at-least-once execution. Keep prompts and mutating tools
   # idempotent because a transient failure can rerun the full prompt.

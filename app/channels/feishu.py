@@ -35,6 +35,26 @@ _PROPOSAL_DIFF_MAX_CHARS = 1_800
 _PROPOSAL_ERROR_MAX_CHARS = 500
 _MAX_FEISHU_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_FEISHU_FILE_BYTES = 30 * 1024 * 1024
+_FEISHU_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+
+
+def _read_binary_stream_bounded(stream: Any, max_bytes: int) -> bytes:
+    """Read a possibly short-reading SDK stream without exceeding max+1 bytes."""
+    data = bytearray()
+    while len(data) <= max_bytes:
+        remaining = max_bytes + 1 - len(data)
+        chunk = stream.read(min(_FEISHU_DOWNLOAD_CHUNK_BYTES, remaining))
+        if not chunk:
+            return bytes(data)
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise RuntimeError("Feishu resource download did not return bytes")
+        data.extend(chunk)
+    raise ValueError(
+        "Feishu resource exceeds the inbound file limit of "
+        f"{max_bytes} bytes"
+    )
+
+
 _FEISHU_IMAGE_EXTENSIONS = frozenset(
     {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".ico", ".tiff", ".heic"}
 )
@@ -1160,9 +1180,16 @@ class FeishuChannel:
         file_obj = getattr(resp, "file", None)
         if file_obj is None:
             raise RuntimeError("Feishu resource download did not return a file stream")
-        data = await asyncio.to_thread(file_obj.read)
-        if not isinstance(data, bytes):
-            raise RuntimeError("Feishu resource download did not return bytes")
+        try:
+            data = await asyncio.to_thread(
+                _read_binary_stream_bounded,
+                file_obj,
+                _MAX_FEISHU_FILE_BYTES,
+            )
+        finally:
+            close = getattr(file_obj, "close", None)
+            if callable(close):
+                await asyncio.to_thread(close)
         filename = getattr(resp, "file_name", "") or ""
         return data, filename
 

@@ -466,6 +466,15 @@ class Settings(BaseModel):
     scheduler_timezone: str = Field(
         default_factory=lambda: _setting_str("scheduler_timezone", "DEER_FLOW_SCHEDULER_TIMEZONE", "Asia/Shanghai")
     )
+    scheduler_recursion_limit: int = Field(
+        default_factory=lambda: _setting_int(
+            "scheduler_recursion_limit",
+            "DEER_FLOW_SCHEDULER_RECURSION_LIMIT",
+            _setting_int("recursion_limit", "DEER_FLOW_RECURSION_LIMIT", 200),
+        ),
+        ge=10,
+        le=2000,
+    )
     scheduler_max_concurrent_runs: int = Field(
         default_factory=lambda: _setting_int("scheduler_max_concurrent_runs", "DEER_FLOW_SCHEDULER_MAX_CONCURRENT_RUNS", 4),
         ge=1,

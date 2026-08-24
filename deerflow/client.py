@@ -19,7 +19,6 @@ import asyncio
 import json
 import logging
 import mimetypes
-import shutil
 import tempfile
 import uuid
 from collections.abc import AsyncGenerator, Generator, Sequence
@@ -66,7 +65,7 @@ from deerflow.config.paths import get_paths
 from deerflow.models import create_chat_model
 from deerflow.skills.installer import install_skill_from_archive
 from deerflow.uploads.manager import (
-    claim_unique_filename,
+    copy_file_exclusive,
     delete_file_safe,
     enrich_file_listing,
     ensure_uploads_dir,
@@ -1791,8 +1790,7 @@ class DeerFlowClient:
         from deerflow.utils.file_conversion import CONVERTIBLE_EXTENSIONS, convert_file_to_markdown
 
         # Validate all files upfront to avoid partial uploads.
-        resolved_files = []
-        seen_names: set[str] = set()
+        resolved_files: list[Path] = []
         has_convertible_file = False
         for f in files:
             p = Path(f)
@@ -1800,8 +1798,7 @@ class DeerFlowClient:
                 raise FileNotFoundError(f"File not found: {f}")
             if not p.is_file():
                 raise ValueError(f"Path is not a file: {f}")
-            dest_name = claim_unique_filename(p.name, seen_names)
-            resolved_files.append((p, dest_name))
+            resolved_files.append(p)
             if not has_convertible_file and p.suffix.lower() in CONVERTIBLE_EXTENSIONS:
                 has_convertible_file = True
 
@@ -1825,9 +1822,9 @@ class DeerFlowClient:
             return asyncio.run(convert_file_to_markdown(path))
 
         try:
-            for src_path, dest_name in resolved_files:
-                dest = uploads_dir / dest_name
-                shutil.copy2(src_path, dest)
+            for src_path in resolved_files:
+                dest = copy_file_exclusive(src_path, uploads_dir)
+                dest_name = dest.name
 
                 info: dict[str, Any] = {
                     "filename": dest_name,

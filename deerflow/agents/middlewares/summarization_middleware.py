@@ -18,6 +18,8 @@ from langgraph.config import get_config
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
 
+from deerflow.agents.middlewares.input_sanitization_middleware import is_genuine_user_message
+
 logger = logging.getLogger(__name__)
 
 
@@ -470,30 +472,48 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         messages: list[AnyMessage],
         cutoff_index: int,
     ) -> tuple[list[AnyMessage], list[AnyMessage]]:
-        """Partition like the parent, then rescue recently-loaded skill bundles."""
+        """Partition like the parent, then rescue the active request and recent skills.
+
+        Long tool-heavy turns can push the latest genuine user message behind the
+        parent's cutoff while keeping only tool traffic in the tail. The active
+        request must remain verbatim so the model still knows what those tools are
+        trying to accomplish. Middleware-generated HumanMessages are excluded by
+        ``is_genuine_user_message``.
+        """
         to_summarize, preserved = self._partition_messages(messages, cutoff_index)
+        latest_user = next((message for message in reversed(messages) if is_genuine_user_message(message)), None)
+
+        def rescue_latest_user() -> tuple[list[AnyMessage], list[AnyMessage]]:
+            if latest_user is None or not any(message is latest_user for message in to_summarize):
+                return to_summarize, preserved
+            remaining = [message for message in to_summarize if message is not latest_user]
+            return remaining, [latest_user, *preserved]
 
         if self._preserve_recent_skill_count == 0 or self._preserve_recent_skill_tokens == 0 or not to_summarize:
-            return to_summarize, preserved
+            return rescue_latest_user()
 
         try:
             bundles = self._find_skill_bundles(to_summarize, self._skills_container_path)
         except Exception:
             logger.exception("Skill-preserving summarization rescue failed; falling back to default partition")
-            return to_summarize, preserved
+            return rescue_latest_user()
 
         if not bundles:
-            return to_summarize, preserved
+            return rescue_latest_user()
 
         rescue_bundles = self._select_bundles_to_rescue(bundles)
         if not rescue_bundles:
-            return to_summarize, preserved
+            return rescue_latest_user()
 
         bundles_by_ai_index = {bundle.ai_index: bundle for bundle in rescue_bundles}
         rescue_tool_indices = {idx for bundle in rescue_bundles for idx in bundle.skill_tool_indices}
         rescued: list[AnyMessage] = []
         remaining: list[AnyMessage] = []
         for i, msg in enumerate(to_summarize):
+            if msg is latest_user:
+                rescued.append(msg)
+                continue
+
             bundle = bundles_by_ai_index.get(i)
             if bundle is not None and isinstance(msg, AIMessage):
                 rescued_tool_calls = [tc for tc in msg.tool_calls if tc.get("id") in bundle.skill_tool_call_ids]

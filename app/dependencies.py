@@ -226,6 +226,7 @@ class ClientManager:
                 manager=self,
                 poll_interval_seconds=settings.scheduler_poll_interval_seconds,
                 default_timezone=settings.scheduler_timezone,
+                recursion_limit_resolver=lambda: settings.scheduler_recursion_limit,
                 max_concurrent_runs=settings.scheduler_max_concurrent_runs,
                 max_attempts=settings.scheduler_max_attempts,
                 retry_base_seconds=settings.scheduler_retry_base_seconds,

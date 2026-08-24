@@ -1916,6 +1916,7 @@ tool_groups: []
             "/api/admin/runtime",
             headers=self._auth_headers(),
             json={
+                "scheduler_recursion_limit": 350,
                 "scheduler_max_concurrent_runs": 8,
                 "scheduler_max_attempts": 5,
                 "scheduler_retry_base_seconds": 20,
@@ -1929,10 +1930,17 @@ tool_groups: []
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
+        self.assertEqual(payload["effects"]["scheduler_recursion_limit"], "hot_applied")
         self.assertTrue(
-            all(effect == "requires_restart" for effect in payload["effects"].values())
+            all(
+                effect == "requires_restart"
+                for field, effect in payload["effects"].items()
+                if field != "scheduler_recursion_limit"
+            )
         )
+        self.assertEqual(settings.scheduler_recursion_limit, 350)
         raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["api"]["scheduler_recursion_limit"], 350)
         self.assertEqual(raw["api"]["scheduler_max_concurrent_runs"], 8)
         self.assertEqual(raw["api"]["scheduler_max_attempts"], 5)
         self.assertEqual(raw["api"]["scheduler_max_runs_per_task"], 2000)

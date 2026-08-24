@@ -42,6 +42,8 @@ def ask_clarification_tool(
     - Don't make assumptions when clarification is needed
     - For risky operations, ALWAYS ask for confirmation
     - After calling this tool, execution will be interrupted automatically
+    - Do not call other tools in the same turn; sibling tool calls are dropped
+      so they cannot execute before the user answers
 
     Args:
         question: The clarification question to ask the user. Be specific and clear.

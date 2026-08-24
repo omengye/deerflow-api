@@ -204,6 +204,47 @@ def _proposal(*, status: str = "pending_review", proposal_id: str = "p_test") ->
 
 
 class FeishuChannelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_incoming_resource_download_is_size_bounded_and_closes_stream(self) -> None:
+        channel = FeishuChannel(app_id="app", app_secret="secret")
+        read_sizes: list[int] = []
+
+        class Stream:
+            closed = False
+
+            def read(self, size: int) -> bytes:
+                read_sizes.append(size)
+                return b"12345"
+
+            def close(self) -> None:
+                self.closed = True
+
+        stream = Stream()
+        response = SimpleNamespace(
+            success=lambda: True,
+            file=stream,
+            file_name="large.bin",
+        )
+        channel._lark_client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message_resource=SimpleNamespace(get=lambda _request: response),
+                )
+            )
+        )
+        resource = _IncomingResource(
+            resource_type="file",
+            resource_key="file-key",
+            filename="large.bin",
+            message_id="message-1",
+        )
+
+        with patch("app.channels.feishu._MAX_FEISHU_FILE_BYTES", 4):
+            with self.assertRaisesRegex(ValueError, "inbound file limit"):
+                await channel._download_message_resource(resource)
+
+        self.assertEqual(read_sizes, [5])
+        self.assertTrue(stream.closed)
+
     async def test_attachment_upload_helpers_run_off_event_loop(self) -> None:
         channel = FeishuChannel(app_id="app", app_secret="secret")
         loop_thread = threading.get_ident()

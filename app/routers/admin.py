@@ -189,6 +189,7 @@ class AdminRuntimePatchRequest(BaseModel):
     scheduler_enabled: bool | None = None
     scheduler_poll_interval_seconds: float | None = Field(default=None, ge=0.5, le=3600)
     scheduler_timezone: str | None = Field(default=None, min_length=1, max_length=128)
+    scheduler_recursion_limit: int | None = Field(default=None, ge=10, le=2000)
     scheduler_max_concurrent_runs: int | None = Field(default=None, ge=1, le=100)
     scheduler_max_attempts: int | None = Field(default=None, ge=1, le=20)
     scheduler_retry_base_seconds: float | None = Field(default=None, ge=0, le=3600)
@@ -273,6 +274,7 @@ _HOT_RUNTIME_FIELDS = {
     "max_upload_size_mb",
     "max_uploads_per_request",
     "allowed_upload_extensions",
+    "scheduler_recursion_limit",
 }
 _RESTART_RUNTIME_FIELDS = {
     "allow_insecure_remote",

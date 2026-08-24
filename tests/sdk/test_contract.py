@@ -84,15 +84,27 @@ def test_no_langgraph_in_public_module() -> None:
     """
     import sys
 
-    # Drop any cached modules first so the import is observable.
-    for mod in list(sys.modules):
-        if mod.startswith(("deerflow_sdk", "langgraph", "langchain")):
-            del sys.modules[mod]
+    prefixes = ("deerflow_sdk", "langgraph", "langchain")
+    original_modules = {
+        name: module for name, module in sys.modules.items() if name.startswith(prefixes)
+    }
+    try:
+        # Drop any cached modules first so the import is observable.
+        for name in original_modules:
+            del sys.modules[name]
 
-    import deerflow_sdk  # noqa: F401
+        import deerflow_sdk  # noqa: F401
 
-    leaked = [m for m in sys.modules if m.startswith(("langgraph", "langchain"))]
-    assert leaked == [], f"public import leaked engine modules: {leaked}"
+        leaked = [name for name in sys.modules if name.startswith(("langgraph", "langchain"))]
+        assert leaked == [], f"public import leaked engine modules: {leaked}"
+    finally:
+        # Module deletion changes class identity for anything imported during
+        # test collection. Restore the process exactly so later tests do not
+        # depend on collection/execution order.
+        for name in list(sys.modules):
+            if name.startswith(prefixes):
+                del sys.modules[name]
+        sys.modules.update(original_modules)
 
 
 # ---------------------------------------------------------------------

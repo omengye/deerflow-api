@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta, timezone as fixed_timezone
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -985,6 +985,7 @@ class SchedulerService:
         manager: Any,
         poll_interval_seconds: float,
         default_timezone: str = "Asia/Shanghai",
+        recursion_limit_resolver: Callable[[], int] | None = None,
         max_concurrent_runs: int = 4,
         max_attempts: int = 3,
         retry_base_seconds: float = 15.0,
@@ -997,6 +998,7 @@ class SchedulerService:
         self.manager = manager
         self.poll_interval_seconds = max(0.5, poll_interval_seconds)
         self.default_timezone = default_timezone
+        self.recursion_limit_resolver = recursion_limit_resolver
         self.max_concurrent_runs = max(1, max_concurrent_runs)
         self.max_attempts = max(1, max_attempts)
         self.retry_base_seconds = max(0.0, retry_base_seconds)
@@ -1267,10 +1269,15 @@ class SchedulerService:
                 self._renew_lease(task_run_id, attempt_count),
                 name=f"scheduled-lease-{task_run_id}-a{attempt_count}",
             )
+            run_kwargs = dict(task.kwargs)
+            if self.recursion_limit_resolver is not None:
+                # Resolve at dispatch time so an Admin hot update applies to the
+                # next scheduled occurrence without restarting the scheduler.
+                run_kwargs["recursion_limit"] = int(self.recursion_limit_resolver())
             record = await self.manager.start_client_stream_run(
                 thread_id=task.thread_id,
                 message=task.prompt,
-                kwargs=task.kwargs,
+                kwargs=run_kwargs,
                 run_id=managed_run_id,
                 entrypoint="scheduled_task",
                 on_disconnect="continue",

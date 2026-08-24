@@ -367,6 +367,23 @@ class ProductionControlsTests(unittest.IsolatedAsyncioTestCase):
         finally:
             app_config._API_CONFIG = original_api_config
 
+    async def test_scheduler_recursion_limit_defaults_to_interactive_limit(self) -> None:
+        original_api_config = dict(app_config._API_CONFIG)
+        try:
+            app_config._API_CONFIG = {"recursion_limit": 321}
+            with patch.dict("os.environ", {}, clear=True):
+                inherited = app_config.Settings()
+            self.assertEqual(inherited.recursion_limit, 321)
+            self.assertEqual(inherited.scheduler_recursion_limit, 321)
+
+            app_config._API_CONFIG["scheduler_recursion_limit"] = 480
+            with patch.dict("os.environ", {}, clear=True):
+                overridden = app_config.Settings()
+            self.assertEqual(overridden.recursion_limit, 321)
+            self.assertEqual(overridden.scheduler_recursion_limit, 480)
+        finally:
+            app_config._API_CONFIG = original_api_config
+
     async def test_settings_support_legacy_and_short_subagent_env_names(self) -> None:
         original_api_config = dict(app_config._API_CONFIG)
         try:

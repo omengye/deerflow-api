@@ -136,10 +136,13 @@ class OAuthTokenManager:
     async def _fetch_token(self, oauth: McpOAuthConfig) -> _OAuthToken:
         import httpx  # pyright: ignore[reportMissingImports]
 
-        data: dict[str, str] = {
-            "grant_type": oauth.grant_type,
-            **oauth.extra_token_params,
-        }
+        # Operator-supplied extras may add provider-specific fields, but they
+        # must never override the reserved fields that select and configure the
+        # OAuth flow below.  In particular, letting an extra ``grant_type`` win
+        # would make the request body disagree with the branch logic in this
+        # method.
+        data: dict[str, str] = dict(oauth.extra_token_params)
+        data["grant_type"] = oauth.grant_type
 
         if oauth.scope:
             data["scope"] = oauth.scope

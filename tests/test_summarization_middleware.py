@@ -18,7 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from deerflow.agents.lead_agent import agent as lead_agent
 from deerflow.agents.middlewares.summarization_middleware import DeerFlowSummarizationMiddleware
@@ -71,6 +71,27 @@ def _state(count: int = 8) -> dict:
             messages.append(HumanMessage(content=f"question {i}"))
         else:
             messages.append(AIMessage(content=f"answer {i}"))
+    return {"messages": messages}
+
+
+def _tool_heavy_state(*, include_internal_reminder: bool = False) -> dict:
+    """A single active user turn whose request falls behind a tool-heavy cutoff."""
+    messages = [HumanMessage(content="CURRENT REQUEST", id="user-current")]
+    if include_internal_reminder:
+        messages.append(HumanMessage(content="internal reminder", name="todo_reminder", id="reminder"))
+    for index in range(3):
+        call_id = f"call-{index}"
+        messages.extend(
+            [
+                AIMessage(
+                    content="",
+                    id=f"assistant-{index}",
+                    tool_calls=[{"name": "search", "args": {"query": str(index)}, "id": call_id}],
+                ),
+                ToolMessage(content=f"result {index}", tool_call_id=call_id, id=f"tool-{index}"),
+            ]
+        )
+    messages.append(AIMessage(content="working", id="assistant-final"))
     return {"messages": messages}
 
 
@@ -203,6 +224,45 @@ def test_successful_summary_replaces_history_with_the_summary() -> None:
     (replacement,) = _replacements(update)
     assert replacement.additional_kwargs["lc_source"] == "summarization"
     assert "the summary" in replacement.content
+
+
+def test_latest_user_request_survives_tool_heavy_summarization() -> None:
+    """The live request must not be compressed while its tool turn is still running."""
+    seen: list = []
+    middleware = _middleware(_FakeModel(), before_summarization=[lambda event: seen.append(event)])
+
+    update = middleware.before_model(_tool_heavy_state(), _runtime())
+
+    assert update is not None
+    (event,) = seen
+    assert "CURRENT REQUEST" not in [message.content for message in event.messages_to_summarize]
+    assert "CURRENT REQUEST" in [message.content for message in event.preserved_messages]
+    assert "CURRENT REQUEST" in [message.content for message in update["messages"]]
+
+
+def test_internal_human_message_is_not_mistaken_for_current_user() -> None:
+    """Named middleware reminders must not displace the actual user request."""
+    seen: list = []
+    middleware = _middleware(_FakeModel(), before_summarization=[lambda event: seen.append(event)])
+
+    update = middleware.before_model(_tool_heavy_state(include_internal_reminder=True), _runtime())
+
+    assert update is not None
+    (event,) = seen
+    preserved_contents = [message.content for message in event.preserved_messages]
+    summarized_contents = [message.content for message in event.messages_to_summarize]
+    assert "CURRENT REQUEST" in preserved_contents
+    assert "internal reminder" in summarized_contents
+
+
+async def test_latest_user_request_survives_tool_heavy_summarization_async() -> None:
+    """Async execution must preserve the same active-request invariant."""
+    middleware = _middleware(_FakeModel())
+
+    update = await middleware.abefore_model(_tool_heavy_state(), _runtime())
+
+    assert update is not None
+    assert "CURRENT REQUEST" in [message.content for message in update["messages"]]
 
 
 def test_failed_summary_is_not_used_as_summary_content() -> None:

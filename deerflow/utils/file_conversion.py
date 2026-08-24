@@ -20,6 +20,7 @@ import re
 from pathlib import Path
 
 from deerflow.config.app_config import get_app_config
+from deerflow.uploads.manager import write_text_file_exclusive
 
 logger = logging.getLogger(__name__)
 
@@ -162,8 +163,7 @@ async def convert_file_to_markdown(file_path: Path) -> Path | None:
         else:
             text = _do_convert(file_path, pdf_converter)
 
-        md_path = file_path.with_suffix(".md")
-        md_path.write_text(text, encoding="utf-8")
+        md_path = write_text_file_exclusive(file_path.parent, file_path.with_suffix(".md").name, text)
 
         logger.info("Converted %s to markdown: %s (%d chars)", file_path.name, md_path.name, len(text))
         return md_path

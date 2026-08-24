@@ -114,6 +114,64 @@ def test_token_within_refresh_skew_triggers_refresh(monkeypatch: pytest.MonkeyPa
     assert fetch_calls == 1
 
 
+def test_extra_token_params_cannot_override_reserved_grant_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    post_calls: list[dict] = []
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "access_token": "fresh-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            }
+
+    class _AsyncClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> bool:
+            return False
+
+        async def post(self, url: str, data: dict) -> _Response:
+            post_calls.append({"url": url, "data": dict(data)})
+            return _Response()
+
+    monkeypatch.setattr("httpx.AsyncClient", _AsyncClient)
+    oauth = McpOAuthConfig(
+        token_url="https://example.invalid/token",
+        grant_type="client_credentials",
+        client_id="client",
+        client_secret="secret",
+        extra_token_params={
+            "grant_type": "password",
+            "resource": "https://api.example.invalid",
+        },
+    )
+
+    token = asyncio.run(OAuthTokenManager({SERVER: oauth})._fetch_token(oauth))
+
+    assert token.access_token == "fresh-access-token"
+    assert post_calls == [
+        {
+            "url": "https://example.invalid/token",
+            "data": {
+                "grant_type": "client_credentials",
+                "resource": "https://api.example.invalid",
+                "client_id": "client",
+                "client_secret": "secret",
+            },
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # (b) Same event loop: concurrent callers coalesce onto a single in-flight
 #     refresh (original single-fetch semantics preserved).

@@ -112,7 +112,7 @@ def sanitize_user_text(text: str) -> str:
     return f"{_USER_INPUT_BEGIN}\n{escaped}\n{_USER_INPUT_END}"
 
 
-def _is_genuine_user_message(message: object) -> bool:
+def is_genuine_user_message(message: object) -> bool:
     """Exclude HumanMessages synthesized by framework middlewares/providers."""
     if not isinstance(message, HumanMessage):
         return False
@@ -185,7 +185,7 @@ class InputSanitizationMiddleware(AgentMiddleware[AgentState]):
         messages = list(request.messages)
         changed = False
         for index, message in enumerate(messages):
-            if not _is_genuine_user_message(message):
+            if not is_genuine_user_message(message):
                 continue
 
             content = message.content

@@ -6,6 +6,7 @@ Both Gateway and Client delegate to these functions.
 
 import os
 import re
+import shutil
 from pathlib import Path
 from urllib.parse import quote
 
@@ -38,8 +39,20 @@ def get_uploads_dir(thread_id: str) -> Path:
 
 def ensure_uploads_dir(thread_id: str) -> Path:
     """Return the uploads directory for a thread, creating it if needed."""
-    base = get_uploads_dir(thread_id)
+    paths = get_paths()
+    base = paths.sandbox_uploads_dir(thread_id)
     base.mkdir(parents=True, exist_ok=True)
+    current = paths.base_dir
+    for part in base.relative_to(paths.base_dir).parts:
+        current /= part
+        if current.is_symlink():
+            raise PathTraversalError("Uploads directory cannot contain symbolic-link components")
+    if not base.is_dir():
+        raise PathTraversalError("Uploads directory must be a real directory")
+    try:
+        base.resolve().relative_to(paths.base_dir.resolve())
+    except ValueError:
+        raise PathTraversalError("Uploads directory escapes the DeerFlow data directory") from None
     return base
 
 
@@ -94,6 +107,66 @@ def claim_unique_filename(name: str, seen: set[str]) -> str:
         candidate = f"{stem}_{counter}{suffix}"
     seen.add(candidate)
     return candidate
+
+
+def _numbered_filename(name: str, counter: int) -> str:
+    if counter == 0:
+        return name
+    path = Path(name)
+    return f"{path.stem}_{counter}{path.suffix}"
+
+
+def copy_file_exclusive(source: Path, destination_dir: Path, preferred_name: str | None = None) -> Path:
+    """Copy *source* without overwriting or following an existing destination.
+
+    The destination is created with exclusive-create semantics (``xb``). This
+    makes the final filesystem operation authoritative even when another upload
+    process races with filename selection, and an existing symbolic link is
+    treated as a collision rather than followed. A numbered filename is retried
+    until one can be claimed.
+    """
+    source = Path(source)
+    safe_name = normalize_filename(preferred_name or source.name)
+    if destination_dir.is_symlink() or not destination_dir.is_dir():
+        raise PathTraversalError("Upload destination must be a real directory")
+
+    counter = 0
+    while True:
+        destination = destination_dir / _numbered_filename(safe_name, counter)
+        try:
+            output = destination.open("xb")
+        except FileExistsError:
+            counter += 1
+            continue
+
+        try:
+            with output, source.open("rb") as input_file:
+                shutil.copyfileobj(input_file, output, length=64 * 1024)
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+        return destination
+
+
+def write_text_file_exclusive(destination_dir: Path, preferred_name: str, text: str) -> Path:
+    """Write UTF-8 text using the same collision/symlink guarantees as uploads."""
+    safe_name = normalize_filename(preferred_name)
+    if destination_dir.is_symlink() or not destination_dir.is_dir():
+        raise PathTraversalError("Upload destination must be a real directory")
+
+    counter = 0
+    while True:
+        destination = destination_dir / _numbered_filename(safe_name, counter)
+        try:
+            with destination.open("x", encoding="utf-8", newline="") as output:
+                output.write(text)
+        except FileExistsError:
+            counter += 1
+            continue
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+        return destination
 
 
 def validate_path_traversal(path: Path, base: Path) -> None:

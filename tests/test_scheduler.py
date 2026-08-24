@@ -147,7 +147,16 @@ async def test_scheduler_service_dispatches_due_task(tmp_path):
     )
 
     await asyncio.sleep(0.02)
-    service = SchedulerService(store=store, manager=FakeManager(), poll_interval_seconds=1)
+    live_limit = {"value": 200}
+    service = SchedulerService(
+        store=store,
+        manager=FakeManager(),
+        poll_interval_seconds=1,
+        recursion_limit_resolver=lambda: live_limit["value"],
+    )
+    # The service was already constructed; changing the source before dispatch
+    # models an Admin hot update and must affect this occurrence.
+    live_limit["value"] = 350
     await service.tick()
     for _ in range(20):
         if calls:
@@ -157,6 +166,7 @@ async def test_scheduler_service_dispatches_due_task(tmp_path):
     assert calls
     assert calls[0]["thread_id"] == "thread-1"
     assert calls[0]["message"] == "run due task"
+    assert calls[0]["kwargs"]["recursion_limit"] == 350
     task_id = (await store.list_tasks(include_disabled=True))[0].id
     runs = []
     for _ in range(20):
