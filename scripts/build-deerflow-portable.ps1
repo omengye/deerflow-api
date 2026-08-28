@@ -143,7 +143,7 @@ foreach ($relative in @("config", "data", "skills", "logs", "backups", "runtime\
 }
 
 Write-Host "Validating embedded Python modules..."
-& (Join-Path $runtimeRoot "python.exe") -c "import importlib.util; import boto3; import botocore.config; import deerflow.config_tool; import deerflow.acp.daemon; from deerflow.community.scrapling.tools import web_fetch_tool; assert importlib.util.find_spec('agent_sandbox') is None; assert importlib.util.find_spec('playwright') is None; assert importlib.util.find_spec('patchright') is None; print('embedded Local-only runtime ok')"
+& (Join-Path $runtimeRoot "python.exe") -c "import importlib.util; import sys; import boto3; import botocore.config; import deerflow.config_tool; import deerflow.acp.daemon; from deerflow.community.scrapling.tools import _scrapling_fetch, web_fetch_tool; assert importlib.util.find_spec('agent_sandbox') is None; assert importlib.util.find_spec('playwright') is None; assert importlib.util.find_spec('patchright') is None; sys.modules['scrapling.fetchers'] = None; assert _scrapling_fetch('https://invalid.invalid', 1, None).startswith('Error: Scrapling fetch failed: ModuleNotFoundError'); print('embedded Local-only runtime ok')"
 if ($LASTEXITCODE -ne 0) { throw "Embedded Python validation failed" }
 
 if (-not $SkipZip) {

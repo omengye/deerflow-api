@@ -67,9 +67,14 @@ def _resolve_max_output_chars() -> int:
 
 def _scrapling_fetch(url: str, timeout: int, https_proxy: str | None) -> str:
     """Sync Scrapling fetch using curl_cffi-based Fetcher with browser impersonation."""
-    from scrapling.fetchers import Fetcher
-
     try:
+        # Some Scrapling releases import Playwright from their shared response
+        # converter even when only the curl_cffi-backed Fetcher is used. It is
+        # intentionally omitted from the portable runtime, so treat an import
+        # failure like any other Scrapling failure and let web_fetch fall back
+        # to the direct HTTP client.
+        from scrapling.fetchers import Fetcher
+
         kwargs: dict = {"timeout": timeout}
         if https_proxy:
             kwargs["proxy"] = https_proxy

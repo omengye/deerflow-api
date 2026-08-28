@@ -288,7 +288,11 @@ def latest_visible_assistant_signature(messages: list[Any]) -> str:
 def create_goal_evaluator_model(*, model_name: str | None = None) -> Any:
     """Create the non-thinking model used only for completion judgments."""
 
-    return create_chat_model(name=model_name, thinking_enabled=False)
+    return create_chat_model(
+        name=model_name,
+        thinking_enabled=False,
+        disable_keepalive=True,
+    )
 
 
 async def evaluate_goal_completion(

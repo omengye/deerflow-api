@@ -10,6 +10,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import START, StateGraph
 
+import deerflow.runtime.goal as goal_module
 from deerflow.acp.config import LocalACPConfig
 from deerflow.agents.goal_state import GoalEvaluation
 from deerflow.agents.thread_state import ThreadState
@@ -68,6 +69,28 @@ def test_parse_goal_evaluation_fails_closed_for_unknown_blocker() -> None:
         "blocker": "missing_evidence",
         "reason": "not enough",
         "evidence_summary": "none",
+    }
+
+
+def test_goal_evaluator_uses_an_owned_async_http_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    evaluator = object()
+
+    def fake_create_chat_model(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return evaluator
+
+    monkeypatch.setattr(goal_module, "create_chat_model", fake_create_chat_model)
+
+    result = goal_module.create_goal_evaluator_model(model_name="test-model")
+
+    assert result is evaluator
+    assert captured == {
+        "name": "test-model",
+        "thinking_enabled": False,
+        "disable_keepalive": True,
     }
 
 
