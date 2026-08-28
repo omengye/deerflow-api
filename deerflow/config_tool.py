@@ -47,6 +47,9 @@ class RuntimeDocument(BaseModel):
     max_active_connections: int = Field(default=16, ge=1, le=128)
     max_active_runs: int = Field(default=2, ge=1, le=128)
     run_timeout_seconds: float = Field(default=600, gt=0)
+    goal_auto_continue: bool = False
+    goal_max_continuations: int = Field(default=3, ge=0, le=8)
+    goal_max_no_progress_continuations: int = Field(default=2, ge=0, le=8)
     permission_mode: str = "dangerous"
     memory_scope: str = "workspace"
     enable_bash: bool = False
@@ -391,6 +394,12 @@ def _runtime_document(data: dict[str, Any]) -> dict[str, Any]:
         max_active_connections=local.get("max_active_connections", 16),
         max_active_runs=local.get("max_active_runs", 2),
         run_timeout_seconds=local.get("run_timeout_seconds", 600),
+        goal_auto_continue=local.get("goal_auto_continue", False),
+        goal_max_continuations=local.get("goal_max_continuations", 3),
+        goal_max_no_progress_continuations=local.get(
+            "goal_max_no_progress_continuations",
+            2,
+        ),
         permission_mode="off" if local.get("permission_mode") is False else local.get("permission_mode", "dangerous"),
         memory_scope=local.get("memory_scope", "workspace"),
         enable_bash=local.get("enable_bash", False),

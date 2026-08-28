@@ -1,6 +1,6 @@
 """File upload and artifact endpoints."""
+import hashlib
 import logging
-import shutil
 import tempfile
 from pathlib import Path
 from urllib.parse import quote
@@ -182,7 +182,9 @@ async def get_artifact(thread_id: str, path: str, download: bool = False):
 
     try:
         content, mime_type = client.get_artifact(thread_id, path)
-        headers = {}
+        # The API already has the artifact bytes in memory, so expose a
+        # content-addressed revision without another filesystem read.
+        headers = {"ETag": f'"{hashlib.sha256(content).hexdigest()}"'}
         if download:
             headers["Content-Disposition"] = _content_disposition(Path(path).name)
         return Response(content=content, media_type=mime_type, headers=headers)

@@ -101,6 +101,7 @@ class ACPEventMapper:
         }
         self._lead_usage = dict(self.usage)
         self._subagent_usage = dict(self.usage)
+        self._goal_evaluator_usage = dict(self.usage)
         self.failure_message: str | None = None
         self._closed = False
 
@@ -152,11 +153,11 @@ class ACPEventMapper:
             elif event_type == "end":
                 usage = data.get("usage")
                 if isinstance(usage, dict):
-                    self._lead_usage = {
-                        "input_tokens": max(0, int(usage.get("input_tokens", 0) or 0)),
-                        "output_tokens": max(0, int(usage.get("output_tokens", 0) or 0)),
-                        "total_tokens": max(0, int(usage.get("total_tokens", 0) or 0)),
-                    }
+                    for key in ("input_tokens", "output_tokens", "total_tokens"):
+                        self._lead_usage[key] += max(
+                            0,
+                            int(usage.get(key, 0) or 0),
+                        )
                     self._refresh_usage()
                 await self._send_usage_update(data)
             else:
@@ -342,6 +343,57 @@ class ACPEventMapper:
             self.failure_message = str(data.get("message") or data.get("reason") or "Model request failed")
             return
 
+        if event_type == "goal_status":
+            evaluator_usage = data.get("evaluator_usage")
+            if isinstance(evaluator_usage, dict):
+                for key in ("input_tokens", "output_tokens", "total_tokens"):
+                    self._goal_evaluator_usage[key] += max(
+                        0,
+                        int(evaluator_usage.get(key, 0) or 0),
+                    )
+                self._refresh_usage()
+            status = str(data.get("status") or "paused")
+            objective = str(data.get("objective") or "")
+            reason = str(data.get("reason") or "")
+            stand_down = str(data.get("stand_down_reason") or "")
+            count = max(0, int(data.get("continuation_count", 0) or 0))
+            maximum = max(0, int(data.get("max_continuations", 0) or 0))
+            if status == "completed":
+                text = f"Goal completed: {objective}"
+            elif status == "continuing":
+                text = f"Goal not complete; continuing ({count}/{maximum})."
+                if reason:
+                    text += f" {reason}"
+            elif stand_down == "auto_continue_disabled":
+                text = "Goal remains active; automatic continuation is disabled."
+            elif stand_down == "continuation_limit":
+                text = f"Goal remains active; continuation limit reached ({count}/{maximum})."
+            elif stand_down == "no_progress_limit":
+                text = "Goal remains active; automatic continuation stopped after repeated no-progress evaluations."
+            elif stand_down == "needs_user_input":
+                text = "Goal remains active and needs user input."
+            elif stand_down == "external_wait":
+                text = "Goal remains active and is waiting on an external system."
+            elif stand_down == "run_failed":
+                text = "Goal remains active; the run failed."
+            elif stand_down == "evaluator_failed":
+                text = "Goal remains active; completion evaluation failed safely."
+            else:
+                text = "Goal remains active; automatic continuation paused."
+            if status != "continuing" and status != "completed" and reason:
+                text += f" {reason}"
+            await self._send(
+                schema.AgentMessageChunk(
+                    session_update="agent_message_chunk",
+                    content=acp.text_block(_limited_text(text)),
+                    message_id=_message_uuid(
+                        "goal-status",
+                        f"{status}:{stand_down}:{count}:{objective}",
+                    ),
+                )
+            )
+            return
+
         task_id = str(data.get("task_id") or data.get("trace_id") or "")
         if event_type == "token_usage" and task_id:
             for key in ("input_tokens", "output_tokens", "total_tokens"):
@@ -415,7 +467,11 @@ class ACPEventMapper:
 
     def _refresh_usage(self) -> None:
         self.usage = {
-            key: self._lead_usage[key] + self._subagent_usage[key]
+            key: (
+                self._lead_usage[key]
+                + self._subagent_usage[key]
+                + self._goal_evaluator_usage[key]
+            )
             for key in ("input_tokens", "output_tokens", "total_tokens")
         }
 

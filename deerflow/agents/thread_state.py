@@ -15,6 +15,7 @@ from langchain_core.messages import (
 from langgraph.channels import DeltaChannel
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
+from deerflow.agents.goal_state import GoalState
 from deerflow.config.checkpointer_config import (
     DEFAULT_CHECKPOINT_SNAPSHOT_FREQUENCY,
     CheckpointChannelMode,
@@ -87,6 +88,16 @@ def merge_viewed_images(existing: dict[str, ViewedImageData] | None, new: dict[s
     return {**existing, **new}
 
 
+def merge_goal(
+    existing: GoalState | None,
+    new: GoalState | None,
+) -> GoalState | None:
+    """Preserve an active goal when a graph node does not update it."""
+    if new is None:
+        return existing
+    return new
+
+
 class ThreadState(AgentState):
     sandbox: NotRequired[SandboxState | None]
     thread_data: NotRequired[ThreadDataState | None]
@@ -94,6 +105,7 @@ class ThreadState(AgentState):
     artifacts: Annotated[list[str], merge_artifacts]
     uploaded_files: NotRequired[list[dict] | None]
     viewed_images: Annotated[dict[str, ViewedImageData], merge_viewed_images]  # image_path -> {base64, mime_type}
+    goal: Annotated[GoalState | None, merge_goal]
     thread_directories_created: NotRequired[bool]
 
 

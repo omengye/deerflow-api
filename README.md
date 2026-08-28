@@ -81,6 +81,26 @@ tools:
 
 七牛云配置也可以全部由服务进程环境变量提供：`QINIU_ACCESS_KEY`、`QINIU_SECRET_KEY`、`QINIU_BUCKET`、`QINIU_DOMAIN`、`QINIU_KEY_PREFIX` 和 `QINIU_PRIVATE_BUCKET`。下载、列举、查看元数据、删除和生成下载链接等工具的完整模板见 [config.example.yaml](config.example.yaml)。
 
+### 启用 RAGFlow 知识检索
+
+RAGFlow 检索使用现有 HTTP 依赖，不需要安装额外 SDK。将 `knowledge` 和 `knowledge_search` 分别追加到 `config.yaml` 已有的 `tool_groups:`、`tools:` 列表，不要创建重复键，并让 API Key 来自服务进程环境变量：
+
+```yaml
+tool_groups:
+  - name: knowledge
+
+tools:
+  - name: knowledge_search
+    group: knowledge
+    use: deerflow.community.ragflow.tools:knowledge_search_tool
+    base_url: http://localhost:9380
+    api_key: $RAGFLOW_API_KEY
+    datasets:
+      - 0123456789abcdef0123456789abcdef
+```
+
+`datasets` 是操作员侧的只读检索范围，不会作为工具参数暴露给模型。省略该字段会搜索当前 API Key 可访问的全部数据集；不要配置空列表。不同嵌入模型的数据集会分组检索并交错合并，空数据集会自动跳过。超时、召回阈值和输出长度等完整选项见 [config.example.yaml](config.example.yaml)。
+
 依赖和配置完成后请重启 API 服务；systemd、Docker 或多 worker 部署需要更新实际运行环境并重启所有 worker。若启动时仍提示缺少 SDK，请确认安装命令与启动命令都在本项目目录执行，并使用同一个 `.venv`（推荐始终通过 `uv run` 启动）。
 
 ## 配置方式
@@ -285,6 +305,9 @@ uv run deerflow-acp
 
 - Prompt 支持文本和 ACP `ResourceLink`。本地 `file:` 资源必须是真实存在且位于当前 session 的 `cwd` 内，并受 `resource_link_max_size_mb` 限制；`http/https` 链接只作为用户提供的数据引用传给 Agent，不会由适配层自动下载。暂不接受 embedded resource、图片或音频输入。
 - 支持多轮会话、完整历史重放、会话列表、`session/close`、取消、思考、计划、工具进度和本地产物链接。关闭的会话立即从列表和加载接口隐藏，超过 `closed_session_retention_days` 后会在 daemon/stdio 下次启动时连同 checkpoint 一起清理。
+- 支持线程级 `/goal <完成条件>`：命令会保存目标并立即以规范化后的完成条件开始任务；单独发送 `/goal` 查看当前状态，发送 `/goal clear`、`/goal reset` 或 `/goal off` 清除。目标随 checkpoint 恢复，完成后自动清除。带图片或 ResourceLink 的消息不会被识别为命令。
+- 每个有活动目标的 Agent 回合结束后，运行一个关闭 thinking 的独立模型判断，只依据客户端可见的对话证据。只有判断为 `goal_not_met_yet` 时才允许自动续跑；需要用户输入、运行失败、外部等待、证据不足或评估失败都会停止并保留目标状态。
+- 自动续跑默认关闭。设置 `local_acp.goal_auto_continue: true` 后启用；`goal_max_continuations` 默认 3、硬上限 8，`goal_max_no_progress_continuations` 默认 2。隐藏续跑仍受原 prompt 的超时、权限策略和取消控制，模型用量会累计到该次 ACP 响应。
 - 新建或加载会话时，会通过稳定版 ACP `configOptions` 暴露 `models:` 中配置的模型和服务端批准的 Agent Profile；支持该能力的客户端可按 session 选择。Profile 会实际应用其默认模型、工具组和 Skill 白名单，选择结果会持久化，且只能在 session 没有正在执行的 prompt 时切换。
 - Zed 通过 `session/new` 传入的绝对 `cwd` 会绑定为该会话的 `/mnt/user-data/workspace`。Agent 可在这个目录内列举、搜索、读取、写入、替换、移动/重命名和删除文件或目录；路径穿越以及通过符号链接或 junction 逃出工作区会被拒绝。
 - `cwd` 必须是已经存在的本地目录，加载会话时必须与创建会话时的目录一致。非空 `additionalDirectories` 会被明确拒绝。
@@ -299,7 +322,7 @@ uv run deerflow-acp
 - DeerFlow 的 uploads、outputs、ACP 外部 agent workspace 和会话状态仍保存在自己的线程目录中，不会混入客户端项目。
 - ACP 使用独立的 `acp-checkpoints.db` 和 `acp-sessions.db`，可与 HTTP API 同时运行而不共享 SQLite 写热点。
 
-可选配置见 `config.example.yaml` 的 `local_acp:`。也可用 `DEER_FLOW_ACP_CHECKPOINTER_PATH`、`DEER_FLOW_ACP_SESSION_STORE_PATH`、`DEER_FLOW_ACP_MAX_ACTIVE_CONNECTIONS`、`DEER_FLOW_ACP_MAX_ACTIVE_RUNS`、`DEER_FLOW_ACP_RUN_TIMEOUT`、`DEER_FLOW_ACP_ENABLE_BASH` 和 `DEER_FLOW_ACP_ACCEPT_CLIENT_MCP_SERVERS` 覆盖运行参数。Bridge 的 stdout 只承载 ACP JSON-RPC；daemon 日志写入独立轮转文件。
+可选配置见 `config.example.yaml` 的 `local_acp:`。也可用 `DEER_FLOW_ACP_CHECKPOINTER_PATH`、`DEER_FLOW_ACP_SESSION_STORE_PATH`、`DEER_FLOW_ACP_MAX_ACTIVE_CONNECTIONS`、`DEER_FLOW_ACP_MAX_ACTIVE_RUNS`、`DEER_FLOW_ACP_RUN_TIMEOUT`、`DEER_FLOW_ACP_GOAL_AUTO_CONTINUE`、`DEER_FLOW_ACP_GOAL_MAX_CONTINUATIONS`、`DEER_FLOW_ACP_GOAL_MAX_NO_PROGRESS_CONTINUATIONS`、`DEER_FLOW_ACP_ENABLE_BASH` 和 `DEER_FLOW_ACP_ACCEPT_CLIENT_MCP_SERVERS` 覆盖运行参数。Bridge 的 stdout 只承载 ACP JSON-RPC；daemon 日志写入独立轮转文件。
 
 ## 外部 ACP Agent 对接（Codex / Claude Code）
 

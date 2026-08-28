@@ -141,6 +141,12 @@ local_acp:
   # deleted at a later daemon/stdio startup after this retention period.
   closed_session_retention_days: 30
   recursion_limit: 200
+  # `/goal <completion condition>` always stores and evaluates a thread goal.
+  # Automatic hidden continuation is opt-in for portable ACP. Each continuation
+  # remains inside the original ACP prompt timeout and permission policy.
+  goal_auto_continue: false
+  goal_max_continuations: 3
+  goal_max_no_progress_continuations: 2
   agent_name: null
   # session/new.cwd is mounted as /mnt/user-data/workspace for this local
   # Agent. Portable ACP requires LocalSandboxProvider. The runtime omits bash
@@ -445,6 +451,7 @@ tool_groups:
   - name: bash
   - name: object_storage
   - name: host:opencli
+  - name: knowledge
 
 tool_search:
   enabled: false
@@ -490,6 +497,24 @@ tools:
     use: deerflow.community.image_search.tools:image_search_tool
     max_results: 5
     https_proxy: http://172.17.0.1:11055
+  # RAGFlow retrieval is read-only. Omit `datasets` to search every dataset
+  # visible to the configured API key, or list stable IDs to restrict scope.
+  # Empty datasets are skipped and mixed embedding models are queried in
+  # separate bounded groups before their ranked results are interleaved.
+  # - name: knowledge_search
+  #   group: knowledge
+  #   use: deerflow.community.ragflow.tools:knowledge_search_tool
+  #   base_url: http://localhost:9380
+  #   api_key: $RAGFLOW_API_KEY
+  #   datasets:
+  #     - 0123456789abcdef0123456789abcdef
+  #   timeout: 30
+  #   page_size: 8
+  #   similarity_threshold: 0.2
+  #   vector_similarity_weight: 0.3
+  #   top_k: 256
+  #   max_chars_per_chunk: 800
+  #   max_total_chars: 8000
   # Qiniu Kodo object storage tools. Install optional dependency first:
   #   uv sync --extra qiniu
   #

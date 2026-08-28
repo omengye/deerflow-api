@@ -7,6 +7,7 @@ no I/O.
 """
 
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -182,6 +183,66 @@ async def test_invoke_acp_agent_returns_agent_response_on_success(
     result = await _invoke(agent_config)
 
     assert result == "42"
+
+
+async def test_invoke_acp_agent_offloads_blocking_setup_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from deerflow.tools.builtins import invoke_acp_agent_tool as module
+
+    event_loop_thread = threading.get_ident()
+    helper_threads: dict[str, int] = {}
+
+    def work_dir(_thread_id):
+        helper_threads["work_dir"] = threading.get_ident()
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        return str(tmp_path)
+
+    def mcp_servers():
+        helper_threads["mcp_servers"] = threading.get_ident()
+        return []
+
+    monkeypatch.setattr(module, "_get_work_dir", work_dir)
+    monkeypatch.setattr(module, "_build_acp_mcp_servers", mcp_servers)
+    monkeypatch.setattr(
+        "acp.spawn_agent_process",
+        _fake_spawn_agent_process(hang=False, response_text="ok"),
+    )
+
+    result = await _invoke(_agent_config(timeout_seconds=5))
+
+    assert result == "ok"
+    assert helper_threads.keys() == {"work_dir", "mcp_servers"}
+    assert all(thread_id != event_loop_thread for thread_id in helper_threads.values())
+
+
+async def test_invoke_acp_agent_offloads_executable_lookup_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deerflow.tools.builtins import invoke_acp_agent_tool as module
+
+    event_loop_thread = threading.get_ident()
+    formatting_thread: list[int] = []
+
+    @asynccontextmanager
+    async def missing_process(*_args, **_kwargs):
+        raise FileNotFoundError("missing")
+        yield  # pragma: no cover
+
+    def format_error(_agent, _cmd, _error):
+        formatting_thread.append(threading.get_ident())
+        return "formatted failure"
+
+    monkeypatch.setattr(module, "_build_acp_mcp_servers", list)
+    monkeypatch.setattr(module, "_format_invocation_error", format_error)
+    monkeypatch.setattr("acp.spawn_agent_process", missing_process)
+
+    result = await _invoke(_agent_config(timeout_seconds=5))
+
+    assert result == "formatted failure"
+    assert len(formatting_thread) == 1
+    assert formatting_thread[0] != event_loop_thread
 
 
 async def test_invoke_acp_agent_forwards_live_chunks_before_prompt_completes(

@@ -175,6 +175,9 @@ class LocalACPConfig:
     plan_mode: bool = True
     max_concurrent_subagents: int = 2
     recursion_limit: int = 200
+    goal_auto_continue: bool = False
+    goal_max_continuations: int = 3
+    goal_max_no_progress_continuations: int = 2
     agent_name: str | None = None
     enable_bash: bool = False
     accept_client_mcp_servers: bool = False
@@ -241,6 +244,14 @@ class LocalACPConfig:
         recursion_limit = int(
             _value(local, "recursion_limit", _value(api, "recursion_limit", 200))
         )
+        goal_max_continuations = _env_int(
+            "DEER_FLOW_ACP_GOAL_MAX_CONTINUATIONS",
+            int(_value(local, "goal_max_continuations", 3)),
+        )
+        goal_max_no_progress_continuations = _env_int(
+            "DEER_FLOW_ACP_GOAL_MAX_NO_PROGRESS_CONTINUATIONS",
+            int(_value(local, "goal_max_no_progress_continuations", 2)),
+        )
         max_concurrent_subagents = int(_value(local, "max_concurrent_subagents", 2))
         permission_raw = _value(local, "permission_mode", "dangerous")
         # PyYAML follows YAML 1.1 here and parses an unquoted `off` as False.
@@ -292,6 +303,14 @@ class LocalACPConfig:
             raise ValueError("local_acp.session_page_size must be between 1 and 500")
         if recursion_limit < 10:
             raise ValueError("local_acp.recursion_limit must be at least 10")
+        if not 0 <= goal_max_continuations <= 8:
+            raise ValueError(
+                "local_acp.goal_max_continuations must be between 0 and 8"
+            )
+        if not 0 <= goal_max_no_progress_continuations <= 8:
+            raise ValueError(
+                "local_acp.goal_max_no_progress_continuations must be between 0 and 8"
+            )
         if not 1 <= max_concurrent_subagents <= 4:
             raise ValueError(
                 "local_acp.max_concurrent_subagents must be between 1 and 4"
@@ -427,6 +446,17 @@ class LocalACPConfig:
             ),
             max_concurrent_subagents=max_concurrent_subagents,
             recursion_limit=recursion_limit,
+            goal_auto_continue=_as_bool(
+                os.getenv(
+                    "DEER_FLOW_ACP_GOAL_AUTO_CONTINUE",
+                    _value(local, "goal_auto_continue", False),
+                ),
+                name="local_acp.goal_auto_continue",
+            ),
+            goal_max_continuations=goal_max_continuations,
+            goal_max_no_progress_continuations=(
+                goal_max_no_progress_continuations
+            ),
             agent_name=_value(local, "agent_name", api.get("agent_name")),
             enable_bash=_as_bool(
                 os.getenv(

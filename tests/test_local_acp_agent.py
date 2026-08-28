@@ -35,6 +35,9 @@ class FakeRuntime:
         self.released_client_mcp: list[str] = []
         self.prompt_messages: list[str] = []
         self.prompt_images: list[list[dict[str, str | int]]] = []
+        self.goal: dict[str, Any] | None = None
+        self.goal_set_calls: list[tuple[str, str]] = []
+        self.goal_clear_calls: list[str] = []
 
     async def bind_client_mcp(self, session_id: str, binding: Any) -> None:
         if binding is None:
@@ -45,6 +48,25 @@ class FakeRuntime:
     async def release_client_mcp(self, session_id: str) -> None:
         self.client_mcp_bindings.pop(session_id, None)
         self.released_client_mcp.append(session_id)
+
+    async def get_goal(self, session_id: str) -> dict[str, Any] | None:
+        del session_id
+        return self.goal
+
+    async def set_goal(self, session_id: str, objective: str) -> dict[str, Any]:
+        normalized = " ".join(objective.strip().split())
+        self.goal_set_calls.append((session_id, normalized))
+        self.goal = {
+            "objective": normalized,
+            "auto_continue": False,
+            "continuation_count": 0,
+            "max_continuations": 3,
+        }
+        return self.goal
+
+    async def clear_goal(self, session_id: str) -> None:
+        self.goal_clear_calls.append(session_id)
+        self.goal = None
 
     async def astream(
         self,
@@ -69,6 +91,16 @@ class FakeRuntime:
     async def history(self, session_id: str) -> list[dict[str, Any]]:
         del session_id
         return self.history_messages
+
+    async def history_state(self, session_id: str) -> dict[str, Any]:
+        del session_id
+        return {
+            "messages": self.history_messages,
+            "todos": [],
+            "artifacts": [],
+            "title": None,
+            "goal": self.goal,
+        }
 
 
 def make_config(tmp_path: Path, **overrides: Any) -> LocalACPConfig:
@@ -782,6 +814,197 @@ async def test_prompt_maps_events_usage_and_title(
 
 
 @pytest.mark.asyncio
+async def test_goal_set_command_persists_and_starts_normalized_task(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    connection = FakeConnection()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    agent.on_connect(connection)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    response = await agent.prompt(
+        [acp.text_block("/goal   finish the implementation   and tests  ")],
+        created.session_id,
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert runtime.goal_set_calls == [
+        (created.session_id, "finish the implementation and tests")
+    ]
+    assert runtime.prompt_messages == ["finish the implementation and tests"]
+
+
+@pytest.mark.asyncio
+async def test_goal_status_command_does_not_start_model_run(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    runtime.goal = {
+        "objective": "make every test pass",
+        "auto_continue": True,
+        "continuation_count": 1,
+        "max_continuations": 3,
+        "last_evaluation": {"reason": "Two tests still fail."},
+    }
+    connection = FakeConnection()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    agent.on_connect(connection)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    response = await agent.prompt(
+        [acp.text_block("/goal")],
+        created.session_id,
+    )
+
+    assert response.usage.total_tokens == 0
+    assert runtime.prompt_messages == []
+    updates = [update for _, update in connection.updates]
+    status = next(
+        update for update in updates if isinstance(update, schema.AgentMessageChunk)
+    )
+    assert "Active goal: make every test pass" in status.content.text
+    assert "1/3 used" in status.content.text
+    assert "Two tests still fail" in status.content.text
+
+
+@pytest.mark.asyncio
+async def test_goal_clear_command_clears_without_model_run(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    runtime.goal = {"objective": "old goal"}
+    connection = FakeConnection()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    agent.on_connect(connection)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    response = await agent.prompt(
+        [acp.text_block("/goal RESET")],
+        created.session_id,
+    )
+
+    assert response.usage.total_tokens == 0
+    assert runtime.goal_clear_calls == [created.session_id]
+    assert runtime.prompt_messages == []
+    updates = [update for _, update in connection.updates]
+    cleared = next(
+        update for update in updates if isinstance(update, schema.AgentMessageChunk)
+    )
+    assert cleared.content.text == "Goal cleared."
+
+
+@pytest.mark.asyncio
+async def test_goal_command_with_resource_is_treated_as_an_ordinary_prompt(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    resource = tmp_path / "input.txt"
+    resource.write_text("hello", encoding="utf-8")
+    runtime = FakeRuntime()
+    runtime.goal = {"objective": "keep this goal"}
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    await agent.prompt(
+        [
+            acp.text_block("/goal clear"),
+            acp.resource_link_block("input.txt", resource.as_uri(), size=5),
+        ],
+        created.session_id,
+    )
+
+    assert runtime.goal_clear_calls == []
+    assert runtime.goal == {"objective": "keep this goal"}
+    assert runtime.prompt_messages[0].startswith("/goal clear")
+    assert "/mnt/user-data/workspace/input.txt" in runtime.prompt_messages[0]
+
+
+@pytest.mark.asyncio
+async def test_goal_survives_prompt_cancellation(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    runtime.block = True
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+    prompt_task = asyncio.create_task(
+        agent.prompt(
+            [acp.text_block("/goal finish the task")],
+            created.session_id,
+        )
+    )
+    await runtime.started.wait()
+
+    await agent.cancel(created.session_id)
+    response = await prompt_task
+
+    assert response.stop_reason == "cancelled"
+    assert runtime.goal is not None
+    assert runtime.goal["objective"] == "finish the task"
+
+
+@pytest.mark.asyncio
+async def test_goal_survives_prompt_timeout(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    runtime.block = True
+    agent = DeerFlowACPAgent(
+        make_config(tmp_path, run_timeout_seconds=0.01),
+        store,
+        runtime,
+    )
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    with pytest.raises(RequestError) as error:
+        await agent.prompt(
+            [acp.text_block("/goal finish the task")],
+            created.session_id,
+        )
+
+    assert "timed out" in str(error.value.data)
+    assert runtime.goal is not None
+    assert runtime.goal["objective"] == "finish the task"
+
+
+@pytest.mark.asyncio
+async def test_load_session_reports_restored_goal(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime()
+    runtime.goal = {
+        "objective": "finish the task",
+        "created_at": "2026-08-27T00:00:00Z",
+    }
+    connection = FakeConnection()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    agent.on_connect(connection)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    await agent.load_session(
+        cwd=str(tmp_path),
+        session_id=created.session_id,
+        mcp_servers=[],
+    )
+
+    restored = [
+        update
+        for _, update in connection.updates
+        if isinstance(update, schema.AgentMessageChunk)
+    ]
+    assert [update.content.text for update in restored] == [
+        "Active goal restored: finish the task"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_prompt_rejects_outside_resources_and_one_active_prompt_per_session(
     tmp_path: Path,
     store: LocalACPSessionStore,
@@ -1427,6 +1650,67 @@ async def test_event_mapper_adds_subagent_usage_to_prompt_usage() -> None:
     )
 
     assert mapper.usage == {"input_tokens": 8, "output_tokens": 11, "total_tokens": 19}
+
+
+@pytest.mark.asyncio
+async def test_event_mapper_accumulates_lead_usage_across_goal_turns() -> None:
+    async def send(_update: Any) -> None:
+        pass
+
+    mapper = ACPEventMapper("session-1", send)
+    await mapper.handle(
+        SimpleNamespace(
+            type="end",
+            data={"usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}},
+        )
+    )
+    await mapper.handle(
+        SimpleNamespace(
+            type="end",
+            data={"usage": {"input_tokens": 5, "output_tokens": 6, "total_tokens": 11}},
+        )
+    )
+
+    assert mapper.usage == {"input_tokens": 8, "output_tokens": 10, "total_tokens": 18}
+
+
+@pytest.mark.asyncio
+async def test_event_mapper_reports_goal_continuation_status() -> None:
+    updates: list[Any] = []
+
+    async def send(update: Any) -> None:
+        updates.append(update)
+
+    mapper = ACPEventMapper("session-1", send)
+    await mapper.handle(
+        SimpleNamespace(
+            type="custom",
+            data={
+                "type": "goal_status",
+                "status": "continuing",
+                "objective": "finish the task",
+                "continuation_count": 1,
+                "max_continuations": 3,
+                "reason": "One test remains.",
+                "evaluator_usage": {
+                    "input_tokens": 8,
+                    "output_tokens": 4,
+                    "total_tokens": 12,
+                },
+            },
+        )
+    )
+
+    assert len(updates) == 1
+    assert isinstance(updates[0], schema.AgentMessageChunk)
+    assert updates[0].content.text == (
+        "Goal not complete; continuing (1/3). One test remains."
+    )
+    assert mapper.usage == {
+        "input_tokens": 8,
+        "output_tokens": 4,
+        "total_tokens": 12,
+    }
 
 
 @pytest.mark.asyncio

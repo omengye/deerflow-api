@@ -332,7 +332,7 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
         thread_id: str | None = ((config or {}).get("configurable") or {}).get(
             "thread_id"
         )
-        physical_cwd = _get_work_dir(thread_id)
+        physical_cwd = await asyncio.to_thread(_get_work_dir, thread_id)
         artifact_downloader = ACPArtifactDownloader(
             Path(physical_cwd),
             uuid.uuid4().hex,
@@ -495,7 +495,7 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
         cmd = agent_config.command
         args = agent_config.args or []
         try:
-            mcp_servers = _build_acp_mcp_servers()
+            mcp_servers = await asyncio.to_thread(_build_acp_mcp_servers)
         except ValueError as exc:
             logger.warning(
                 "Invalid MCP server configuration for ACP agent '%s'; continuing without MCP servers: %s",
@@ -593,7 +593,7 @@ def build_invoke_acp_agent_tool(agents: dict) -> BaseTool:
         except Exception as e:  # noqa: BLE001 - return external agent failures as tool results
             await client.cancel_artifacts()
             logger.error("ACP agent '%s' invocation failed: %s", agent, e)
-            message = _format_invocation_error(agent, cmd, e)
+            message = await asyncio.to_thread(_format_invocation_error, agent, cmd, e)
             await progress.finish("task_failed", error=message)
             _log_stream_metrics("failed")
             return message

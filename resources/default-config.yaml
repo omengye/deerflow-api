@@ -30,6 +30,9 @@ local_acp:
   accept_client_mcp_servers: false
   closed_session_retention_days: 30
   recursion_limit: 200
+  goal_auto_continue: false
+  goal_max_continuations: 3
+  goal_max_no_progress_continuations: 2
 
 models:
   - name: openai

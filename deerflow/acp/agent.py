@@ -27,8 +27,9 @@ from deerflow.agents.image_inputs import (
     validate_image_turn,
 )
 from deerflow.config import get_app_config
-from deerflow.sandbox.output_paths import workspace_outputs_path
 from deerflow.config.agents_config import list_custom_agents, load_agent_config
+from deerflow.runtime.goal import parse_goal_command
+from deerflow.sandbox.output_paths import workspace_outputs_path
 
 from .artifact_publisher import RustFSArtifactPublisher
 from .client_mcp import ClientMCPBinding, normalize_client_mcp_servers
@@ -425,6 +426,22 @@ class DeerFlowACPAgent:
                         {"type": "values", "data": replay_values},
                     )()
                 )
+            restored_goal = replay_state.get("goal")
+            if isinstance(restored_goal, dict) and restored_goal.get("objective"):
+                await self._session_update(
+                    session_id,
+                    schema.AgentMessageChunk(
+                        session_update="agent_message_chunk",
+                        content=acp.text_block(
+                            "Active goal restored: "
+                            f"{restored_goal['objective']}"
+                        ),
+                        message_id=_message_uuid(
+                            "goal-restored",
+                            f"{session_id}:{restored_goal.get('created_at', '')}",
+                        ),
+                    ),
+                )
             response = acp.LoadSessionResponse(
                 modes=self._mode_state(session),
                 config_options=self._config_options(session),
@@ -574,12 +591,14 @@ class DeerFlowACPAgent:
         session = await self._require_attached_session(session_id)
         text_parts: list[str] = []
         pending_images: list[PendingInputImage] = []
+        has_non_text_blocks = False
         for block in prompt:
             if isinstance(block, schema.TextContentBlock):
                 if block.text:
                     text_parts.append(block.text)
                 continue
             if isinstance(block, schema.ImageContentBlock):
+                has_non_text_blocks = True
                 try:
                     pending = decode_base64_image(
                         block.data,
@@ -597,6 +616,7 @@ class DeerFlowACPAgent:
                     raise RequestError.invalid_params({"details": str(exc)}) from exc
                 continue
             if isinstance(block, schema.ResourceContentBlock):
+                has_non_text_blocks = True
                 metadata, local_path = self._resource_link_details(session, block)
                 declared_mime = normalize_image_mime(block.mime_type)
                 resource_suffix = Path(
@@ -691,6 +711,65 @@ class DeerFlowACPAgent:
                         )
                     )
             message = "\n".join(text_parts).strip()
+            goal_command = (
+                None if has_non_text_blocks else parse_goal_command(message)
+            )
+            if goal_command is not None and goal_command.kind != "set":
+                if goal_command.kind == "clear":
+                    await self.runtime.clear_goal(session_id)
+                    response_text = "Goal cleared."
+                else:
+                    goal = await self.runtime.get_goal(session_id)
+                    if goal is None:
+                        response_text = "No active goal."
+                    else:
+                        response_text = f"Active goal: {goal['objective']}"
+                        response_text += (
+                            " Automatic continuation is enabled"
+                            f" ({goal.get('continuation_count', 0)}/"
+                            f"{goal.get('max_continuations', 0)} used)."
+                            if goal.get("auto_continue", False)
+                            else " Automatic continuation is disabled."
+                        )
+                        last_evaluation = goal.get("last_evaluation")
+                        if isinstance(last_evaluation, dict):
+                            reason = last_evaluation.get("reason")
+                            if isinstance(reason, str) and reason:
+                                response_text += f" Last evaluation: {reason}"
+                await self._session_update(
+                    session_id,
+                    schema.AgentMessageChunk(
+                        session_update="agent_message_chunk",
+                        content=acp.text_block(response_text),
+                        message_id=_message_uuid(
+                            "goal-command",
+                            message_id or f"{session_id}:{goal_command.kind}",
+                        ),
+                    ),
+                )
+                return acp.PromptResponse(
+                    stop_reason="end_turn",
+                    usage=schema.Usage(
+                        input_tokens=0,
+                        output_tokens=0,
+                        total_tokens=0,
+                    ),
+                    user_message_id=message_id or str(uuid.uuid4()),
+                )
+            if goal_command is not None:
+                try:
+                    goal = await self.runtime.set_goal(
+                        session_id,
+                        goal_command.objective,
+                    )
+                except ValueError as exc:
+                    raise RequestError.invalid_params(
+                        {"details": str(exc)}
+                    ) from exc
+                # Match the official Web behavior: setting a goal immediately
+                # starts a normal run whose user task is the normalized goal,
+                # while the slash-command wrapper itself stays out of history.
+                message = goal["objective"]
             artifact_run_id = uuid.uuid4().hex
             artifact_publisher = self._artifact_publisher
             outputs_path = workspace_outputs_path(session.cwd)

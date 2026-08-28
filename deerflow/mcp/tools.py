@@ -6,15 +6,18 @@ import asyncio
 import logging
 from typing import Any
 
+import anyio
 from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.config import get_config
 from langgraph.runtime import Runtime
+from mcp.shared.exceptions import McpError
+from mcp.types import CONNECTION_CLOSED
 
 from deerflow.config.extensions_config import ExtensionsConfig
 from deerflow.constants import DEFAULT_MCP_SESSION_INIT_TIMEOUT
 from deerflow.mcp.client import build_servers_config
 from deerflow.mcp.oauth import build_oauth_tool_interceptor, get_initial_oauth_headers
-from deerflow.mcp.session_pool import get_session_pool
+from deerflow.mcp.session_pool import MCPSessionPool, OwnedMCPSession, get_session_pool
 from deerflow.reflection import resolve_variable
 from deerflow.tools.sync import make_sync_tool_wrapper
 
@@ -22,6 +25,48 @@ logger = logging.getLogger(__name__)
 
 # Backward-compatible alias for older internal callers.
 _make_sync_tool_wrapper = make_sync_tool_wrapper
+
+_MCP_CLOSED_STREAM_ERRORS = (
+    anyio.ClosedResourceError,
+    anyio.BrokenResourceError,
+    anyio.EndOfStream,
+)
+
+
+def _is_mcp_transport_disconnect(error: Exception) -> bool:
+    """Return whether an error proves that the pooled transport is dead."""
+    if isinstance(error, _MCP_CLOSED_STREAM_ERRORS):
+        return True
+    return (
+        isinstance(error, McpError)
+        and error.error.code == CONNECTION_CLOSED
+        and error.error.message == "Connection closed"
+    )
+
+
+async def _call_pooled_session_tool(
+    session: OwnedMCPSession,
+    pool: MCPSessionPool,
+    *,
+    server_name: str,
+    scope_key: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> Any:
+    """Evict a dead transport without replaying a possibly side-effectful call."""
+    try:
+        return await session.call_tool(tool_name, arguments)
+    except Exception as error:
+        if _is_mcp_transport_disconnect(error):
+            try:
+                await pool.close_session_if_current(server_name, scope_key, session)
+            except Exception:
+                logger.warning(
+                    "Failed to close disconnected MCP session for server '%s'",
+                    server_name,
+                    exc_info=True,
+                )
+        raise
 
 
 def _extract_thread_id(runtime: Runtime | None) -> str:
@@ -152,7 +197,14 @@ def _make_session_pool_tool(
             from langchain_mcp_adapters.interceptors import MCPToolCallRequest
 
             async def base_handler(request: MCPToolCallRequest) -> Any:
-                return await session.call_tool(request.name, request.args)
+                return await _call_pooled_session_tool(
+                    session,
+                    pool,
+                    server_name=server_name,
+                    scope_key=thread_id,
+                    tool_name=request.name,
+                    arguments=request.args,
+                )
 
             handler = base_handler
             for interceptor in reversed(tool_interceptors):
@@ -171,7 +223,14 @@ def _make_session_pool_tool(
             )
             call_tool_result = await handler(request)
         else:
-            call_tool_result = await session.call_tool(original_name, arguments)
+            call_tool_result = await _call_pooled_session_tool(
+                session,
+                pool,
+                server_name=server_name,
+                scope_key=thread_id,
+                tool_name=original_name,
+                arguments=arguments,
+            )
 
         return _convert_call_tool_result(call_tool_result)
 

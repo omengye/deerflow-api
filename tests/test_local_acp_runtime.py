@@ -7,13 +7,42 @@ from typing import Any
 
 import pytest
 from acp import schema
+from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
 import deerflow.acp.runtime as runtime_module
 from deerflow.acp.client_mcp import normalize_client_mcp_servers
 from deerflow.acp.config import LocalACPConfig
 from deerflow.acp.runtime import LocalACPRuntime
 from deerflow.acp.session_store import LocalACPSession
-from deerflow.client import DeerFlowClient
+from deerflow.agents.goal_state import GoalEvaluation
+from deerflow.client import DeerFlowClient, StreamEvent
+
+
+def _make_runtime_session(tmp_path: Path, session_id: str) -> LocalACPSession:
+    return LocalACPSession(
+        session_id=session_id,
+        cwd=str(tmp_path),
+        title=None,
+        updated_at="",
+        model_name=None,
+        thinking_enabled=True,
+        subagent_enabled=False,
+        plan_mode=False,
+        max_concurrent_subagents=1,
+        recursion_limit=100,
+    )
+
+
+def _configure_local_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "deerflow.config.get_app_config",
+        lambda: SimpleNamespace(
+            sandbox=SimpleNamespace(
+                use="deerflow.sandbox.local:LocalSandboxProvider"
+            )
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -326,6 +355,408 @@ async def test_runtime_passes_session_cwd_as_workspace_path(
             "user_id": runtime._memory_user_id(session, str(tmp_path)),
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_goal_runtime_continues_then_stops_after_repeated_no_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str | HumanMessage] = []
+
+    class FakeClient:
+        async def astream(
+            self,
+            message: str | HumanMessage,
+            **kwargs: Any,
+        ):
+            del kwargs
+            calls.append(message)
+            if False:
+                yield None
+
+    async def fake_evaluate(*args: Any, **kwargs: Any) -> GoalEvaluation:
+        del args, kwargs
+        return GoalEvaluation(
+            satisfied=False,
+            blocker="goal_not_met_yet",
+            reason="More work remains.",
+            evidence_summary="No new visible evidence.",
+        )
+
+    _configure_local_sandbox(monkeypatch)
+    monkeypatch.setattr(
+        runtime_module,
+        "create_goal_evaluator_model",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(runtime_module, "evaluate_goal_completion", fake_evaluate)
+    runtime = LocalACPRuntime(
+        LocalACPConfig(
+            config_path=tmp_path / "config.yaml",
+            checkpointer_path=tmp_path / "checkpoints.db",
+            session_store_path=tmp_path / "sessions.db",
+            goal_auto_continue=True,
+            goal_max_continuations=8,
+            goal_max_no_progress_continuations=2,
+        )
+    )
+    runtime._checkpointer = InMemorySaver()
+
+    async def client_for(_session: LocalACPSession) -> FakeClient:
+        return FakeClient()
+
+    monkeypatch.setattr(runtime, "_client_for", client_for)
+    session = _make_runtime_session(tmp_path, "goal-no-progress")
+    await runtime.set_goal(session.session_id, "finish the task")
+
+    events = [
+        event
+        async for event in runtime.astream(
+            session,
+            "finish the task",
+            live_event_callback=lambda _event: None,  # type: ignore[arg-type]
+        )
+    ]
+
+    assert calls[0] == "finish the task"
+    assert len(calls) == 3
+    assert all(isinstance(message, HumanMessage) for message in calls[1:])
+    assert all(
+        message.additional_kwargs.get("hide_from_ui") is True
+        for message in calls[1:]
+        if isinstance(message, HumanMessage)
+    )
+    statuses = [event.data for event in events if event.type == "custom"]
+    assert [status["status"] for status in statuses] == [
+        "continuing",
+        "continuing",
+        "paused",
+    ]
+    assert statuses[-1]["stand_down_reason"] == "no_progress_limit"
+    goal = await runtime.get_goal(session.session_id)
+    assert goal is not None
+    assert goal["continuation_count"] == 2
+    assert goal["no_progress_count"] == 2
+    assert goal["last_evaluation"]["stand_down_reason"] == "no_progress_limit"
+
+
+@pytest.mark.asyncio
+async def test_goal_runtime_clears_goal_when_evaluator_reports_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str | HumanMessage] = []
+
+    class FakeClient:
+        async def astream(
+            self,
+            message: str | HumanMessage,
+            **kwargs: Any,
+        ):
+            del kwargs
+            calls.append(message)
+            if False:
+                yield None
+
+    async def fake_evaluate(*args: Any, **kwargs: Any) -> GoalEvaluation:
+        del args, kwargs
+        return GoalEvaluation(
+            satisfied=True,
+            blocker="none",
+            reason="All requested work is complete.",
+            evidence_summary="Tests passed.",
+        )
+
+    _configure_local_sandbox(monkeypatch)
+    monkeypatch.setattr(
+        runtime_module,
+        "create_goal_evaluator_model",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(runtime_module, "evaluate_goal_completion", fake_evaluate)
+    runtime = LocalACPRuntime(
+        LocalACPConfig(
+            config_path=tmp_path / "config.yaml",
+            checkpointer_path=tmp_path / "checkpoints.db",
+            session_store_path=tmp_path / "sessions.db",
+            goal_auto_continue=True,
+        )
+    )
+    runtime._checkpointer = InMemorySaver()
+
+    async def client_for(_session: LocalACPSession) -> FakeClient:
+        return FakeClient()
+
+    monkeypatch.setattr(runtime, "_client_for", client_for)
+    session = _make_runtime_session(tmp_path, "goal-completed")
+    await runtime.set_goal(session.session_id, "finish the task")
+
+    events = [
+        event
+        async for event in runtime.astream(
+            session,
+            "finish the task",
+            live_event_callback=lambda _event: None,  # type: ignore[arg-type]
+        )
+    ]
+
+    assert calls == ["finish the task"]
+    assert await runtime.get_goal(session.session_id) is None
+    assert [event.data["status"] for event in events] == ["completed"]
+
+
+@pytest.mark.asyncio
+async def test_goal_runtime_evaluates_but_does_not_continue_when_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str | HumanMessage] = []
+
+    class FakeClient:
+        async def astream(
+            self,
+            message: str | HumanMessage,
+            **kwargs: Any,
+        ):
+            del kwargs
+            calls.append(message)
+            if False:
+                yield None
+
+    async def fake_evaluate(*args: Any, **kwargs: Any) -> GoalEvaluation:
+        del args, kwargs
+        return GoalEvaluation(
+            satisfied=False,
+            blocker="goal_not_met_yet",
+            reason="More work remains.",
+            evidence_summary="Partial result.",
+        )
+
+    _configure_local_sandbox(monkeypatch)
+    monkeypatch.setattr(
+        runtime_module,
+        "create_goal_evaluator_model",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(runtime_module, "evaluate_goal_completion", fake_evaluate)
+    runtime = LocalACPRuntime(
+        LocalACPConfig(
+            config_path=tmp_path / "config.yaml",
+            checkpointer_path=tmp_path / "checkpoints.db",
+            session_store_path=tmp_path / "sessions.db",
+            goal_auto_continue=False,
+        )
+    )
+    runtime._checkpointer = InMemorySaver()
+
+    async def client_for(_session: LocalACPSession) -> FakeClient:
+        return FakeClient()
+
+    monkeypatch.setattr(runtime, "_client_for", client_for)
+    session = _make_runtime_session(tmp_path, "goal-no-auto-continue")
+    await runtime.set_goal(session.session_id, "finish the task")
+
+    events = [
+        event
+        async for event in runtime.astream(
+            session,
+            "finish the task",
+            live_event_callback=lambda _event: None,  # type: ignore[arg-type]
+        )
+    ]
+
+    assert calls == ["finish the task"]
+    assert events[0].data["status"] == "paused"
+    assert events[0].data["stand_down_reason"] == "auto_continue_disabled"
+    goal = await runtime.get_goal(session.session_id)
+    assert goal is not None
+    assert goal["continuation_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_goal_runtime_records_model_failure_without_running_evaluator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeClient:
+        async def astream(
+            self,
+            message: str | HumanMessage,
+            **kwargs: Any,
+        ):
+            del message, kwargs
+            yield StreamEvent(
+                type="custom",
+                data={"type": "llm_failure", "message": "provider failed"},
+            )
+
+    def fail_if_evaluator_created(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise AssertionError("goal evaluator must not run after a failed turn")
+
+    _configure_local_sandbox(monkeypatch)
+    monkeypatch.setattr(
+        runtime_module,
+        "create_goal_evaluator_model",
+        fail_if_evaluator_created,
+    )
+    runtime = LocalACPRuntime(
+        LocalACPConfig(
+            config_path=tmp_path / "config.yaml",
+            checkpointer_path=tmp_path / "checkpoints.db",
+            session_store_path=tmp_path / "sessions.db",
+            goal_auto_continue=True,
+        )
+    )
+    runtime._checkpointer = InMemorySaver()
+
+    async def client_for(_session: LocalACPSession) -> FakeClient:
+        return FakeClient()
+
+    monkeypatch.setattr(runtime, "_client_for", client_for)
+    session = _make_runtime_session(tmp_path, "goal-run-failed")
+    await runtime.set_goal(session.session_id, "finish the task")
+
+    events = [
+        event
+        async for event in runtime.astream(
+            session,
+            "finish the task",
+            live_event_callback=lambda _event: None,  # type: ignore[arg-type]
+        )
+    ]
+
+    assert [event.data["type"] for event in events] == [
+        "llm_failure",
+        "goal_status",
+    ]
+    assert events[-1].data["stand_down_reason"] == "run_failed"
+    goal = await runtime.get_goal(session.session_id)
+    assert goal is not None
+    assert goal["last_evaluation"]["blocker"] == "run_failed"
+
+
+@pytest.mark.asyncio
+async def test_stateless_runtime_preserves_llm_failure_compatibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeClient:
+        async def astream(self, _message: str, **_kwargs: Any):
+            yield StreamEvent(
+                type="custom",
+                data={"type": "llm_failure", "message": "provider failed"},
+            )
+
+    _configure_local_sandbox(monkeypatch)
+    runtime = LocalACPRuntime(
+        LocalACPConfig(
+            config_path=tmp_path / "config.yaml",
+            checkpointer_path=tmp_path / "checkpoints.db",
+            session_store_path=tmp_path / "sessions.db",
+        )
+    )
+
+    async def client_for(_session: LocalACPSession) -> FakeClient:
+        return FakeClient()
+
+    monkeypatch.setattr(runtime, "_client_for", client_for)
+    session = _make_runtime_session(tmp_path, "stateless-run-failed")
+
+    events = [
+        event
+        async for event in runtime.astream(
+            session,
+            "task",
+            live_event_callback=lambda _event: None,  # type: ignore[arg-type]
+        )
+    ]
+
+    assert [event.data["type"] for event in events] == ["llm_failure"]
+
+
+@pytest.mark.asyncio
+async def test_goal_runtime_records_raised_agent_error_before_propagating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeClient:
+        async def astream(self, _message: str, **_kwargs: Any):
+            if False:
+                yield None
+            raise RuntimeError("tool crashed")
+
+    _configure_local_sandbox(monkeypatch)
+    runtime = LocalACPRuntime(
+        LocalACPConfig(
+            config_path=tmp_path / "config.yaml",
+            checkpointer_path=tmp_path / "checkpoints.db",
+            session_store_path=tmp_path / "sessions.db",
+            goal_auto_continue=True,
+        )
+    )
+    runtime._checkpointer = InMemorySaver()
+
+    async def client_for(_session: LocalACPSession) -> FakeClient:
+        return FakeClient()
+
+    monkeypatch.setattr(runtime, "_client_for", client_for)
+    session = _make_runtime_session(tmp_path, "goal-raised-error")
+    await runtime.set_goal(session.session_id, "finish the task")
+
+    with pytest.raises(RuntimeError, match="tool crashed"):
+        async for _ in runtime.astream(
+            session,
+            "task",
+            live_event_callback=lambda _event: None,  # type: ignore[arg-type]
+        ):
+            pass
+
+    goal = await runtime.get_goal(session.session_id)
+    assert goal is not None
+    assert goal["last_evaluation"]["blocker"] == "run_failed"
+
+
+@pytest.mark.asyncio
+async def test_history_hides_internal_goal_continuations_and_returns_goal(
+    tmp_path: Path,
+) -> None:
+    visible = HumanMessage(content="visible", id="visible-message")
+    hidden = HumanMessage(
+        content="hidden continuation",
+        id="hidden-message",
+        additional_kwargs={"hide_from_ui": True},
+    )
+    goal = {"objective": "finish", "status": "active"}
+
+    class FakeCheckpointer:
+        async def aget_tuple(self, _config: dict[str, Any]) -> Any:
+            return SimpleNamespace(
+                checkpoint={
+                    "channel_values": {
+                        "messages": [visible, hidden],
+                        "goal": goal,
+                    }
+                }
+            )
+
+    runtime = LocalACPRuntime(
+        LocalACPConfig(
+            config_path=tmp_path / "config.yaml",
+            checkpointer_path=tmp_path / "checkpoints.db",
+            session_store_path=tmp_path / "sessions.db",
+        )
+    )
+    runtime._checkpointer = FakeCheckpointer()
+
+    expected_messages = [
+        {"type": "human", "content": "visible", "id": "visible-message"}
+    ]
+    assert await runtime.history("history-goal") == expected_messages
+    state = await runtime.history_state("history-goal")
+    assert state["messages"] == expected_messages
+    assert state["goal"] == goal
 
 
 @pytest.mark.asyncio

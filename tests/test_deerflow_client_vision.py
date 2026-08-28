@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from langchain_core.messages import HumanMessage
+
 from deerflow.agents.image_inputs import INPUT_IMAGES_KEY
 from deerflow.client import DeerFlowClient
 
@@ -198,3 +200,30 @@ def test_deerflow_client_checkpoints_only_direct_image_metadata() -> None:
     assert message.additional_kwargs == {INPUT_IMAGES_KEY: [metadata]}
     assert "base64" not in str(message.additional_kwargs)
     assert DeerFlowClient._serialize_message(message)["input_images"] == [metadata]
+
+
+def test_deerflow_client_preserves_hidden_goal_continuation_metadata() -> None:
+    client = _client()
+    client._agent = object()
+    continuation = HumanMessage(
+        content="continue",
+        additional_kwargs={
+            "hide_from_ui": True,
+            "deerflow_goal_continuation": True,
+        },
+    )
+    config = {"configurable": {"thread_id": "thread-1"}}
+
+    with (
+        patch.object(DeerFlowClient, "_get_runnable_config", return_value=config),
+        patch.object(DeerFlowClient, "_ensure_agent"),
+    ):
+        _, state, _ = client._prepare_stream_invocation(
+            continuation,
+            "thread-1",
+        )
+
+    message = state["messages"][0]
+    assert message is not continuation
+    assert message.content == "continue"
+    assert message.additional_kwargs == continuation.additional_kwargs

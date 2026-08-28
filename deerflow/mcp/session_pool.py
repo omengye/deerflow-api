@@ -383,6 +383,21 @@ class MCPSessionPool:
         for session in sessions:
             await session.aclose()
 
+    async def close_session_if_current(
+        self,
+        server_name: str,
+        scope_key: str,
+        session: OwnedMCPSession,
+    ) -> bool:
+        """Evict a dead session without closing a newer replacement."""
+        key = (server_name, scope_key)
+        with self._lock:
+            if self._entries.get(key) is not session:
+                return False
+            self._entries.pop(key)
+        await session.aclose()
+        return True
+
     async def close_server(self, server_name: str) -> None:
         sessions = await self._detach_matching(lambda key: key[0] == server_name)
         for session in sessions:

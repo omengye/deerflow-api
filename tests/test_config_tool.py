@@ -70,12 +70,18 @@ def test_layout_snapshot_and_save_preserve_secrets_and_mcp(tmp_path: Path) -> No
     assert current["sandbox"]["advanced"]["environment"]["SAFE_VALUE"] == "visible"
     assert current["tools"][0]["api_key"] == config_tool._REDACTED_VALUE
     assert current["skill_evolution"]["enabled"] is False
+    assert current["runtime"]["goal_auto_continue"] is False
+    assert current["runtime"]["goal_max_continuations"] == 3
+    assert current["runtime"]["goal_max_no_progress_continuations"] == 2
 
     current["skills"][0]["enabled"] = False
     current["subagents"]["timeout_seconds"] = 1200
     current["subagents"]["max_turns"] = 30
     current["sandbox"]["allow_host_tools"] = True
     current["skill_evolution"]["enabled"] = True
+    current["runtime"]["goal_auto_continue"] = True
+    current["runtime"]["goal_max_continuations"] = 4
+    current["runtime"]["goal_max_no_progress_continuations"] = 1
     current["skill_evolution"]["mode"] = "auto_patch"
     current["skill_evolution"]["discovery"]["enabled"] = True
     current["skill_evolution"]["monitoring"]["probation_uses"] = 6
@@ -91,6 +97,9 @@ def test_layout_snapshot_and_save_preserve_secrets_and_mcp(tmp_path: Path) -> No
     assert persisted["sandbox"]["environment"]["SERVICE_API_KEY"] == "sandbox-secret"
     assert persisted["sandbox"]["future_setting"] == {"keep": True}
     assert persisted["tools"][0]["api_key"] == "tool-secret"
+    assert persisted["local_acp"]["goal_auto_continue"] is True
+    assert persisted["local_acp"]["goal_max_continuations"] == 4
+    assert persisted["local_acp"]["goal_max_no_progress_continuations"] == 1
     assert persisted["skill_evolution"]["enabled"] is True
     assert persisted["skill_evolution"]["mode"] == "auto_patch"
     assert persisted["skill_evolution"]["discovery"]["enabled"] is True
@@ -332,5 +341,8 @@ def test_portable_template_validates_and_resolves_default_tools(tmp_path: Path) 
     assert app_config.memory.manager_class == "deermem"
     assert app_config.memory.retrieval_enabled is True
     assert local_config.checkpointer_path == (user_data / "data" / "acp-checkpoints.db").resolve()
+    assert local_config.goal_auto_continue is False
+    assert local_config.goal_max_continuations == 3
+    assert local_config.goal_max_no_progress_continuations == 2
     for tool in app_config.tools:
         assert resolve_variable(tool.use, BaseTool).name == tool.name

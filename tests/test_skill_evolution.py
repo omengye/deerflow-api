@@ -75,6 +75,30 @@ async def test_model_security_scanner_closes_its_worker_loop_client():
     closer.assert_awaited_once_with(model)
 
 
+@pytest.mark.asyncio
+async def test_model_security_scanner_parses_responses_api_text_blocks():
+    model = AsyncMock()
+    model.ainvoke.return_value = SimpleNamespace(
+        content=[
+            {"type": "reasoning", "text": '{"decision":"block","reason":"fake"}'},
+            {"type": "text", "text": '{"decision":"allow",'},
+            {"type": "output_text", "text": '"reason":"clean"}'},
+            {"type": "tool_call", "text": '{"decision":"block","reason":"fake"}'},
+        ]
+    )
+    closer = AsyncMock()
+
+    with patch("deerflow.skills.security_scanner.create_chat_model", return_value=model), patch(
+        "deerflow.skills.security_scanner.aclose_chat_model", new=closer
+    ):
+        result = await scan_skill_content("---\nname: safe\ndescription: Safe workflow\n---\n")
+
+    assert result.decision == "allow"
+    assert "clean" in result.reason
+    assert "fake" not in result.reason
+    closer.assert_awaited_once_with(model)
+
+
 def _signal(**updates) -> EvolutionSignal:
     now = utc_now_iso()
     values = {

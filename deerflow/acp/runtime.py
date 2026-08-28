@@ -7,11 +7,34 @@ import hashlib
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from typing import Any
 
+from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from deerflow.agents.goal_state import GoalEvaluation, GoalState
 from deerflow.client import DeerFlowClient, StreamEvent
+from deerflow.models import aclose_chat_model
+from deerflow.runtime.goal import (
+    GoalCheckpointSnapshot,
+    GoalWriteConflict,
+    attach_goal_evaluation,
+    build_goal_state,
+    compute_no_progress_count,
+    create_goal_evaluator_model,
+    evaluate_goal_completion,
+    goal_instance_matches,
+    goal_stand_down_reason,
+    goal_thread_lock,
+    latest_visible_assistant_signature,
+    make_goal_continuation_message,
+    read_goal_snapshot,
+    read_thread_goal,
+    should_continue_goal,
+    visible_conversation_signature,
+    write_thread_goal,
+)
 
 from .client_mcp import ClientMCPBinding
 from .config import LocalACPConfig
@@ -23,6 +46,12 @@ from .session_store import LocalACPSession
 LiveEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _GoalTurnResult:
+    continuation: HumanMessage | None
+    status_event: StreamEvent | None
 
 
 class LocalACPRuntime:
@@ -262,6 +291,53 @@ class LocalACPRuntime:
                     exc_info=True,
                 )
 
+    def _require_checkpointer(self) -> Any:
+        if self._checkpointer is None:
+            raise RuntimeError("Local ACP runtime is not open")
+        return self._checkpointer
+
+    async def get_goal(self, session_id: str) -> GoalState | None:
+        """Return a defensive copy of one ACP session's active goal."""
+
+        return await read_thread_goal(self._require_checkpointer(), session_id)
+
+    async def set_goal(self, session_id: str, objective: str) -> GoalState:
+        """Set or replace the durable goal for one ACP session."""
+
+        goal = build_goal_state(
+            objective,
+            auto_continue=self.config.goal_auto_continue,
+            max_continuations=self.config.goal_max_continuations,
+            max_no_progress_continuations=(
+                self.config.goal_max_no_progress_continuations
+            ),
+        )
+        checkpointer = self._require_checkpointer()
+        async with goal_thread_lock(session_id):
+            await write_thread_goal(
+                checkpointer,
+                session_id,
+                goal,
+                create_if_missing=True,
+                as_node="goal_command",
+            )
+        return goal
+
+    async def clear_goal(self, session_id: str) -> None:
+        """Clear an active goal, treating a missing checkpoint as already clear."""
+
+        checkpointer = self._require_checkpointer()
+        try:
+            async with goal_thread_lock(session_id):
+                await write_thread_goal(
+                    checkpointer,
+                    session_id,
+                    None,
+                    as_node="goal_command",
+                )
+        except LookupError:
+            return
+
     def _memory_user_id(
         self, session: LocalACPSession, workspace_path: str
     ) -> str | None:
@@ -302,11 +378,317 @@ class LocalACPRuntime:
             }
             if input_images:
                 client_kwargs["input_images"] = input_images
-            async for event in client.astream(
-                message,
-                **client_kwargs,
-            ):
-                yield event
+            evaluator_model: Any | None = None
+            current_message: str | HumanMessage = message
+            try:
+                while True:
+                    turn_failed = False
+                    try:
+                        async for event in client.astream(
+                            current_message,
+                            **client_kwargs,
+                        ):
+                            if (
+                                event.type == "custom"
+                                and event.data.get("type") == "llm_failure"
+                            ):
+                                turn_failed = True
+                            yield event
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        if self._goal_checkpointer_available():
+                            try:
+                                await self._record_failed_goal_turn(
+                                    session.session_id,
+                                    reason=(
+                                        "The Agent run raised an error before the "
+                                        "goal could be evaluated."
+                                    ),
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "Failed to record goal run failure for ACP session %s",
+                                    session.session_id,
+                                    exc_info=True,
+                                )
+                        raise
+
+                    # Images belong only to the genuine initial user turn. A
+                    # hidden continuation reuses checkpoint context instead.
+                    client_kwargs.pop("input_images", None)
+                    if turn_failed:
+                        if self._goal_checkpointer_available():
+                            status = await self._record_failed_goal_turn(
+                                session.session_id,
+                                reason="The model run failed before the goal could be evaluated.",
+                            )
+                            if status is not None:
+                                yield status
+                        break
+
+                    checkpointer = self._checkpointer
+                    if not self._goal_checkpointer_available():
+                        # Lightweight injected clients in embedders may opt out
+                        # of persistence entirely; such clients cannot host a
+                        # durable goal and retain the historical single-turn path.
+                        break
+                    snapshot = await read_goal_snapshot(
+                        checkpointer,
+                        session.session_id,
+                    )
+                    if not snapshot.goal or snapshot.goal.get("status") != "active":
+                        break
+                    if evaluator_model is None:
+                        evaluator_model = create_goal_evaluator_model(
+                            model_name=session.model_name
+                        )
+                    result = await self._evaluate_goal_turn(
+                        session,
+                        evaluator_model=evaluator_model,
+                        snapshot=snapshot,
+                    )
+                    if result.status_event is not None:
+                        yield result.status_event
+                    if result.continuation is None:
+                        break
+                    current_message = result.continuation
+            finally:
+                await aclose_chat_model(evaluator_model)
+
+    def _goal_checkpointer_available(self) -> bool:
+        checkpointer = self._checkpointer
+        return checkpointer is not None and any(
+            callable(getattr(checkpointer, name, None))
+            for name in ("aget_tuple", "get_tuple")
+        )
+
+    async def _record_failed_goal_turn(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+    ) -> StreamEvent | None:
+        checkpointer = self._require_checkpointer()
+        snapshot = await read_goal_snapshot(checkpointer, session_id)
+        goal = snapshot.goal
+        if not goal:
+            return None
+        evaluation = GoalEvaluation(
+            satisfied=False,
+            blocker="run_failed",
+            reason=reason,
+            evidence_summary="",
+        )
+        evidence_signature = latest_visible_assistant_signature(snapshot.messages)
+        updated = attach_goal_evaluation(
+            goal,
+            evaluation,
+            no_progress_count=compute_no_progress_count(
+                goal,
+                evaluation,
+                evidence_signature=evidence_signature,
+            ),
+            stand_down_reason="run_failed",
+            evidence_signature=evidence_signature,
+        )
+        try:
+            async with goal_thread_lock(session_id):
+                current = await read_goal_snapshot(checkpointer, session_id)
+                if (
+                    not goal_instance_matches(goal, current.goal)
+                    or current.checkpoint_id != snapshot.checkpoint_id
+                ):
+                    return None
+                await write_thread_goal(
+                    checkpointer,
+                    session_id,
+                    updated,
+                    expected_checkpoint_id=snapshot.checkpoint_id,
+                    as_node="goal_evaluator",
+                )
+        except GoalWriteConflict:
+            return None
+        return self._goal_status_event(
+            updated,
+            evaluation,
+            status="paused",
+            stand_down_reason="run_failed",
+        )
+
+    async def _evaluate_goal_turn(
+        self,
+        session: LocalACPSession,
+        *,
+        evaluator_model: Any,
+        snapshot: GoalCheckpointSnapshot,
+    ) -> _GoalTurnResult:
+        """Evaluate and atomically commit one post-turn goal decision."""
+
+        goal: GoalState = snapshot.goal
+        conversation_signature = visible_conversation_signature(snapshot.messages)
+        evidence_signature = latest_visible_assistant_signature(snapshot.messages)
+        evaluator_usage: dict[str, int] = {}
+        try:
+            evaluation = await evaluate_goal_completion(
+                goal,
+                snapshot.messages,
+                model=evaluator_model,
+                model_name=session.model_name,
+                usage_callback=evaluator_usage.update,
+            )
+            evaluator_failed = False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Goal evaluator failed for ACP session %s",
+                session.session_id,
+                exc_info=True,
+            )
+            evaluator_failed = True
+            evaluation = GoalEvaluation(
+                satisfied=False,
+                blocker="missing_evidence",
+                reason="The goal evaluator failed; automatic continuation stopped safely.",
+                evidence_summary="",
+            )
+
+        checkpointer = self._require_checkpointer()
+        current = await read_goal_snapshot(checkpointer, session.session_id)
+        if not goal_instance_matches(goal, current.goal):
+            return _GoalTurnResult(None, None)
+        if (
+            current.checkpoint_id != snapshot.checkpoint_id
+            or visible_conversation_signature(current.messages)
+            != conversation_signature
+        ):
+            return _GoalTurnResult(None, None)
+
+        if evaluation["satisfied"]:
+            try:
+                async with goal_thread_lock(session.session_id):
+                    latest = await read_goal_snapshot(
+                        checkpointer,
+                        session.session_id,
+                    )
+                    if (
+                        not goal_instance_matches(goal, latest.goal)
+                        or latest.checkpoint_id != snapshot.checkpoint_id
+                        or visible_conversation_signature(latest.messages)
+                        != conversation_signature
+                    ):
+                        return _GoalTurnResult(None, None)
+                    await write_thread_goal(
+                        checkpointer,
+                        session.session_id,
+                        None,
+                        expected_checkpoint_id=snapshot.checkpoint_id,
+                        as_node="goal_evaluator",
+                    )
+            except GoalWriteConflict:
+                return _GoalTurnResult(None, None)
+            return _GoalTurnResult(
+                None,
+                self._goal_status_event(
+                    goal,
+                    evaluation,
+                    status="completed",
+                    evaluator_usage=evaluator_usage,
+                ),
+            )
+
+        no_progress_count = compute_no_progress_count(
+            goal,
+            evaluation,
+            evidence_signature=evidence_signature,
+        )
+        stand_down_reason = (
+            "evaluator_failed"
+            if evaluator_failed
+            else goal_stand_down_reason(
+                goal,
+                evaluation,
+                no_progress_count=no_progress_count,
+            )
+        )
+        continue_goal = not evaluator_failed and should_continue_goal(
+            goal,
+            evaluation,
+            no_progress_count=no_progress_count,
+        )
+        next_count = int(goal.get("continuation_count", 0)) + 1
+        updated = attach_goal_evaluation(
+            goal,
+            evaluation,
+            continuation_count=next_count if continue_goal else None,
+            no_progress_count=no_progress_count,
+            stand_down_reason=stand_down_reason,
+            evidence_signature=evidence_signature,
+        )
+        try:
+            async with goal_thread_lock(session.session_id):
+                latest = await read_goal_snapshot(checkpointer, session.session_id)
+                if (
+                    not goal_instance_matches(goal, latest.goal)
+                    or latest.checkpoint_id != snapshot.checkpoint_id
+                    or visible_conversation_signature(latest.messages)
+                    != conversation_signature
+                ):
+                    return _GoalTurnResult(None, None)
+                await write_thread_goal(
+                    checkpointer,
+                    session.session_id,
+                    updated,
+                    expected_checkpoint_id=snapshot.checkpoint_id,
+                    as_node="goal_evaluator",
+                )
+        except GoalWriteConflict:
+            return _GoalTurnResult(None, None)
+
+        if not continue_goal:
+            return _GoalTurnResult(
+                None,
+                self._goal_status_event(
+                    updated,
+                    evaluation,
+                    status="paused",
+                    stand_down_reason=stand_down_reason,
+                    evaluator_usage=evaluator_usage,
+                ),
+            )
+        return _GoalTurnResult(
+            make_goal_continuation_message(updated, evaluation),
+            self._goal_status_event(
+                updated,
+                evaluation,
+                status="continuing",
+                evaluator_usage=evaluator_usage,
+            ),
+        )
+
+    @staticmethod
+    def _goal_status_event(
+        goal: GoalState,
+        evaluation: GoalEvaluation,
+        *,
+        status: str,
+        stand_down_reason: str | None = None,
+        evaluator_usage: dict[str, int] | None = None,
+    ) -> StreamEvent:
+        data: dict[str, Any] = {
+            "type": "goal_status",
+            "status": status,
+            "objective": goal.get("objective", ""),
+            "continuation_count": int(goal.get("continuation_count", 0)),
+            "max_continuations": int(goal.get("max_continuations", 0)),
+            "blocker": evaluation.get("blocker", "none"),
+            "reason": evaluation.get("reason", ""),
+            "stand_down_reason": stand_down_reason,
+        }
+        if evaluator_usage:
+            data["evaluator_usage"] = evaluator_usage
+        return StreamEvent(type="custom", data=data)
 
     async def history(self, session_id: str) -> list[dict[str, Any]]:
         """Return the latest full message snapshot for session/load replay."""
@@ -325,7 +707,8 @@ class LocalACPRuntime:
             if hasattr(message, "content")
             else dict(message)
             for message in messages
-            if hasattr(message, "content") or isinstance(message, dict)
+            if (hasattr(message, "content") or isinstance(message, dict))
+            and not self._hidden_message(message)
         ]
 
     async def history_state(self, session_id: str) -> dict[str, Any]:
@@ -338,7 +721,7 @@ class LocalACPRuntime:
             {"configurable": {"thread_id": session_id, "checkpoint_ns": ""}}
         )
         if checkpoint is None:
-            return {"messages": [], "todos": [], "artifacts": []}
+            return {"messages": [], "todos": [], "artifacts": [], "goal": None}
         values = checkpoint.checkpoint.get("channel_values", {})
         messages = values.get("messages", [])
         return {
@@ -347,9 +730,20 @@ class LocalACPRuntime:
                 if hasattr(message, "content")
                 else dict(message)
                 for message in messages
-                if hasattr(message, "content") or isinstance(message, dict)
+                if (
+                    hasattr(message, "content") or isinstance(message, dict)
+                )
+                and not self._hidden_message(message)
             ],
             "todos": values.get("todos", []),
             "artifacts": values.get("artifacts", []),
             "title": values.get("title"),
+            "goal": values.get("goal"),
         }
+
+    @staticmethod
+    def _hidden_message(message: Any) -> bool:
+        kwargs = getattr(message, "additional_kwargs", None)
+        if kwargs is None and isinstance(message, dict):
+            kwargs = message.get("additional_kwargs")
+        return isinstance(kwargs, dict) and kwargs.get("hide_from_ui") is True

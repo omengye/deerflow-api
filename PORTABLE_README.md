@@ -63,6 +63,23 @@ DeerFlow ACP 支持客户端发送标准 `ImageContentBlock`，也支持引用�
 
 图片输入要求当前会话选择的模型配置了 `supports_vision: true`。如果当前模型不支持视觉，ACP 会拒绝该轮输入并提示可选的视觉模型，不会静默切换模型。HTTP/HTTPS 图片 ResourceLink 暂不自动下载；远程图片请由客户端作为 `ImageContentBlock` 发送。
 
+### `/goal` 长任务
+
+发送 `/goal <完成条件>` 会把目标保存到当前 ACP 会话并立即开始执行。单独发送 `/goal` 可查看状态；发送 `/goal clear`、`/goal reset` 或 `/goal off` 可清除。目标会随会话 checkpoint 恢复，完成后自动清除；带图片或资源链接的消息按普通 prompt 处理，不会触发命令。
+
+每个有活动目标的回合结束后，DeerFlow 会用关闭 thinking 的独立模型检查可见证据。需要用户输入、运行失败、等待外部系统、证据不足或评估失败时会停止，并保留目标供后续查看或继续。
+
+自动续跑默认关闭。需要时编辑 `user-data/config/config.yaml` 的 `local_acp`：
+
+```yaml
+local_acp:
+  goal_auto_continue: true
+  goal_max_continuations: 3
+  goal_max_no_progress_continuations: 2
+```
+
+单次目标最多自动续跑 8 次。隐藏续跑仍受原 prompt 的超时、取消和权限审批约束，用量会累计到同一次 ACP 响应。
+
 ### 启动与排障
 
 第一次连接前应先运行一次 `deerflow-config.exe` 并保存模型配置。Daemon 可以由 ACP Client 首次连接时自动启动，也可以从配置工具的概览页提前启动。

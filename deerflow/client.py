@@ -789,7 +789,7 @@ class DeerFlowClient:
 
     def _prepare_stream_invocation(
         self,
-        message: str,
+        message: str | HumanMessage,
         thread_id: str | None,
         **kwargs: Any,
     ) -> tuple[RunnableConfig, dict[str, Any], dict[str, Any]]:
@@ -803,14 +803,22 @@ class DeerFlowClient:
             raise RuntimeError("Agent was not initialized")
 
         input_images = normalize_input_image_metadata(kwargs.get("input_images"))
-        additional_kwargs = {INPUT_IMAGES_KEY: input_images} if input_images else {}
+        if isinstance(message, HumanMessage):
+            additional_kwargs = dict(message.additional_kwargs or {})
+            if input_images:
+                additional_kwargs[INPUT_IMAGES_KEY] = input_images
+            human_message = message.model_copy(
+                deep=True,
+                update={"additional_kwargs": additional_kwargs},
+            )
+        else:
+            additional_kwargs = {INPUT_IMAGES_KEY: input_images} if input_images else {}
+            human_message = HumanMessage(
+                content=message,
+                additional_kwargs=additional_kwargs,
+            )
         state: dict[str, Any] = {
-            "messages": [
-                HumanMessage(
-                    content=message,
-                    additional_kwargs=additional_kwargs,
-                )
-            ]
+            "messages": [human_message]
         }
         context = {
             "thread_id": thread_id,
@@ -1326,7 +1334,7 @@ class DeerFlowClient:
 
     async def astream(
         self,
-        message: str,
+        message: str | HumanMessage,
         *,
         thread_id: str | None = None,
         **kwargs,
