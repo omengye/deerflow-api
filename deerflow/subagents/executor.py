@@ -902,7 +902,17 @@ class SubagentExecutor:
                 logger.exception(f"[trace={self.trace_id}] Subagent {self.config.name} async execution failed")
                 result.try_set_terminal(SubagentStatus.FAILED, error=str(e))
 
-        _scheduler_pool.submit(run_task)
+        try:
+            _scheduler_pool.submit(run_task)
+        except Exception:
+            # Registration happens before submission so a very fast worker can
+            # always find its result. If the executor is shutting down or
+            # broken, the caller never receives this execution ID; do not leave
+            # an unreachable PENDING entry in the process-wide registry.
+            with _background_tasks_lock:
+                if _background_tasks.get(execution_id) is result:
+                    _background_tasks.pop(execution_id, None)
+            raise
         return execution_id
 
 def request_cancel_background_task(task_id: str) -> None:

@@ -1,9 +1,11 @@
 import errno
+import locale
 import logging
 import ntpath
 import os
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -16,6 +18,55 @@ from deerflow.sandbox.search import GrepMatch, find_glob_matches, find_grep_matc
 logger = logging.getLogger(__name__)
 
 _MAX_DOWNLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 600
+_COMMAND_CAPTURE_LIMIT_BYTES = 10 * 1024 * 1024
+_PIPE_DRAIN_JOIN_TIMEOUT_SECONDS = 0.2
+
+
+class _BoundedPipeCapture:
+    """Drain a subprocess pipe while retaining only bounded output."""
+
+    def __init__(
+        self,
+        *,
+        limit_bytes: int = _COMMAND_CAPTURE_LIMIT_BYTES,
+        encoding: str = "utf-8",
+        normalize_newlines: bool = False,
+    ) -> None:
+        self._limit_bytes = max(0, limit_bytes)
+        self._encoding = encoding
+        self._normalize_newlines = normalize_newlines
+        self._chunks: list[bytes] = []
+        self._kept_bytes = 0
+        self._total_bytes = 0
+        self._lock = threading.Lock()
+
+    def append(self, chunk: bytes) -> None:
+        with self._lock:
+            self._total_bytes += len(chunk)
+            if self._kept_bytes >= self._limit_bytes:
+                return
+            remaining = self._limit_bytes - self._kept_bytes
+            kept = chunk[:remaining]
+            self._chunks.append(kept)
+            self._kept_bytes += len(kept)
+
+    def read(self) -> str:
+        with self._lock:
+            data = b"".join(self._chunks)
+            truncated = self._total_bytes > self._kept_bytes
+            total_bytes = self._total_bytes
+            kept_bytes = self._kept_bytes
+
+        output = data.decode(self._encoding, errors="replace")
+        if self._normalize_newlines:
+            output = output.replace("\r\n", "\n").replace("\r", "\n")
+        if truncated:
+            output += (
+                f"\n... [output truncated after {kept_bytes} of {total_bytes} "
+                "bytes; remaining output discarded] ..."
+            )
+        return output
 
 
 @dataclass(frozen=True)
@@ -63,7 +114,14 @@ class LocalSandbox(Sandbox):
 
         return None
 
-    def __init__(self, id: str, path_mappings: list[PathMapping] | None = None):
+    def __init__(
+        self,
+        id: str,
+        path_mappings: list[PathMapping] | None = None,
+        *,
+        command_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        command_capture_limit_bytes: int = _COMMAND_CAPTURE_LIMIT_BYTES,
+    ) -> None:
         """
         Initialize local sandbox with optional path mappings.
 
@@ -74,6 +132,12 @@ class LocalSandbox(Sandbox):
         """
         super().__init__(id)
         self.path_mappings = path_mappings or []
+        if command_timeout_seconds <= 0:
+            raise ValueError("command_timeout_seconds must be positive")
+        if command_capture_limit_bytes < 0:
+            raise ValueError("command_capture_limit_bytes cannot be negative")
+        self.command_timeout_seconds = command_timeout_seconds
+        self.command_capture_limit_bytes = command_capture_limit_bytes
         # Track files written through write_file so read_file only
         # reverse-resolves paths in agent-authored content.
         self._agent_written_paths: set[str] = set()
@@ -303,6 +367,150 @@ class LocalSandbox(Sandbox):
 
         raise RuntimeError("No suitable shell executable found. Tried /bin/zsh, /bin/bash, /bin/sh, and `sh` on PATH.")
 
+    @staticmethod
+    def _format_timeout_notice(timeout: float) -> str:
+        seconds = float(timeout)
+        amount = str(int(seconds)) if seconds.is_integer() else f"{seconds:g}"
+        unit = "second" if seconds == 1 else "seconds"
+        return (
+            f"Command timed out after {amount} {unit} and was terminated. "
+            "Run long-lived processes in the background and redirect their output."
+        )
+
+    @staticmethod
+    def _drain_pipe(fd: int, capture: _BoundedPipeCapture) -> None:
+        try:
+            while chunk := os.read(fd, 8192):
+                capture.append(chunk)
+        except OSError:
+            logger.debug("Subprocess output pipe closed while draining", exc_info=True)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _start_pipe_drain(
+        self,
+        fd: int,
+        name: str,
+        *,
+        encoding: str,
+    ) -> tuple[_BoundedPipeCapture, threading.Thread]:
+        capture = _BoundedPipeCapture(
+            limit_bytes=self.command_capture_limit_bytes,
+            encoding=encoding,
+            normalize_newlines=True,
+        )
+        thread = threading.Thread(
+            target=self._drain_pipe,
+            args=(fd, capture),
+            name=name,
+            daemon=True,
+        )
+        thread.start()
+        return capture, thread
+
+    def _run_windows_command(
+        self,
+        args: list[str],
+    ) -> tuple[str, str, int, bool]:
+        """Run a Windows command with bounded capture and tree termination."""
+        stdout_read_fd, stdout_write_fd = os.pipe()
+        stderr_read_fd, stderr_write_fd = os.pipe()
+        try:
+            process = subprocess.Popen(
+                args,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_write_fd,
+                stderr=stderr_write_fd,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        except Exception:
+            for fd in (
+                stdout_read_fd,
+                stdout_write_fd,
+                stderr_read_fd,
+                stderr_write_fd,
+            ):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+        finally:
+            for fd in (stdout_write_fd, stderr_write_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        encoding = locale.getpreferredencoding(False)
+        stdout_capture, stdout_thread = self._start_pipe_drain(
+            stdout_read_fd,
+            "deerflow-bash-stdout-drain",
+            encoding=encoding,
+        )
+        stderr_capture, stderr_thread = self._start_pipe_drain(
+            stderr_read_fd,
+            "deerflow-bash-stderr-drain",
+            encoding=encoding,
+        )
+
+        timed_out = False
+        try:
+            try:
+                process.wait(timeout=self.command_timeout_seconds)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                self._terminate_windows_process_tree(process)
+            returncode = process.returncode if process.returncode is not None else 0
+        finally:
+            join_timeout = 10 if timed_out else _PIPE_DRAIN_JOIN_TIMEOUT_SECONDS
+            for thread in (stdout_thread, stderr_thread):
+                thread.join(timeout=join_timeout)
+                if thread.is_alive():
+                    logger.debug("Subprocess output drain thread still active after command returned")
+
+        return stdout_capture.read(), stderr_capture.read(), returncode, timed_out
+
+    @staticmethod
+    def _terminate_windows_process_tree(process: subprocess.Popen) -> None:
+        """Terminate a Windows process and its descendants, then reap it."""
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        taskkill = ntpath.join(system_root, "System32", "taskkill.exe")
+        try:
+            result = subprocess.run(
+                [taskkill, "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode != 0 and process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    logger.debug("Windows process %s already exited", process.pid)
+        except (OSError, subprocess.TimeoutExpired):
+            logger.debug(
+                "Failed to terminate Windows process tree for pid %s",
+                process.pid,
+                exc_info=True,
+            )
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    logger.debug("Windows process %s already exited", process.pid)
+
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("Process tree for pid %s did not exit after taskkill", process.pid)
+
     def execute_command(self, command: str) -> str:
         # Resolve container paths in command before execution
         resolved_command = self._resolve_paths_in_command(command)
@@ -316,13 +524,7 @@ class LocalSandbox(Sandbox):
             else:
                 args = [shell, "-c", resolved_command]
 
-            result = subprocess.run(
-                args,
-                shell=False,
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
+            stdout, stderr, returncode, timed_out = self._run_windows_command(args)
         else:
             args = [shell, "-c", resolved_command]
             result = subprocess.run(
@@ -330,13 +532,22 @@ class LocalSandbox(Sandbox):
                 shell=False,
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=self.command_timeout_seconds,
             )
-        output = result.stdout
-        if result.stderr:
-            output += f"\nStd Error:\n{result.stderr}" if output else result.stderr
-        if result.returncode != 0:
-            output += f"\nExit Code: {result.returncode}"
+            stdout, stderr, returncode, timed_out = (
+                result.stdout,
+                result.stderr,
+                result.returncode,
+                False,
+            )
+        output = stdout
+        if stderr:
+            output += f"\nStd Error:\n{stderr}" if output else stderr
+        if timed_out:
+            notice = self._format_timeout_notice(self.command_timeout_seconds)
+            output += f"\n{notice}" if output else notice
+        elif returncode != 0:
+            output += f"\nExit Code: {returncode}"
 
         final_output = output if output else "(no output)"
         # Reverse resolve local paths back to container paths in output

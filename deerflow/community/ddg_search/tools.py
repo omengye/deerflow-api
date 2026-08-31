@@ -6,6 +6,10 @@ import logging
 from langchain.tools import tool
 
 from deerflow.community.proxy import get_tool_https_proxy
+from deerflow.community.search_time_range import (
+    DDGS_TIMELIMIT_BY_TIME_RANGE,
+    SearchTimeRange,
+)
 from deerflow.config import get_app_config
 
 logger = logging.getLogger(__name__)
@@ -13,6 +17,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SEARCH_TIMEOUT = 30
 _MAX_SEARCH_TIMEOUT = 120
 _MAX_RESULTS_CAP = 50
+_TIME_RANGE_BACKENDS = "brave,duckduckgo,yahoo"
 
 
 def _resolve_search_timeout(tool_name: str) -> int:
@@ -46,6 +51,7 @@ def _search_text(
     safesearch: str = "moderate",
     https_proxy: str | None = None,
     timeout: int = _DEFAULT_SEARCH_TIMEOUT,
+    time_range: SearchTimeRange | None = None,
 ) -> list[dict]:
     """Execute text search using DuckDuckGo."""
     try:
@@ -57,12 +63,17 @@ def _search_text(
     ddgs = DDGS(proxy=https_proxy, timeout=timeout)
 
     try:
-        results = ddgs.text(
-            query,
-            region=region,
-            safesearch=safesearch,
-            max_results=max_results,
-        )
+        search_kwargs: dict[str, object] = {
+            "region": region,
+            "safesearch": safesearch,
+            "max_results": max_results,
+        }
+        if time_range is not None:
+            # Restrict recency searches to DDGS engines that implement the
+            # native time-limit parameter; other engines may silently ignore it.
+            search_kwargs["timelimit"] = DDGS_TIMELIMIT_BY_TIME_RANGE[time_range]
+            search_kwargs["backend"] = _TIME_RANGE_BACKENDS
+        results = ddgs.text(query, **search_kwargs)
         return list(results) if results else []
     except Exception as e:
         # Avoid leaking proxy URL or query payload in logs.
@@ -74,12 +85,15 @@ def _search_text(
 def web_search_tool(
     query: str,
     max_results: int = 5,
+    time_range: SearchTimeRange | None = None,
 ) -> str:
-    """Search the web for information. Use this tool to find current information, news, articles, and facts from the internet.
+    """Search the web for current information, news, articles, and facts.
 
     Args:
         query: Search keywords describing what you want to find. Be specific for better results.
         max_results: Maximum number of results to return. Default is 5.
+        time_range: Optional relative result window. Use day, week, month, or
+            year only when recent results are required.
     """
     config = get_app_config().get_tool_config("web_search")
 
@@ -93,6 +107,7 @@ def web_search_tool(
         max_results=max_results,
         https_proxy=get_tool_https_proxy("web_search"),
         timeout=_resolve_search_timeout("web_search"),
+        time_range=time_range,
     )
 
     if not results:

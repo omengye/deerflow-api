@@ -7,6 +7,10 @@ import httpx
 from langchain.tools import tool
 
 from deerflow.community.proxy import get_tool_https_proxy
+from deerflow.community.search_time_range import (
+    BRAVE_FRESHNESS_BY_TIME_RANGE,
+    SearchTimeRange,
+)
 from deerflow.config import get_app_config
 
 logger = logging.getLogger(__name__)
@@ -61,6 +65,7 @@ def _search_text(
     safesearch: str = "moderate",
     https_proxy: str | None = None,
     timeout: int = _DEFAULT_SEARCH_TIMEOUT,
+    time_range: SearchTimeRange | None = None,
 ) -> list[dict]:
     """Execute text search using Brave Search API."""
     headers = {
@@ -76,6 +81,8 @@ def _search_text(
         "safesearch": safesearch,
         "text_decorations": False,
     }
+    if time_range is not None:
+        params["freshness"] = BRAVE_FRESHNESS_BY_TIME_RANGE[time_range]
 
     try:
         with httpx.Client(
@@ -101,12 +108,15 @@ def _search_text(
 def web_search_tool(
     query: str,
     max_results: int = 5,
+    time_range: SearchTimeRange | None = None,
 ) -> str:
-    """Search the web for information. Use this tool to find current information, news, articles, and facts from the internet.
+    """Search the web for current information, news, articles, and facts.
 
     Args:
         query: Search keywords describing what you want to find. Be specific for better results.
         max_results: Maximum number of results to return. Default is 5.
+        time_range: Optional relative result window. Use day, week, month, or
+            year only when recent results are required.
     """
     config = get_app_config().get_tool_config("web_search")
 
@@ -129,6 +139,7 @@ def web_search_tool(
         max_results=max_results,
         https_proxy=get_tool_https_proxy("web_search"),
         timeout=_resolve_search_timeout("web_search"),
+        time_range=time_range,
     )
 
     if not results:

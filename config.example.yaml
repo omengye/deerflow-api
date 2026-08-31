@@ -226,6 +226,8 @@ default_model: qwen3.6-plus
 sandbox:
   use: deerflow.sandbox.local:LocalSandboxProvider
   allow_host_bash: false
+  # Host commands are terminated with their process tree after this timeout.
+  bash_command_timeout: 600
   # Host-process tools such as host_opencli can reuse browser login state and
   # credentials outside the sandbox. Keep disabled unless every prompt and
   # fetched document is trusted.

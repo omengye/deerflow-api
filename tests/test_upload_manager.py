@@ -11,6 +11,38 @@ from deerflow.uploads import manager as upload_manager
 from deerflow.utils import file_conversion
 
 
+def test_max_length_filename_dedup_stays_within_utf8_limit() -> None:
+    name = f"{'a' * 251}.txt"
+
+    deduplicated = upload_manager.claim_unique_filename(name, {name})
+
+    assert deduplicated.endswith("_1.txt")
+    assert len(deduplicated.encode("utf-8")) <= 255
+    assert upload_manager.normalize_filename(deduplicated) == deduplicated
+
+
+def test_multibyte_filename_dedup_truncates_on_codepoint_boundary() -> None:
+    name = f"{'界' * 83}a.txt"
+
+    deduplicated = upload_manager.claim_unique_filename(name, {name})
+
+    assert deduplicated.endswith("_1.txt")
+    assert "�" not in deduplicated
+    assert len(deduplicated.encode("utf-8")) <= 255
+    assert upload_manager.normalize_filename(deduplicated) == deduplicated
+
+
+def test_repeated_max_length_collisions_remain_unique_and_valid() -> None:
+    name = f"{'a' * 251}.txt"
+    seen = {name}
+
+    generated = [upload_manager.claim_unique_filename(name, seen) for _ in range(12)]
+
+    assert len(set(generated)) == len(generated)
+    assert all(len(candidate.encode("utf-8")) <= 255 for candidate in generated)
+    assert generated[-1].endswith("_12.txt")
+
+
 def test_client_upload_preserves_existing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(upload_manager, "get_paths", lambda: Paths(tmp_path))
     uploads_dir = Paths(tmp_path).sandbox_uploads_dir("thread-1")

@@ -114,6 +114,11 @@ class SandboxConfig(BaseModel):
         ge=0,
         description="Maximum characters to keep from bash tool output. Output exceeding this limit is middle-truncated (head + tail), preserving the first and last half. Set to 0 to disable truncation.",
     )
+    bash_command_timeout: int = Field(
+        default=600,
+        ge=1,
+        description="Wall-clock timeout in seconds for a LocalSandbox host command.",
+    )
     read_file_output_max_chars: int = Field(
         default=50000,
         ge=0,

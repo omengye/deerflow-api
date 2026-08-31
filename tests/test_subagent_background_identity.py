@@ -3,6 +3,7 @@ import threading
 import time
 
 import deerflow.subagents.executor as executor_module
+import pytest
 from deerflow.subagents.executor import (
     SubagentExecutor,
     SubagentResult,
@@ -18,6 +19,11 @@ class _DeferredPool:
     def submit(self, func, *args, **kwargs):
         self.calls.append((func, args, kwargs))
         return SimpleNamespace()
+
+
+class _FailingPool:
+    def submit(self, func, *args, **kwargs):
+        raise RuntimeError("scheduler is shut down")
 
 
 def _executor() -> SubagentExecutor:
@@ -47,6 +53,16 @@ def test_reused_external_tool_call_ids_get_distinct_registry_keys(monkeypatch) -
         with executor_module._background_tasks_lock:
             executor_module._background_tasks.pop(first_id, None)
             executor_module._background_tasks.pop(second_id, None)
+
+
+def test_scheduler_submission_failure_removes_unreachable_pending_result(monkeypatch) -> None:
+    monkeypatch.setattr(executor_module, "_scheduler_pool", _FailingPool())
+    existing_ids = set(executor_module._background_tasks)
+
+    with pytest.raises(RuntimeError, match="scheduler is shut down"):
+        _executor().execute_async("work")
+
+    assert set(executor_module._background_tasks) == existing_ids
 
 
 def test_terminal_outcome_is_first_writer_wins() -> None:

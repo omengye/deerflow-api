@@ -19,6 +19,7 @@ class PathTraversalError(ValueError):
 
 # thread_id must be alphanumeric, hyphens, underscores, or dots only.
 _SAFE_THREAD_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
+_MAX_FILENAME_BYTES = 255
 
 
 def validate_thread_id(thread_id: str) -> None:
@@ -79,9 +80,39 @@ def normalize_filename(filename: str) -> str:
     # but they indicate a Windows-style path that should be stripped or rejected.
     if "\\" in safe:
         raise ValueError(f"Filename contains backslash: {filename!r}")
-    if len(safe.encode("utf-8")) > 255:
+    if len(safe.encode("utf-8")) > _MAX_FILENAME_BYTES:
         raise ValueError(f"Filename too long: {len(safe)} chars")
     return safe
+
+
+def _fit_utf8_bytes(text: str, budget: int) -> str:
+    """Truncate *text* without splitting a UTF-8 code point."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= budget:
+        return text
+    return encoded[:budget].decode("utf-8", errors="ignore")
+
+
+def _numbered_filename(name: str, counter: int) -> str:
+    """Return a collision suffix variant that still fits a filesystem name."""
+    if counter == 0:
+        return name
+
+    path = Path(name)
+    tag = f"_{counter}"
+    tag_size = len(tag.encode("utf-8"))
+    if tag_size >= _MAX_FILENAME_BYTES:
+        raise ValueError("Filename collision counter is too large")
+
+    suffix = path.suffix
+    stem_budget = _MAX_FILENAME_BYTES - tag_size - len(suffix.encode("utf-8"))
+    if stem_budget < 1:
+        # An unusually long extension leaves no room for a stem. Preserve as
+        # much of the original name as possible and put the uniqueness tag at
+        # the end rather than returning another invalid filename.
+        fitted = _fit_utf8_bytes(path.stem + suffix, _MAX_FILENAME_BYTES - tag_size)
+        return f"{fitted}{tag}"
+    return f"{_fit_utf8_bytes(path.stem, stem_budget)}{tag}{suffix}"
 
 
 def claim_unique_filename(name: str, seen: set[str]) -> str:
@@ -99,21 +130,13 @@ def claim_unique_filename(name: str, seen: set[str]) -> str:
     if name not in seen:
         seen.add(name)
         return name
-    stem, suffix = Path(name).stem, Path(name).suffix
     counter = 1
-    candidate = f"{stem}_{counter}{suffix}"
+    candidate = _numbered_filename(name, counter)
     while candidate in seen:
         counter += 1
-        candidate = f"{stem}_{counter}{suffix}"
+        candidate = _numbered_filename(name, counter)
     seen.add(candidate)
     return candidate
-
-
-def _numbered_filename(name: str, counter: int) -> str:
-    if counter == 0:
-        return name
-    path = Path(name)
-    return f"{path.stem}_{counter}{path.suffix}"
 
 
 def copy_file_exclusive(source: Path, destination_dir: Path, preferred_name: str | None = None) -> Path:

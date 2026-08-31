@@ -6,7 +6,11 @@ from collections import OrderedDict
 from collections.abc import Collection
 from pathlib import Path
 
-from deerflow.sandbox.local.local_sandbox import LocalSandbox, PathMapping
+from deerflow.sandbox.local.local_sandbox import (
+    DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    LocalSandbox,
+    PathMapping,
+)
 from deerflow.sandbox.output_paths import workspace_outputs_path
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import (
@@ -118,6 +122,17 @@ class LocalSandboxProvider(SandboxProvider):
     def __init__(self, max_cached_threads: int = DEFAULT_MAX_CACHED_THREAD_SANDBOXES):
         """Initialize the local sandbox provider with path mappings."""
         self._path_mappings = self._build_non_skill_path_mappings()
+        try:
+            from deerflow.config import get_app_config
+
+            sandbox_config = get_app_config().sandbox
+            self._command_timeout_seconds = (
+                sandbox_config.bash_command_timeout
+                if sandbox_config is not None
+                else DEFAULT_COMMAND_TIMEOUT_SECONDS
+            )
+        except Exception:
+            self._command_timeout_seconds = DEFAULT_COMMAND_TIMEOUT_SECONDS
         self._generic_sandbox: LocalSandbox | None = None
         self._thread_sandboxes: OrderedDict[str, LocalSandbox] = OrderedDict()
         self._max_cached_threads = max_cached_threads
@@ -214,6 +229,7 @@ class LocalSandboxProvider(SandboxProvider):
                     self._generic_sandbox = LocalSandbox(
                         sandbox_id,
                         path_mappings=[*self._path_mappings, skills_mapping],
+                        command_timeout_seconds=self._command_timeout_seconds,
                     )
                     _singleton = self._generic_sandbox
                 return self._generic_sandbox.id
@@ -239,7 +255,11 @@ class LocalSandboxProvider(SandboxProvider):
         with self._lock:
             cached = self._thread_sandboxes.get(cache_key)
             if cached is None:
-                cached = LocalSandbox(f"local:{cache_key}", path_mappings=new_mappings)
+                cached = LocalSandbox(
+                    f"local:{cache_key}",
+                    path_mappings=new_mappings,
+                    command_timeout_seconds=self._command_timeout_seconds,
+                )
                 self._thread_sandboxes[cache_key] = cached
                 self._evict_until_within_cap_locked()
             else:
