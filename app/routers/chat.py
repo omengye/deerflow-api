@@ -221,6 +221,7 @@ async def chat_agui(request: Request, req: AguiRunAgentInput = Body()):
                     "task_started",
                     "task_running",
                     "task_completed",
+                    "task_limit_reached",
                     "task_failed",
                     "task_cancelled",
                     "task_timed_out",
@@ -523,7 +524,13 @@ def _stream_event_to_agui(
             open_subagent_reasoning_message_ids if open_subagent_reasoning_message_ids is not None else set(),
             subagent_names_by_id,
         )
-    if event_type in {"task_completed", "task_failed", "task_cancelled", "task_timed_out"}:
+    if event_type in {
+        "task_completed",
+        "task_limit_reached",
+        "task_failed",
+        "task_cancelled",
+        "task_timed_out",
+    }:
         return _subagent_terminal_event_to_agui(
             event_type,
             event.data,

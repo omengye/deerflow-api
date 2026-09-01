@@ -5,7 +5,9 @@ from langchain_core.messages import AIMessage
 from langchain.agents.middleware import AgentMiddleware
 
 from deerflow.agents.middlewares.loop_detection_middleware import (
+    AGENT_TERMINATION_KEY,
     LoopDetectionMiddleware,
+    TOOL_CALL_LIMIT_STOP_REASON,
     _derive_total_call_limits,
     calibrate_loop_detection,
     count_steps_per_turn,
@@ -89,7 +91,13 @@ def test_total_call_hard_limit_stops_long_diverse_runs():
     # 90th call trips the total hard limit and strips tool_calls to force a final answer.
     result = middleware.after_model(_state("lookup", 89), runtime)
     assert result is not None
-    assert result["messages"][0].tool_calls == []
+    message = result["messages"][0]
+    assert message.tool_calls == []
+    termination = message.additional_kwargs[AGENT_TERMINATION_KEY]
+    assert termination["reason"] == TOOL_CALL_LIMIT_STOP_REASON
+    assert termination["incomplete"] is True
+    assert "Total tool calls reached 90" in termination["message"]
+    assert runtime.context["stop_reason"] == TOOL_CALL_LIMIT_STOP_REASON
 
 
 def test_total_call_warn_is_queued_before_hard_limit():

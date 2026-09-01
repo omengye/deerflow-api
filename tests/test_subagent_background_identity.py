@@ -4,6 +4,13 @@ import time
 
 import deerflow.subagents.executor as executor_module
 import pytest
+from langchain_core.messages import AIMessage
+
+from deerflow.agents.middlewares.loop_detection_middleware import (
+    AGENT_TERMINATION_KEY,
+    TOOL_CALL_LIMIT_STOP_REASON,
+)
+from deerflow.subagents.config import SubagentConfig
 from deerflow.subagents.executor import (
     SubagentExecutor,
     SubagentResult,
@@ -93,6 +100,62 @@ def test_terminal_result_freezes_ai_messages() -> None:
     original_messages.append({"id": "late"})
 
     assert result.ai_messages == [{"id": "first"}]
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_limit_is_not_published_as_completed(monkeypatch) -> None:
+    limit_message = "Tool-call safety limit reached"
+
+    class FakeAgent:
+        async def astream(self, *_args, context, **_kwargs):
+            context["stop_reason"] = TOOL_CALL_LIMIT_STOP_REASON
+            yield (
+                "values",
+                {
+                    "messages": [
+                        AIMessage(
+                            content="partial work",
+                            additional_kwargs={
+                                AGENT_TERMINATION_KEY: {
+                                    "reason": TOOL_CALL_LIMIT_STOP_REASON,
+                                    "incomplete": True,
+                                    "message": limit_message,
+                                }
+                            },
+                        )
+                    ]
+                },
+            )
+
+    executor = SubagentExecutor(
+        SubagentConfig(
+            name="worker",
+            description="worker",
+            system_prompt="work",
+        ),
+        tools=[],
+    )
+
+    async def initial_state(_task: str) -> dict[str, list[object]]:
+        return {"messages": []}
+
+    async def close_model(_model: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        executor,
+        "_create_agent",
+        lambda stream_callback=None: (FakeAgent(), object()),
+    )
+    monkeypatch.setattr(executor, "_build_initial_state", initial_state)
+    monkeypatch.setattr(executor_module, "aclose_chat_model", close_model)
+
+    result = await executor._aexecute("finish the task")
+
+    assert result.status == SubagentStatus.LIMIT_REACHED
+    assert result.result == "partial work"
+    assert result.error == limit_message
+    assert result.termination_reason == TOOL_CALL_LIMIT_STOP_REASON
 
 
 def test_sync_bootstrap_failure_records_error(monkeypatch) -> None:

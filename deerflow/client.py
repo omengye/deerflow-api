@@ -878,9 +878,16 @@ class DeerFlowClient:
             logger.debug("Failed to resolve model context window", exc_info=True)
             return None
 
-    def _end_event(self, stream_state: "_StreamProcessingState") -> "StreamEvent":
+    def _end_event(
+        self,
+        stream_state: "_StreamProcessingState",
+        *,
+        stop_reason: str | None = None,
+    ) -> "StreamEvent":
         """Build the terminal stream event with usage and context telemetry."""
         data: dict[str, Any] = {"usage": stream_state.cumulative_usage}
+        if stop_reason:
+            data["stop_reason"] = stop_reason
         # Context-window telemetry for the lead thread. ``last_usage`` is the
         # final top-level model call's usage snapshot; ``context_window`` is
         # resolved from the model config. Consumers (e.g. the ACP event
@@ -1328,9 +1335,10 @@ class DeerFlowClient:
                     "Recursion limit reached (thread=%s) — emitting graceful final answer",
                     actual_thread_id,
                 )
+                context.setdefault("stop_reason", "recursion_limit")
                 yield self._recursion_limit_event()
 
-        yield self._end_event(stream_state)
+        yield self._end_event(stream_state, stop_reason=context.get("stop_reason"))
 
     async def astream(
         self,
@@ -1375,9 +1383,10 @@ class DeerFlowClient:
                     "Recursion limit reached (thread=%s) — emitting graceful final answer",
                     actual_thread_id,
                 )
+                context.setdefault("stop_reason", "recursion_limit")
                 yield self._recursion_limit_event()
 
-        yield self._end_event(stream_state)
+        yield self._end_event(stream_state, stop_reason=context.get("stop_reason"))
 
     def chat(self, message: str, *, thread_id: str | None = None, **kwargs) -> str:
         """Send a message and return the final text response.

@@ -15,8 +15,38 @@ tool_search_module = importlib.import_module("deerflow.tools.builtins.tool_searc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_result", "expected_output", "expected_stop_reason"),
+    [
+        (
+            SimpleNamespace(
+                status=SubagentStatus.COMPLETED,
+                result="finished",
+                error=None,
+                termination_reason=None,
+                ai_messages=[],
+            ),
+            "Task Succeeded. Result: finished",
+            None,
+        ),
+        (
+            SimpleNamespace(
+                status=SubagentStatus.LIMIT_REACHED,
+                result="partial",
+                error="Tool-call limit reached",
+                termination_reason="tool_call_limit",
+                ai_messages=[],
+            ),
+            "Task incomplete. Reason: Tool-call limit reached. Partial result: partial",
+            "tool_call_limit",
+        ),
+    ],
+)
 async def test_task_tool_propagates_acp_policy_to_internal_subagent(
     monkeypatch: pytest.MonkeyPatch,
+    task_result: SimpleNamespace,
+    expected_output: str,
+    expected_stop_reason: str | None,
 ) -> None:
     permission_middleware = object()
     captured: dict[str, Any] = {}
@@ -51,19 +81,12 @@ async def test_task_tool_propagates_acp_policy_to_internal_subagent(
             captured["execute_kwargs"] = kwargs
             return "execution-1"
 
-    completed_result = SimpleNamespace(
-        status=SubagentStatus.COMPLETED,
-        result="finished",
-        error=None,
-        ai_messages=[],
-    )
-
     monkeypatch.setattr(task_tool_module, "get_available_subagent_names", lambda: ["general-purpose"])
     monkeypatch.setattr(task_tool_module, "get_subagent_config", lambda _name: child_config)
     monkeypatch.setattr(task_tool_module, "SubagentExecutor", FakeExecutor)
     def get_result(task_id: str):
         lookup_calls.append(task_id)
-        return completed_result
+        return task_result
 
     monkeypatch.setattr(task_tool_module, "get_background_task_result", get_result)
     monkeypatch.setattr(task_tool_module, "cleanup_background_task", cleanup_calls.append)
@@ -107,7 +130,8 @@ async def test_task_tool_propagates_acp_policy_to_internal_subagent(
         tool_call_id="tool-call-1",
     )
 
-    assert result == "Task Succeeded. Result: finished"
+    assert result == expected_output
+    assert runtime.context.get("stop_reason") == expected_stop_reason
     assert available_tool_calls == [
         {
             "model_name": "parent-model",

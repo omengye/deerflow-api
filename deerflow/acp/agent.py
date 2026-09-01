@@ -811,7 +811,10 @@ class DeerFlowACPAgent:
                     raise RequestError.internal_error(
                         {"details": mapper.failure_message}
                     )
-                await mapper.close_open_tools(cancelled=False)
+                await mapper.close_open_tools(
+                    cancelled=False,
+                    failure_message=mapper.stop_reason,
+                )
             except asyncio.CancelledError:
                 cancelled = True
                 if hasattr(task, "uncancel"):
@@ -842,7 +845,9 @@ class DeerFlowACPAgent:
                 total_tokens=mapper.usage["total_tokens"],
             )
             return acp.PromptResponse(
-                stop_reason="cancelled" if cancelled else "end_turn",
+                stop_reason="cancelled"
+                if cancelled
+                else mapper.stop_reason or "end_turn",
                 usage=usage,
                 user_message_id=message_id or str(uuid.uuid4()),
             )

@@ -31,6 +31,12 @@ logger = logging.getLogger(__name__)
 _MESSAGE_NAMESPACE = uuid.UUID("d0af913a-b872-4e87-9b31-3fc58f03b3f8")
 _OUTPUT_PREFIX = "/mnt/user-data/outputs/"
 _MAX_TOOL_TEXT = 20_000
+_ACP_STOP_REASONS: dict[str, schema.StopReason] = {
+    "tool_call_limit": "max_turn_requests",
+    "recursion_limit": "max_turn_requests",
+    "model_length_capped": "max_tokens",
+    "safety_capped": "refusal",
+}
 
 
 def _message_uuid(kind: str, raw_id: Any) -> str:
@@ -103,6 +109,7 @@ class ACPEventMapper:
         self._subagent_usage = dict(self.usage)
         self._goal_evaluator_usage = dict(self.usage)
         self.failure_message: str | None = None
+        self.stop_reason: schema.StopReason | None = None
         self._closed = False
 
     async def _send(self, update: Any) -> None:
@@ -151,6 +158,11 @@ class ACPEventMapper:
             elif event_type == "custom":
                 await self._handle_live_unlocked(data)
             elif event_type == "end":
+                internal_stop_reason = data.get("stop_reason")
+                if isinstance(internal_stop_reason, str):
+                    mapped_stop_reason = _ACP_STOP_REASONS.get(internal_stop_reason)
+                    if mapped_stop_reason is not None:
+                        self.stop_reason = mapped_stop_reason
                 usage = data.get("usage")
                 if isinstance(usage, dict):
                     for key in ("input_tokens", "output_tokens", "total_tokens"):
@@ -343,6 +355,10 @@ class ACPEventMapper:
             self.failure_message = str(data.get("message") or data.get("reason") or "Model request failed")
             return
 
+        if event_type == "loop_hard_stop":
+            self.stop_reason = "max_turn_requests"
+            return
+
         if event_type == "goal_status":
             evaluator_usage = data.get("evaluator_usage")
             if isinstance(evaluator_usage, dict):
@@ -433,14 +449,29 @@ class ACPEventMapper:
                 )
             return
 
-        if event_type in {"task_completed", "task_failed", "task_cancelled", "task_timed_out"} and task_id:
+        if event_type in {
+            "task_completed",
+            "task_failed",
+            "task_cancelled",
+            "task_timed_out",
+            "task_limit_reached",
+        } and task_id:
             if subagent_tool_id not in self._started_tools:
                 await self._handle_live_unlocked({**data, "type": "task_started"})
-            status: schema.ToolCallStatus = "completed" if event_type == "task_completed" else "failed"
+            tool_status: schema.ToolCallStatus = (
+                "completed" if event_type == "task_completed" else "failed"
+            )
+            if event_type == "task_limit_reached":
+                self.stop_reason = _ACP_STOP_REASONS.get(
+                    str(data.get("reason") or "tool_call_limit"),
+                    "max_turn_requests",
+                )
             await self._finish_tool(
                 subagent_tool_id,
-                status=status,
-                output=data.get("result") if status == "completed" else data.get("error") or event_type,
+                status=tool_status,
+                output=data.get("result")
+                if tool_status == "completed"
+                else data.get("error") or event_type,
             )
             return
 
@@ -506,12 +537,22 @@ class ACPEventMapper:
         except Exception:
             logger.debug("Failed to send ACP usage_update", exc_info=True)
 
-    async def close_open_tools(self, *, cancelled: bool) -> None:
+    async def close_open_tools(
+        self,
+        *,
+        cancelled: bool,
+        failure_message: str | None = None,
+    ) -> None:
         async with self._lock:
             for tool_call_id in sorted(self._started_tools - self._finished_tools):
+                failed = cancelled or failure_message is not None
                 await self._finish_tool(
                     tool_call_id,
-                    status="failed" if cancelled else "completed",
-                    output="Cancelled" if cancelled else "Completed",
+                    status="failed" if failed else "completed",
+                    output=(
+                        "Cancelled"
+                        if cancelled
+                        else failure_message or "Completed"
+                    ),
                 )
             self._closed = True

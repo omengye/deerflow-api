@@ -814,6 +814,56 @@ async def test_prompt_maps_events_usage_and_title(
 
 
 @pytest.mark.asyncio
+async def test_prompt_reports_tool_call_limit_as_max_turn_requests(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    runtime = FakeRuntime(
+        [
+            {
+                "live": True,
+                "data": {
+                    "type": "task_limit_reached",
+                    "task_id": "sub-1",
+                    "reason": "tool_call_limit",
+                    "error": "Tool-call limit reached",
+                    "result": "partial work",
+                    "incomplete": True,
+                },
+            },
+            SimpleNamespace(
+                type="end",
+                data={
+                    "stop_reason": "tool_call_limit",
+                    "usage": {
+                        "input_tokens": 3,
+                        "output_tokens": 4,
+                        "total_tokens": 7,
+                    },
+                },
+            ),
+        ]
+    )
+    connection = FakeConnection()
+    agent = DeerFlowACPAgent(make_config(tmp_path), store, runtime)
+    agent.on_connect(connection)
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    response = await agent.prompt(
+        [acp.text_block("do it")],
+        created.session_id,
+    )
+
+    assert response.stop_reason == "max_turn_requests"
+    progress = [
+        update
+        for _, update in connection.updates
+        if isinstance(update, schema.ToolCallProgress)
+    ]
+    assert progress[-1].status == "failed"
+
+
+@pytest.mark.asyncio
 async def test_goal_set_command_persists_and_starts_normalized_task(
     tmp_path: Path,
     store: LocalACPSessionStore,
@@ -1623,6 +1673,36 @@ async def test_event_mapper_can_start_subagent_from_progress_or_terminal_event()
         update for update in updates if isinstance(update, schema.ToolCallProgress)
     ]
     assert [update.status for update in progress] == ["in_progress", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_event_mapper_fails_open_tools_after_loop_hard_stop() -> None:
+    updates: list[Any] = []
+
+    async def send(update: Any) -> None:
+        updates.append(update)
+
+    mapper = ACPEventMapper("session-1", send)
+    await mapper.handle_live(
+        {"type": "task_started", "task_id": "sub-1", "description": "work"}
+    )
+    await mapper.handle_live(
+        {
+            "type": "loop_hard_stop",
+            "reason": "tool_call_limit",
+            "incomplete": True,
+        }
+    )
+    await mapper.close_open_tools(
+        cancelled=False,
+        failure_message=mapper.stop_reason,
+    )
+
+    progress = [
+        update for update in updates if isinstance(update, schema.ToolCallProgress)
+    ]
+    assert mapper.stop_reason == "max_turn_requests"
+    assert progress[-1].status == "failed"
 
 
 @pytest.mark.asyncio

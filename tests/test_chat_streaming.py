@@ -528,6 +528,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(notice.data["content"], _RECURSION_LIMIT_NOTICE)
             # ...followed by the normal end event.
             self.assertEqual(events[-1].type, "end")
+            self.assertEqual(events[-1].data["stop_reason"], "recursion_limit")
 
     async def test_chat_stream_uses_async_client_stream(self) -> None:
         fake_client = _FakeClient()
@@ -963,7 +964,13 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_chat_agui_closes_subagent_reasoning_before_terminal_custom_event(self) -> None:
-        for terminal_type in ("task_completed", "task_failed", "task_cancelled", "task_timed_out"):
+        for terminal_type in (
+            "task_completed",
+            "task_limit_reached",
+            "task_failed",
+            "task_cancelled",
+            "task_timed_out",
+        ):
             with self.subTest(terminal_type=terminal_type):
                 terminal_data = {"task_id": "task-1", "result": "done"} if terminal_type == "task_completed" else {"task_id": "task-1", "error": "stop"}
                 fake_client = _FakeClient(

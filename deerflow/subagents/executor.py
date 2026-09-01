@@ -20,6 +20,10 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.runnables import RunnableConfig
 
 from deerflow.agents.date_context import append_current_date
+from deerflow.agents.middlewares.loop_detection_middleware import (
+    AGENT_TERMINATION_KEY,
+    TOOL_CALL_LIMIT_STOP_REASON,
+)
 from deerflow.agents.thread_state import AgentContext, SandboxState, ThreadDataState, ThreadState
 from deerflow.models import aclose_chat_model, create_chat_model
 from deerflow.subagents.config import SubagentConfig
@@ -39,6 +43,7 @@ class SubagentStatus(Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
+    LIMIT_REACHED = "limit_reached"
 
     @property
     def is_terminal(self) -> bool:
@@ -47,6 +52,7 @@ class SubagentStatus(Enum):
             type(self).FAILED,
             type(self).CANCELLED,
             type(self).TIMED_OUT,
+            type(self).LIMIT_REACHED,
         }
 
 
@@ -61,8 +67,9 @@ class SubagentResult:
             state.
         trace_id: Trace ID for distributed tracing (links parent and subagent logs).
         status: Current status of the execution.
-        result: The final result message (if completed).
-        error: Error message (if failed).
+        result: The final or partial result message, when available.
+        error: Error or incomplete-termination message, when applicable.
+        termination_reason: Structured reason when execution stopped incomplete.
         started_at: When execution started.
         completed_at: When execution completed.
         ai_messages: List of complete AI messages (as dicts) generated during execution.
@@ -74,6 +81,7 @@ class SubagentResult:
     external_task_id: str | None = None
     result: str | None = None
     error: str | None = None
+    termination_reason: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     ai_messages: list[dict[str, Any]] = field(default_factory=list)
@@ -95,6 +103,7 @@ class SubagentResult:
         *,
         result: str | None = None,
         error: str | None = None,
+        termination_reason: str | None = None,
         ai_messages: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Publish a terminal outcome once; late workers cannot overwrite it."""
@@ -106,6 +115,7 @@ class SubagentResult:
             self.status = status
             self.result = result
             self.error = error
+            self.termination_reason = termination_reason
             # Always detach the published terminal snapshot from any list a
             # caller or worker may still hold, even when no replacement list
             # was supplied explicitly.
@@ -503,7 +513,7 @@ class SubagentExecutor:
             run_config: RunnableConfig = {
                 "recursion_limit": self._run_recursion_limit or self.config.max_turns * 4,
             }
-            context = {}
+            context: AgentContext = {}
             if self.thread_id:
                 run_config["configurable"] = {"thread_id": self.thread_id}
                 context["thread_id"] = self.thread_id
@@ -636,6 +646,7 @@ class SubagentExecutor:
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} completed async execution")
 
             final_result: str
+            last_ai_message: AIMessage | None = None
             if final_state is None:
                 logger.warning(f"[trace={self.trace_id}] Subagent {self.config.name} no final state")
                 final_result = "No response generated"
@@ -645,7 +656,6 @@ class SubagentExecutor:
                 logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} final messages count: {len(messages)}")
 
                 # Find the last AIMessage in the conversation
-                last_ai_message = None
                 for msg in reversed(messages):
                     if isinstance(msg, AIMessage):
                         last_ai_message = msg
@@ -706,11 +716,38 @@ class SubagentExecutor:
                     logger.warning(f"[trace={self.trace_id}] Subagent {self.config.name} no messages in final state")
                     final_result = "No response generated"
 
-            result.try_set_terminal(
-                SubagentStatus.COMPLETED,
-                result=final_result,
-                ai_messages=captured_ai_messages,
-            )
+            termination_reason = context.get("stop_reason")
+            termination_message: str | None = None
+            if last_ai_message is not None:
+                marker = (last_ai_message.additional_kwargs or {}).get(
+                    AGENT_TERMINATION_KEY
+                )
+                if isinstance(marker, dict):
+                    termination_reason = termination_reason or marker.get("reason")
+                    marker_message = marker.get("message")
+                    if isinstance(marker_message, str) and marker_message:
+                        termination_message = marker_message
+
+            limit_reasons = {
+                TOOL_CALL_LIMIT_STOP_REASON,
+                "model_length_capped",
+                "recursion_limit",
+            }
+            if termination_reason in limit_reasons:
+                result.try_set_terminal(
+                    SubagentStatus.LIMIT_REACHED,
+                    result=final_result,
+                    error=termination_message
+                    or f"Subagent stopped before completion ({termination_reason})",
+                    termination_reason=str(termination_reason),
+                    ai_messages=captured_ai_messages,
+                )
+            else:
+                result.try_set_terminal(
+                    SubagentStatus.COMPLETED,
+                    result=final_result,
+                    ai_messages=captured_ai_messages,
+                )
 
         except Exception as e:
             logger.exception(f"[trace={self.trace_id}] Subagent {self.config.name} async execution failed")
@@ -986,7 +1023,7 @@ def cleanup_background_task(task_id: str) -> None:
     Should be called by task_tool after it finishes polling and returns the result.
     This prevents memory leaks from accumulated completed tasks.
 
-    Only removes tasks that are in a terminal state (COMPLETED/FAILED/TIMED_OUT)
+    Only removes tasks that are in a terminal state
     to avoid race conditions with the background executor still updating the task entry.
 
     Args:
@@ -1001,12 +1038,7 @@ def cleanup_background_task(task_id: str) -> None:
 
         # Only clean up tasks that are in a terminal state to avoid races with
         # the background executor still updating the task entry.
-        is_terminal_status = result.status in {
-            SubagentStatus.COMPLETED,
-            SubagentStatus.FAILED,
-            SubagentStatus.CANCELLED,
-            SubagentStatus.TIMED_OUT,
-        }
+        is_terminal_status = result.status.is_terminal
         if is_terminal_status or result.completed_at is not None:
             del _background_tasks[task_id]
             logger.debug("Cleaned up background task: %s", task_id)

@@ -44,6 +44,7 @@ class AgentContext(TypedDict, total=False):
     user_id: NotRequired[str]
     workspace_path: NotRequired[str]
     available_skills: NotRequired[list[str] | None]
+    stop_reason: NotRequired[str]
 
 
 class ThreadDataState(TypedDict):

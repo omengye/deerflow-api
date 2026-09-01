@@ -302,6 +302,37 @@ async def _task_tool_impl(
                 logger.info(f"[trace={trace_id}] Task {tool_call_id} completed after {poll_count} polls")
                 cleanup_background_task(execution_id)
                 return f"Task Succeeded. Result: {result.result}"
+            elif result.status == SubagentStatus.LIMIT_REACHED:
+                reason = result.termination_reason or "limit_reached"
+                termination_message = (
+                    result.error or f"Subagent stopped before completion ({reason})"
+                )
+                if runtime is not None and isinstance(runtime.context, dict):
+                    runtime.context.setdefault("stop_reason", reason)
+                _emit(
+                    {
+                        "type": "task_limit_reached",
+                        "task_id": tool_call_id,
+                        "reason": reason,
+                        "error": termination_message,
+                        "result": result.result,
+                        "incomplete": True,
+                    }
+                )
+                logger.warning(
+                    "[trace=%s] Task %s stopped incomplete: %s",
+                    trace_id,
+                    tool_call_id,
+                    termination_message,
+                )
+                cleanup_background_task(execution_id)
+                partial_result = (
+                    f" Partial result: {result.result}" if result.result else ""
+                )
+                return (
+                    f"Task incomplete. Reason: {termination_message}."
+                    f"{partial_result}"
+                )
             elif result.status == SubagentStatus.FAILED:
                 _emit({"type": "task_failed", "task_id": tool_call_id, "error": result.error})
                 logger.error(f"[trace={trace_id}] Task {tool_call_id} failed: {result.error}")

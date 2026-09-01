@@ -14,7 +14,7 @@ Detection strategy:
      tool_calls from its ToolMessage responses, which would otherwise
      trigger 400s on strict provider validators (OpenAI / Moonshot).
   4. If a hash appears >= hard_limit times, strip all tool_calls from the
-     response so the agent is forced to produce a final text answer.
+     response and publish a structured incomplete termination.
 """
 
 import hashlib
@@ -33,6 +33,12 @@ from langchain_core.messages import HumanMessage
 from langgraph.runtime import Runtime
 
 logger = logging.getLogger(__name__)
+
+# Structured termination metadata survives the message rewrite performed by a
+# hard stop.  Downstream harness layers must not infer success merely because
+# the rewritten assistant message no longer contains tool calls.
+AGENT_TERMINATION_KEY = "agent_termination"
+TOOL_CALL_LIMIT_STOP_REASON = "tool_call_limit"
 
 # Defaults — can be overridden via constructor
 _DEFAULT_WARN_THRESHOLD = 3  # inject warning after 3 identical calls
@@ -203,15 +209,15 @@ _TOOL_FREQ_WARNING_MSG = (
     "[LOOP DETECTED] You have called {tool_name} {count} times without producing a final answer. Stop calling tools and produce your final answer now. If you cannot complete the task, summarize what you accomplished so far."
 )
 
-_HARD_STOP_MSG = "[FORCED STOP] Repeated tool calls exceeded the safety limit. Producing final answer with results collected so far."
+_HARD_STOP_MSG = "[INCOMPLETE] Repeated tool calls exceeded the safety limit. Partial results were preserved so the task can continue in a new turn."
 
-_TOOL_FREQ_HARD_STOP_MSG = "[FORCED STOP] Tool {tool_name} called {count} times — exceeded the per-tool safety limit. Producing final answer with results collected so far."
+_TOOL_FREQ_HARD_STOP_MSG = "[INCOMPLETE] Tool {tool_name} was called {count} times and exceeded the per-tool safety limit. Partial results were preserved so the task can continue in a new turn."
 
 _TOTAL_CALLS_WARNING_MSG = (
     "[LOOP DETECTED] You have made {count} tool calls in this run without producing a final answer. Wrap up now and produce your final answer from the results collected so far."
 )
 
-_TOTAL_CALLS_HARD_STOP_MSG = "[FORCED STOP] Total tool calls reached {count} — exceeded the per-run safety limit. Producing final answer with results collected so far."
+_TOTAL_CALLS_HARD_STOP_MSG = "[INCOMPLETE] Total tool calls reached {count} and exceeded the per-run safety limit. Partial results were preserved so the task can continue in a new turn."
 
 
 class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
@@ -247,7 +253,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             ``None`` (default), derived from the run budget.
         total_call_hard_limit: Number of tool calls across all tool types
             before forcing a stop. Kept below the achievable turn count so the
-            run ends with a clean final answer instead of a
+            run ends with a structured incomplete result instead of a
             ``GraphRecursionError``. When ``None`` (default), derived from the
             run budget.
         stream_callback: Optional callback that receives ``{"type": ..., "message": ...}``
@@ -318,7 +324,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         normal long conversations do not accumulate tool-frequency counts
         until they trip the hard limit.
         """
-        context = runtime.context or {}
+        context: dict[str, Any] = runtime.context or {}
         thread_id = context.get("loop_detection_scope_id") or context.get("thread_id")
         if thread_id:
             return str(thread_id)
@@ -326,7 +332,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
 
     def _get_run_id(self, runtime: Runtime) -> str:
         """Extract run_id from runtime context for per-run warning scoping."""
-        context = runtime.context or {}
+        context: dict[str, Any] = runtime.context or {}
         run_id = context.get("run_id")
         if run_id:
             return str(run_id)
@@ -557,9 +563,9 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         return str(content) + f"\n\n{text}"
 
     @staticmethod
-    def _build_hard_stop_update(last_msg, content: str | list) -> dict:
+    def _build_hard_stop_update(last_msg, content: str | list, message: str) -> dict:
         """Clear tool-call metadata so forced-stop messages serialize as plain assistant text."""
-        update = {
+        update: dict[str, Any] = {
             "tool_calls": [],
             "content": content,
         }
@@ -567,6 +573,11 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         additional_kwargs = dict(getattr(last_msg, "additional_kwargs", {}) or {})
         for key in ("tool_calls", "function_call"):
             additional_kwargs.pop(key, None)
+        additional_kwargs[AGENT_TERMINATION_KEY] = {
+            "reason": TOOL_CALL_LIMIT_STOP_REASON,
+            "incomplete": True,
+            "message": message,
+        }
         update["additional_kwargs"] = additional_kwargs
 
         response_metadata = deepcopy(getattr(last_msg, "response_metadata", {}) or {})
@@ -595,13 +606,26 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
         warning, hard_stop = self._track_and_check(state, runtime)
 
         if hard_stop:
-            self._emit({"type": "loop_hard_stop", "message": warning or _HARD_STOP_MSG})
+            message = warning or _HARD_STOP_MSG
+            context = getattr(runtime, "context", None)
+            if isinstance(context, dict):
+                context.setdefault("stop_reason", TOOL_CALL_LIMIT_STOP_REASON)
+            self._emit(
+                {
+                    "type": "loop_hard_stop",
+                    "message": message,
+                    "reason": TOOL_CALL_LIMIT_STOP_REASON,
+                    "incomplete": True,
+                }
+            )
 
-            # Strip tool_calls from the last AIMessage to force text output
+            # Strip tool_calls while retaining explicit incomplete metadata.
             messages = state.get("messages", [])
             last_msg = messages[-1]
-            content = self._append_text(last_msg.content, warning or _HARD_STOP_MSG)
-            stripped_msg = last_msg.model_copy(update=self._build_hard_stop_update(last_msg, content))
+            content = self._append_text(last_msg.content, message)
+            stripped_msg = last_msg.model_copy(
+                update=self._build_hard_stop_update(last_msg, content, message)
+            )
             return {"messages": [stripped_msg]}
 
         if warning:
