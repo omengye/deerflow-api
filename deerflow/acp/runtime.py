@@ -368,6 +368,10 @@ class LocalACPRuntime:
                 "ACP session workspace changed after session creation: "
                 f"expected {session.cwd}, resolved to {workspace_path}"
             )
+        self.permission_broker.set_session_approval_mode(
+            session.session_id,
+            session.approval_mode,
+        )
         client = await self._client_for(session)
         async with self._run_slots:
             client_kwargs: dict[str, Any] = {

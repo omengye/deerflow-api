@@ -9,7 +9,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
@@ -41,7 +41,13 @@ from .session_coordinator import (
     ACPSessionCoordinator,
     SessionCoordinationError,
 )
-from .session_store import LocalACPSession, LocalACPSessionStore
+from .session_store import (
+    DEFAULT_SESSION_APPROVAL_MODE,
+    SESSION_APPROVAL_MODES,
+    LocalACPSession,
+    LocalACPSessionStore,
+    SessionApprovalMode,
+)
 from .workspace import normalize_workspace_cwd, workspace_paths_equal
 
 logger = logging.getLogger(__name__)
@@ -187,6 +193,7 @@ class DeerFlowACPAgent:
             ),
             "recursion_limit": self.config.recursion_limit,
             "agent_name": self.config.agent_name,
+            "approval_mode": DEFAULT_SESSION_APPROVAL_MODE,
         }
 
     @staticmethod
@@ -244,6 +251,46 @@ class DeerFlowACPAgent:
                             description=model.description,
                         )
                         for model in available_models.values()
+                    ],
+                )
+            )
+        if self.policy.permissions != "off":
+            options.append(
+                schema.SessionConfigOptionSelect(
+                    type="select",
+                    id="tool_approval",
+                    name="Tool approvals",
+                    description=(
+                        "Choose how protected tool calls are authorized for this "
+                        "ACP session. Deployment tool restrictions still apply."
+                    ),
+                    category="_permissions",
+                    current_value=session.approval_mode,
+                    options=[
+                        schema.SessionConfigSelectOption(
+                            name="Ask before protected tools",
+                            value="ask",
+                            description=(
+                                "Request permission before each protected tool unless "
+                                "that tool was already approved for this session."
+                            ),
+                        ),
+                        schema.SessionConfigSelectOption(
+                            name="Always allow in this session",
+                            value="allow_always",
+                            description=(
+                                "Automatically authorize all protected tools for this "
+                                "session without additional prompts."
+                            ),
+                        ),
+                        schema.SessionConfigSelectOption(
+                            name="Always reject in this session",
+                            value="reject_always",
+                            description=(
+                                "Reject all protected tools for this session without "
+                                "additional prompts."
+                            ),
+                        ),
                     ],
                 )
             )
@@ -539,6 +586,26 @@ class DeerFlowACPAgent:
                         }
                     )
                 session.thinking_enabled = enabled
+            elif config_id == "tool_approval":
+                if self.policy.permissions == "off":
+                    raise RequestError.invalid_params(
+                        {
+                            "details": (
+                                "Tool approval controls are disabled by local ACP "
+                                "deployment policy"
+                            )
+                        }
+                    )
+                if not isinstance(value, str) or value not in SESSION_APPROVAL_MODES:
+                    raise RequestError.invalid_params(
+                        {
+                            "details": (
+                                "Unsupported tool approval mode: "
+                                f"{value}. Expected ask, allow_always, or reject_always"
+                            )
+                        }
+                    )
+                session.approval_mode = cast(SessionApprovalMode, value)
             elif config_id == "subagent_enabled":
                 if not self.policy.subagents_enabled:
                     raise RequestError.invalid_params(

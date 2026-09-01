@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -367,6 +369,7 @@ async def test_new_session_rejects_client_directories_and_mcp(
     assert {option.id for option in response.config_options or []} == {
         "model",
         "thinking_enabled",
+        "tool_approval",
     }
     assert all(option.type == "select" for option in response.config_options or [])
     model_option = next(
@@ -672,6 +675,19 @@ async def test_session_modes_config_list_and_load_history(
     agent.on_connect(connection)
     created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
 
+    approval_option = next(
+        option
+        for option in created.config_options or []
+        if option.id == "tool_approval"
+    )
+    assert approval_option.category == "_permissions"
+    assert approval_option.current_value == "ask"
+    assert [option.value for option in approval_option.options] == [
+        "ask",
+        "allow_always",
+        "reject_always",
+    ]
+
     await agent.set_session_mode("default", created.session_id)
     options = await agent.set_config_option(
         "thinking_enabled", created.session_id, "off"
@@ -691,13 +707,35 @@ async def test_session_modes_config_list_and_load_history(
         ).current_value
         == "model-a"
     )
+    options = await agent.set_config_option(
+        "tool_approval",
+        created.session_id,
+        "allow_always",
+    )
+    assert (
+        next(
+            option
+            for option in options.config_options
+            if option.id == "tool_approval"
+        ).current_value
+        == "allow_always"
+    )
     stored = await store.get(created.session_id)
-    assert stored is not None and stored.model_name == "model-a"
+    assert stored is not None
+    assert stored.model_name == "model-a"
+    assert stored.approval_mode == "allow_always"
     with pytest.raises(RequestError) as model_error:
         await agent.set_config_option("model", created.session_id, "missing-model")
     assert model_error.value.code == -32602
     with pytest.raises(RequestError):
         await agent.set_config_option("subagent_enabled", created.session_id, "on")
+    with pytest.raises(RequestError) as approval_error:
+        await agent.set_config_option(
+            "tool_approval",
+            created.session_id,
+            "allow_everything_forever",
+        )
+    assert approval_error.value.code == -32602
 
     listed = await agent.list_sessions(cwd=str(tmp_path))
     assert [item.session_id for item in listed.sessions] == [created.session_id]
@@ -714,6 +752,14 @@ async def test_session_modes_config_list_and_load_history(
         ).current_value
         == "model-a"
     )
+    assert (
+        next(
+            option
+            for option in loaded.config_options or []
+            if option.id == "tool_approval"
+        ).current_value
+        == "allow_always"
+    )
     assert [type(update) for _, update in connection.updates] == [
         schema.UserMessageChunk,
         schema.AgentThoughtChunk,
@@ -721,6 +767,30 @@ async def test_session_modes_config_list_and_load_history(
         schema.ToolCallStart,
         schema.ToolCallProgress,
     ]
+
+
+@pytest.mark.asyncio
+async def test_tool_approval_option_is_hidden_when_permissions_are_off(
+    tmp_path: Path,
+    store: LocalACPSessionStore,
+) -> None:
+    agent = DeerFlowACPAgent(
+        make_config(tmp_path, permission_mode="off"),
+        store,
+        FakeRuntime(),
+    )
+    created = await agent.new_session(cwd=str(tmp_path), mcp_servers=[])
+
+    assert "tool_approval" not in {
+        option.id for option in created.config_options or []
+    }
+    with pytest.raises(RequestError) as error:
+        await agent.set_config_option(
+            "tool_approval",
+            created.session_id,
+            "allow_always",
+        )
+    assert error.value.code == -32602
 
 
 @pytest.mark.asyncio
@@ -1873,6 +1943,8 @@ async def test_session_store_persists_and_pages(tmp_path: Path) -> None:
         "agent_name": None,
     }
     one = await first.create(cwd=str(tmp_path), defaults=defaults)
+    one.approval_mode = "allow_always"
+    await first.save(one)
     await first.create(cwd=str(tmp_path), defaults=defaults)
     await first.create(cwd=str(tmp_path / "different"), defaults=defaults)
     page, cursor = await first.list(cwd=None, cursor=None, limit=2)
@@ -1885,7 +1957,44 @@ async def test_session_store_persists_and_pages(tmp_path: Path) -> None:
     reopened.setup()
     loaded = await reopened.get(one.session_id)
     assert loaded is not None and loaded.cwd == str(tmp_path)
+    assert loaded.approval_mode == "allow_always"
     reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_session_store_defaults_legacy_approval_mode_to_ask(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "sessions.db"
+    store = LocalACPSessionStore(path)
+    store.setup()
+    defaults = {
+        "model_name": None,
+        "thinking_enabled": True,
+        "subagent_enabled": False,
+        "plan_mode": False,
+        "max_concurrent_subagents": 1,
+        "recursion_limit": 100,
+        "agent_name": None,
+    }
+    session = await store.create(cwd=str(tmp_path), defaults=defaults)
+    legacy_config = session.config_dict()
+    legacy_config.pop("approval_mode", None)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "UPDATE acp_sessions SET config_json = ? WHERE session_id = ?",
+            (json.dumps(legacy_config), session.session_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    loaded = await store.get(session.session_id)
+
+    assert loaded is not None
+    assert loaded.approval_mode == "ask"
+    store.close()
 
 
 @pytest.mark.asyncio

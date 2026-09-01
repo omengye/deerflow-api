@@ -12,7 +12,19 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
+
+
+SessionApprovalMode = Literal["ask", "allow_always", "reject_always"]
+SESSION_APPROVAL_MODES = frozenset({"ask", "allow_always", "reject_always"})
+DEFAULT_SESSION_APPROVAL_MODE: SessionApprovalMode = "ask"
+
+
+def normalize_session_approval_mode(value: object) -> SessionApprovalMode:
+    """Return a safe approval mode for persisted or legacy session data."""
+    if isinstance(value, str) and value in SESSION_APPROVAL_MODES:
+        return cast(SessionApprovalMode, value)
+    return DEFAULT_SESSION_APPROVAL_MODE
 
 
 def utc_now() -> str:
@@ -32,6 +44,7 @@ class LocalACPSession:
     max_concurrent_subagents: int
     recursion_limit: int
     agent_name: str | None = None
+    approval_mode: SessionApprovalMode = DEFAULT_SESSION_APPROVAL_MODE
     closed: bool = False
 
     def runtime_key(self) -> tuple[Any, ...]:
@@ -97,6 +110,9 @@ class LocalACPSessionStore:
     @staticmethod
     def _from_row(row: sqlite3.Row) -> LocalACPSession:
         config = json.loads(row["config_json"])
+        config["approval_mode"] = normalize_session_approval_mode(
+            config.get("approval_mode")
+        )
         return LocalACPSession(
             session_id=row["session_id"],
             cwd=row["cwd"],

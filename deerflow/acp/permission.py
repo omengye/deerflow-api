@@ -16,6 +16,12 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
 from .policy import LocalACPCapabilityPolicy, tool_kind
+from .session_store import (
+    DEFAULT_SESSION_APPROVAL_MODE,
+    SESSION_APPROVAL_MODES,
+    SessionApprovalMode,
+    normalize_session_approval_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +49,7 @@ class ACPPermissionBroker:
         self._state_lock = threading.Lock()
         self._always_allowed: set[tuple[str, str]] = set()
         self._always_rejected: set[tuple[str, str]] = set()
+        self._session_approval_modes: dict[str, SessionApprovalMode] = {}
 
     def bind(
         self,
@@ -59,6 +66,7 @@ class ACPPermissionBroker:
 
     def clear_session(self, session_id: str) -> None:
         with self._state_lock:
+            self._session_approval_modes.pop(session_id, None)
             self._always_allowed = {
                 item for item in self._always_allowed if item[0] != session_id
             }
@@ -66,17 +74,64 @@ class ACPPermissionBroker:
                 item for item in self._always_rejected if item[0] != session_id
             }
 
-    async def request(self, session_id: str, tool_call: Mapping[str, Any]) -> bool:
-        name = str(tool_call.get("name") or "tool")
+    def set_session_approval_mode(
+        self,
+        session_id: str,
+        mode: SessionApprovalMode,
+    ) -> None:
+        """Set one session's wildcard policy and discard stale per-tool choices."""
+        if mode not in SESSION_APPROVAL_MODES:
+            raise ValueError(f"Unsupported session approval mode: {mode}")
+        normalized = normalize_session_approval_mode(mode)
+        with self._state_lock:
+            previous = self._session_approval_modes.get(
+                session_id,
+                DEFAULT_SESSION_APPROVAL_MODE,
+            )
+            self._session_approval_modes[session_id] = normalized
+            if previous != normalized:
+                self._always_allowed = {
+                    item for item in self._always_allowed if item[0] != session_id
+                }
+                self._always_rejected = {
+                    item for item in self._always_rejected if item[0] != session_id
+                }
+
+    def session_approval_mode(self, session_id: str) -> SessionApprovalMode:
+        with self._state_lock:
+            return self._session_approval_modes.get(
+                session_id,
+                DEFAULT_SESSION_APPROVAL_MODE,
+            )
+
+    def _known_decision(self, session_id: str, name: str) -> bool | None:
+        """Return a policy/cache decision, or ``None`` when the client must decide."""
         if not self.policy.requires_permission(name):
             return True
 
         decision_key = (session_id, name)
         with self._state_lock:
+            mode = self._session_approval_modes.get(
+                session_id,
+                DEFAULT_SESSION_APPROVAL_MODE,
+            )
+            if mode == "allow_always":
+                return True
+            if mode == "reject_always":
+                return False
             if decision_key in self._always_allowed:
                 return True
             if decision_key in self._always_rejected:
                 return False
+        return None
+
+    async def request(self, session_id: str, tool_call: Mapping[str, Any]) -> bool:
+        name = str(tool_call.get("name") or "tool")
+        known_decision = self._known_decision(session_id, name)
+        if known_decision is not None:
+            return known_decision
+
+        decision_key = (session_id, name)
 
         connection_id = (
             self._session_owner(session_id)
@@ -159,8 +214,10 @@ class ACPPermissionBroker:
         return False
 
     def request_sync(self, session_id: str, tool_call: Mapping[str, Any]) -> bool:
-        if not self.policy.requires_permission(str(tool_call.get("name") or "tool")):
-            return True
+        name = str(tool_call.get("name") or "tool")
+        known_decision = self._known_decision(session_id, name)
+        if known_decision is not None:
+            return known_decision
         connection_id = (
             self._session_owner(session_id)
             if self._session_owner is not None

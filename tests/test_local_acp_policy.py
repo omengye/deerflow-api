@@ -154,6 +154,43 @@ async def test_permission_broker_supports_allow_always_per_session(tmp_path) -> 
     )
     assert calls == ["call-1"]
 
+    # Changing the session-wide policy clears remembered per-tool decisions.
+    broker.set_session_approval_mode("session-1", "allow_always")
+    broker.set_session_approval_mode("session-1", "ask")
+    assert await broker.request(
+        "session-1", {"id": "call-4", "name": "bash", "args": {"command": "ls"}}
+    )
+    assert calls == ["call-1", "call-4"]
+
+
+@pytest.mark.asyncio
+async def test_permission_broker_supports_session_wildcard_modes(tmp_path) -> None:
+    policy = LocalACPCapabilityPolicy.from_config(
+        _config(tmp_path, permission_mode="dangerous")
+    )
+    broker = ACPPermissionBroker(policy)
+
+    broker.set_session_approval_mode("session-1", "allow_always")
+    assert broker.session_approval_mode("session-1") == "allow_always"
+    assert await broker.request(
+        "session-1", {"id": "call-1", "name": "bash", "args": {}}
+    )
+    assert broker.request_sync(
+        "session-1", {"id": "call-2", "name": "write_file", "args": {}}
+    )
+
+    broker.set_session_approval_mode("session-1", "reject_always")
+    assert not await broker.request(
+        "session-1", {"id": "call-3", "name": "bash", "args": {}}
+    )
+    # Safe tools stay available under reject_always; only protected tools are gated.
+    assert await broker.request(
+        "session-1", {"id": "call-4", "name": "read_file", "args": {}}
+    )
+
+    broker.clear_session("session-1")
+    assert broker.session_approval_mode("session-1") == "ask"
+
 
 @pytest.mark.asyncio
 async def test_permission_broker_routes_sync_subagent_calls_to_connection_loop(

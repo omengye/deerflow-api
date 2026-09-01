@@ -122,7 +122,10 @@ local_acp:
   subagent_enabled: false
   max_concurrent_subagents: 2
   # off | dangerous | all. dangerous approves read/search/think locally and asks
-  # the ACP client before edit/delete/execute/fetch/unknown tool calls.
+  # the ACP client before edit/delete/execute/fetch/unknown tool calls. When this
+  # is dangerous or all, DeerFlow also exposes the standard ACP session config
+  # option `tool_approval`: ask | allow_always | reject_always. This is a
+  # session-wide wildcard choice; deployment tool allow/deny rules still apply.
   permission_mode: dangerous
   # Optional hard tool policy applied after global tools and client MCP tools are assembled.
   # When task is omitted or denied, subagents are effectively disabled even if

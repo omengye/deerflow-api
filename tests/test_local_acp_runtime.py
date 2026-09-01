@@ -336,6 +336,7 @@ async def test_runtime_passes_session_cwd_as_workspace_path(
         plan_mode=False,
         max_concurrent_subagents=1,
         recursion_limit=100,
+        approval_mode="allow_always",
     )
 
     async for _ in runtime.astream(
@@ -346,6 +347,10 @@ async def test_runtime_passes_session_cwd_as_workspace_path(
         pass
 
     assert len(calls) == 1
+    assert (
+        runtime.permission_broker.session_approval_mode("workspace-session")
+        == "allow_always"
+    )
     assert callable(calls[0].pop("live_event_callback"))
     assert calls == [
         {
