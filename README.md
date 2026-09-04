@@ -324,6 +324,10 @@ uv run deerflow-acp
 
 可选配置见 `config.example.yaml` 的 `local_acp:`。也可用 `DEER_FLOW_ACP_CHECKPOINTER_PATH`、`DEER_FLOW_ACP_SESSION_STORE_PATH`、`DEER_FLOW_ACP_MAX_ACTIVE_CONNECTIONS`、`DEER_FLOW_ACP_MAX_ACTIVE_RUNS`、`DEER_FLOW_ACP_RUN_TIMEOUT`、`DEER_FLOW_ACP_GOAL_AUTO_CONTINUE`、`DEER_FLOW_ACP_GOAL_MAX_CONTINUATIONS`、`DEER_FLOW_ACP_GOAL_MAX_NO_PROGRESS_CONTINUATIONS`、`DEER_FLOW_ACP_ENABLE_BASH` 和 `DEER_FLOW_ACP_ACCEPT_CLIENT_MCP_SERVERS` 覆盖运行参数。Bridge 的 stdout 只承载 ACP JSON-RPC；daemon 日志写入独立轮转文件。
 
+### Raft 集成
+
+`integrations/raft/` 提供独立运行的 Raft External Agent sidecar，通过 ACP v1 连接便携版 DeerFlow。它拥有自己的依赖、配置、测试和运行状态，不会被打入主项目 wheel；安装及运行方式见 [`integrations/raft/README.md`](integrations/raft/README.md)。
+
 ## 外部 ACP Agent 对接（Codex / Claude Code）
 
 项目支持作为 **ACP client** 调用外部 agent。配置 `config.yaml` 的 `acp_agents:` 后，DeerFlow 会自动暴露内置工具 `invoke_acp_agent`，主 agent 可以把编码、审查、重构等任务交给外部 ACP agent 执行。

@@ -1,0 +1,5 @@
+.venv/
+adapter.toml
+data/
+.test-tmp-*
+
