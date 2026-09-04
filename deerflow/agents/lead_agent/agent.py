@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Mapping
 from typing import Any, NotRequired, TypedDict, cast
 
 from langchain.agents import create_agent
@@ -29,7 +30,7 @@ from deerflow.agents.thread_state import (
 from deerflow.config.agents_config import load_agent_config, validate_agent_name
 from deerflow.config.app_config import get_app_config
 from deerflow.config.memory_config import get_memory_config
-from deerflow.config.summarization_config import get_summarization_config
+from deerflow.config.summarization_config import DEFAULT_KEEP, get_summarization_config
 from deerflow.models import create_chat_model
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,64 @@ def _resolve_model_name(requested_model_name: str | None = None, fallback_model_
     if fallback_model_name and fallback_model_name != default_model_name:
         logger.warning(f"Agent model '{fallback_model_name}' not found in config; fallback to default model '{default_model_name}'.")
     return default_model_name
+
+
+def _model_profile_max_input_tokens(model: Any) -> int | None:
+    profile = getattr(model, "profile", None)
+    if not isinstance(profile, Mapping):
+        return None
+    value = profile.get("max_input_tokens")
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def _drop_unusable_fraction_clauses(
+    model: Any,
+    trigger: SummarizationContextSize | list[SummarizationContextSize] | None,
+    keep: SummarizationContextSize,
+) -> tuple[
+    SummarizationContextSize | list[SummarizationContextSize] | None,
+    SummarizationContextSize,
+    bool,
+]:
+    clauses = list(trigger) if isinstance(trigger, list) else ([] if trigger is None else [trigger])
+    has_fraction_trigger = any(
+        isinstance(clause, tuple) and clause[0] == "fraction"
+        for clause in clauses
+    )
+    keep_is_fraction = isinstance(keep, tuple) and keep[0] == "fraction"
+    if not (has_fraction_trigger or keep_is_fraction):
+        return trigger, keep, True
+    if _model_profile_max_input_tokens(model) is not None:
+        return trigger, keep, True
+
+    surviving = [
+        clause
+        for clause in clauses
+        if not (isinstance(clause, tuple) and clause[0] == "fraction")
+    ]
+    dropped = [clause for clause in clauses if clause not in surviving]
+    if dropped:
+        logger.warning(
+            "Dropped summarization fraction trigger clause(s) %s because the "
+            "summary model exposes no context window; declare context_window or "
+            "use an absolute token/message threshold.",
+            dropped,
+        )
+
+    effective_keep = keep
+    if keep_is_fraction:
+        effective_keep = cast("SummarizationContextSize", DEFAULT_KEEP)
+        logger.warning(
+            "Summarization fraction keep %s is unusable without a model context "
+            "window; falling back to %s.",
+            keep,
+            effective_keep,
+        )
+
+    if not surviving:
+        return None, effective_keep, not clauses
+    effective_trigger = surviving if isinstance(trigger, list) else surviving[0]
+    return effective_trigger, effective_keep, True
 
 
 def _create_summarization_middleware(run_model_name: str | None = None) -> DeerFlowSummarizationMiddleware | None:
@@ -126,6 +185,18 @@ def _create_summarization_middleware(run_model_name: str | None = None) -> DeerF
     # reused for every summarisation turn — same long-lived-pool risk as the
     # lead agent itself, so opt out of keep-alive consistently.
     model = create_chat_model(name=primary_model_name, thinking_enabled=False, disable_keepalive=True)
+
+    trigger, keep, has_usable_trigger = _drop_unusable_fraction_clauses(
+        model,
+        trigger,
+        keep,
+    )
+    if not has_usable_trigger:
+        logger.warning(
+            "Every configured summarization trigger is fraction-based, but the "
+            "summary model exposes no context window; auto-compaction will not "
+            "fire for this agent build."
+        )
 
     # Second-chance model for when the primary summarization model errors out
     # (see DeerFlowSummarizationMiddleware's tiered fallback). Only meaningful

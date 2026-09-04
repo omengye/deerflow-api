@@ -148,3 +148,68 @@ async def test_task_tool_propagates_acp_policy_to_internal_subagent(
     assert captured["prompt"] == "Inspect the workspace"
     assert lookup_calls == ["execution-1"]
     assert cleanup_calls == ["execution-1"]
+
+
+@pytest.mark.asyncio
+async def test_task_tool_unexpected_poller_exit_cancels_and_cleans_background_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child_config = SubagentConfig(
+        name="general-purpose",
+        description="General task worker",
+        system_prompt="Child base prompt",
+        timeout_seconds=10,
+    )
+    finalize_calls: list[tuple[str, SubagentStatus, str]] = []
+    cleanup_calls: list[str] = []
+
+    class FakeExecutor:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def execute_async(self, _prompt: str, **_kwargs: Any) -> str:
+            return "execution-poller-failure"
+
+    def fail_lookup(_execution_id: str):
+        raise RuntimeError("poller failed")
+
+    def finalize(
+        execution_id: str,
+        *,
+        status: SubagentStatus,
+        error: str,
+    ) -> bool:
+        finalize_calls.append((execution_id, status, error))
+        return True
+
+    monkeypatch.setattr(task_tool_module, "get_available_subagent_names", lambda: ["general-purpose"])
+    monkeypatch.setattr(task_tool_module, "get_subagent_config", lambda _name: child_config)
+    monkeypatch.setattr(task_tool_module, "SubagentExecutor", FakeExecutor)
+    monkeypatch.setattr(task_tool_module, "get_background_task_result", fail_lookup)
+    monkeypatch.setattr(task_tool_module, "finalize_cancelled_background_task", finalize)
+    monkeypatch.setattr(task_tool_module, "cleanup_background_task", cleanup_calls.append)
+    monkeypatch.setattr(tools_module, "get_available_tools", lambda **_kwargs: [])
+
+    runtime = SimpleNamespace(
+        state={},
+        context={},
+        config={"configurable": {}, "metadata": {}},
+    )
+
+    with pytest.raises(RuntimeError, match="poller failed"):
+        await task_tool_module._task_tool_impl(
+            runtime=runtime,
+            description="Run child task",
+            prompt="Inspect the workspace",
+            subagent_type="general-purpose",
+            tool_call_id="tool-call-poller-failure",
+        )
+
+    assert finalize_calls == [
+        (
+            "execution-poller-failure",
+            SubagentStatus.CANCELLED,
+            "Parent task stopped polling unexpectedly",
+        )
+    ]
+    assert cleanup_calls == ["execution-poller-failure"]

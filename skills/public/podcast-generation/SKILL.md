@@ -175,6 +175,10 @@ The following environment variables must be set:
 - `VOLCENGINE_TTS_APPID`: Volcengine TTS application ID
 - `VOLCENGINE_TTS_ACCESS_TOKEN`: Volcengine TTS access token
 - `VOLCENGINE_TTS_CLUSTER`: Volcengine TTS cluster (optional, defaults to "volcano_tts")
+- `VOLCENGINE_TTS_VOICE_TYPE_MALE`: Male voice type (optional; defaults to `zh_male_yangguangqingnian_moon_bigtts`)
+- `VOLCENGINE_TTS_VOICE_TYPE_FEMALE`: Female voice type (optional; defaults to `zh_female_sajiaonvyou_moon_bigtts`)
+
+Voice overrides are trimmed; unset or blank values use the defaults above.
 
 ## Notes
 

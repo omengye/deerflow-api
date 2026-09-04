@@ -38,8 +38,18 @@ async def make_stream_bridge(config=None) -> AsyncIterator[StreamBridge]:
         from deerflow.runtime.stream_bridge.memory import MemoryStreamBridge
 
         maxsize = config.queue_maxsize if config is not None else 256
-        bridge = MemoryStreamBridge(queue_maxsize=maxsize)
-        logger.info("Stream bridge initialised: memory (queue_maxsize=%d)", maxsize)
+        heartbeat_interval = (
+            config.heartbeat_interval_seconds if config is not None else 15.0
+        )
+        bridge = MemoryStreamBridge(
+            queue_maxsize=maxsize,
+            heartbeat_interval=heartbeat_interval,
+        )
+        logger.info(
+            "Stream bridge initialised: memory (queue_maxsize=%d, heartbeat_interval_seconds=%.1f)",
+            maxsize,
+            heartbeat_interval,
+        )
         try:
             yield bridge
         finally:
@@ -54,6 +64,7 @@ async def make_stream_bridge(config=None) -> AsyncIterator[StreamBridge]:
             key_prefix=config.redis_key_prefix,
             maxlen=config.redis_maxlen,
             retention_seconds=config.redis_retention_seconds,
+            heartbeat_interval=config.heartbeat_interval_seconds,
         )
         await bridge.ping()
         logger.info(

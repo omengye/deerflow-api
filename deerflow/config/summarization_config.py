@@ -1,10 +1,12 @@
 """Configuration for conversation summarization."""
 
+import math
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 ContextSizeType = Literal["fraction", "tokens", "messages"]
+DEFAULT_KEEP: tuple[ContextSizeType, int] = ("messages", 20)
 
 
 class ContextSize(BaseModel):
@@ -12,6 +14,24 @@ class ContextSize(BaseModel):
 
     type: ContextSizeType = Field(description="Type of context size specification")
     value: int | float = Field(description="Value for the context size specification")
+
+    @model_validator(mode="after")
+    def _validate_value(self) -> "ContextSize":
+        if not math.isfinite(self.value):
+            raise ValueError("ContextSize value must be finite")
+        if self.type == "fraction":
+            if not 0 < self.value <= 1:
+                raise ValueError(
+                    "fraction ContextSize value must be in (0, 1]; use 0.8 for 80%"
+                )
+        elif self.type == "messages":
+            if not isinstance(self.value, int) or self.value <= 0:
+                raise ValueError(
+                    "messages ContextSize value must be a positive whole number"
+                )
+        elif self.value <= 0:
+            raise ValueError(f"{self.type} ContextSize value must be positive")
+        return self
 
     def to_tuple(self) -> tuple[ContextSizeType, int | float]:
         """Convert to tuple format expected by SummarizationMiddleware."""
@@ -37,7 +57,7 @@ class SummarizationConfig(BaseModel):
         "{'type': 'fraction', 'value': 0.8} triggers at 80% of model's max input tokens",
     )
     keep: ContextSize = Field(
-        default_factory=lambda: ContextSize(type="messages", value=20),
+        default_factory=lambda: ContextSize(type=DEFAULT_KEEP[0], value=DEFAULT_KEEP[1]),
         description="Context retention policy after summarization. Specifies how much history to preserve. "
         "Examples: {'type': 'messages', 'value': 20} keeps 20 messages, "
         "{'type': 'tokens', 'value': 3000} keeps 3000 tokens, "

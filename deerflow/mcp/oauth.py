@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from deerflow.config.extensions_config import ExtensionsConfig, McpOAuthConfig
+from deerflow.mcp.headers import illegal_header_value_reason
 
 logger = logging.getLogger(__name__)
 
@@ -89,18 +90,31 @@ class OAuthTokenManager:
 
         token = self._get_cached_token(server_name)
         if token and not self._is_expiring(token, oauth):
-            return f"{token.token_type} {token.access_token}"
+            return self._authorization_value(token, server_name)
 
         lock = self._get_loop_lock(server_name)
         async with lock:
             token = self._get_cached_token(server_name)
             if token and not self._is_expiring(token, oauth):
-                return f"{token.token_type} {token.access_token}"
+                return self._authorization_value(token, server_name)
 
             fresh = await self._fetch_token(oauth)
             self._store_token(server_name, fresh)
             logger.info(f"Refreshed OAuth access token for MCP server: {server_name}")
-            return f"{fresh.token_type} {fresh.access_token}"
+            return self._authorization_value(fresh, server_name)
+
+    @staticmethod
+    def _authorization_value(token: _OAuthToken, server_name: str) -> str:
+        """Render and validate an Authorization value without leaking it."""
+        value = f"{token.token_type} {token.access_token}"
+        reason = illegal_header_value_reason(value)
+        if reason is not None:
+            raise ValueError(
+                f"OAuth token for MCP server '{server_name}' cannot be sent as "
+                f"an HTTP header value: the Authorization value {reason}. "
+                "Check what the token endpoint returned for this server."
+            )
+        return value
 
     def _get_cached_token(self, server_name: str) -> _OAuthToken | None:
         with self._state_lock:

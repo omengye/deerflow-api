@@ -615,16 +615,26 @@ class DeerFlowClient:
     @staticmethod
     def _tool_message_event(msg: ToolMessage) -> "StreamEvent":
         """Build a ``messages-tuple`` tool-result event from a ToolMessage."""
+        from deerflow.tools.builtins.present_file_tool import PRESENTED_ARTIFACTS_KEY
+
+        presented = (msg.additional_kwargs or {}).get(PRESENTED_ARTIFACTS_KEY)
+        data = {
+            "type": "tool",
+            "content": DeerFlowClient._extract_text(msg.content),
+            "name": msg.name,
+            "tool_call_id": msg.tool_call_id,
+            "id": msg.id,
+            "status": getattr(msg, "status", "success"),
+        }
+        if (
+            msg.name == "present_files"
+            and isinstance(presented, list)
+            and all(isinstance(path, str) for path in presented)
+        ):
+            data["presented_artifacts"] = presented
         return StreamEvent(
             type="messages-tuple",
-            data={
-                "type": "tool",
-                "content": DeerFlowClient._extract_text(msg.content),
-                "name": msg.name,
-                "tool_call_id": msg.tool_call_id,
-                "id": msg.id,
-                "status": getattr(msg, "status", "success"),
-            },
+            data=data,
         )
 
     @staticmethod

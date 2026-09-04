@@ -12,6 +12,13 @@ import requests
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+DEFAULT_VOLCENGINE_TTS_VOICE_TYPE_MALE = (
+    "zh_male_yangguangqingnian_moon_bigtts"
+)
+DEFAULT_VOLCENGINE_TTS_VOICE_TYPE_FEMALE = (
+    "zh_female_sajiaonvyou_moon_bigtts"
+)
+
 
 # Types
 class ScriptLine:
@@ -105,9 +112,15 @@ def _process_line(args: tuple[int, ScriptLine, int]) -> tuple[int, Optional[byte
 
     # Select voice based on speaker gender
     if line.speaker == "male":
-        voice_type = "zh_male_yangguangqingnian_moon_bigtts"  # Male voice
+        voice_type = (
+            os.getenv("VOLCENGINE_TTS_VOICE_TYPE_MALE", "").strip()
+            or DEFAULT_VOLCENGINE_TTS_VOICE_TYPE_MALE
+        )
     else:
-        voice_type = "zh_female_sajiaonvyou_moon_bigtts"  # Female voice
+        voice_type = (
+            os.getenv("VOLCENGINE_TTS_VOICE_TYPE_FEMALE", "").strip()
+            or DEFAULT_VOLCENGINE_TTS_VOICE_TYPE_FEMALE
+        )
 
     logger.info(f"Processing line {i + 1}/{total} ({line.speaker})")
     audio = text_to_speech(line.paragraph, voice_type)

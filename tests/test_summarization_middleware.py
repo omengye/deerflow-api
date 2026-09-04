@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from pydantic import ValidationError
 
 from deerflow.agents.lead_agent import agent as lead_agent
 from deerflow.agents.middlewares.summarization_middleware import DeerFlowSummarizationMiddleware
@@ -208,6 +209,102 @@ def test_summarization_invalid_config_model_without_run_model_falls_back_to_defa
     assert created_names == [None]  # create_chat_model(None) -> configured default
     assert captured["fallback_model_name"] is None
     assert any("not-in-config" in record.message and "default" in record.message for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("size_type", "value"),
+    [
+        ("fraction", 0),
+        ("fraction", 1.01),
+        ("fraction", float("nan")),
+        ("fraction", float("inf")),
+        ("tokens", 0),
+        ("messages", 1.5),
+    ],
+)
+def test_context_size_rejects_dead_or_crashing_thresholds(size_type: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        ContextSize(type=size_type, value=value)
+
+
+def _capture_fraction_config(
+    *,
+    trigger: ContextSize | list[ContextSize],
+    keep: ContextSize,
+    model_profile: dict | None,
+) -> tuple[dict, list[logging.LogRecord]]:
+    config = SummarizationConfig(
+        enabled=True,
+        trigger=trigger,
+        keep=keep,
+    )
+    captured: dict = {}
+    records: list[logging.LogRecord] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _CaptureHandler()
+    logger = logging.getLogger(lead_agent.__name__)
+    logger.addHandler(handler)
+    try:
+        with (
+            patch.object(lead_agent, "get_summarization_config", return_value=config),
+            patch.object(lead_agent, "get_app_config", return_value=_app_config()),
+            patch.object(lead_agent, "get_memory_config", return_value=SimpleNamespace(enabled=False)),
+            patch.object(
+                lead_agent,
+                "create_chat_model",
+                return_value=SimpleNamespace(profile=model_profile),
+            ),
+            patch.object(
+                lead_agent,
+                "DeerFlowSummarizationMiddleware",
+                side_effect=lambda **kwargs: captured.update(kwargs) or "middleware",
+            ),
+        ):
+            assert lead_agent._create_summarization_middleware("run-model") == "middleware"
+    finally:
+        logger.removeHandler(handler)
+    return captured, records
+
+
+def test_fraction_thresholds_survive_when_model_profile_is_available() -> None:
+    captured, _ = _capture_fraction_config(
+        trigger=ContextSize(type="fraction", value=0.8),
+        keep=ContextSize(type="fraction", value=0.25),
+        model_profile={"max_input_tokens": 128000},
+    )
+
+    assert captured["trigger"] == ("fraction", 0.8)
+    assert captured["keep"] == ("fraction", 0.25)
+
+
+def test_unusable_fraction_thresholds_degrade_without_breaking_agent_build() -> None:
+    captured, records = _capture_fraction_config(
+        trigger=[
+            ContextSize(type="fraction", value=0.8),
+            ContextSize(type="messages", value=40),
+        ],
+        keep=ContextSize(type="fraction", value=0.25),
+        model_profile=None,
+    )
+
+    assert captured["trigger"] == [("messages", 40)]
+    assert captured["keep"] == ("messages", 20)
+    assert any("fraction trigger" in record.getMessage() for record in records)
+
+
+def test_fraction_only_trigger_becomes_never_firing_when_profile_is_missing() -> None:
+    captured, records = _capture_fraction_config(
+        trigger=ContextSize(type="fraction", value=0.8),
+        keep=ContextSize(type="messages", value=20),
+        model_profile=None,
+    )
+
+    assert captured["trigger"] is None
+    assert any("auto-compaction will not fire" in record.getMessage() for record in records)
 
 
 # --------------------------------------------------------------------------

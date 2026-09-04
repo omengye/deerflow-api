@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
+from deerflow.sandbox.env_policy import build_sandbox_subprocess_env
 from deerflow.sandbox.local.list_dir import list_dir
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.search import GrepMatch, find_glob_matches, find_grep_matches
@@ -426,6 +427,7 @@ class LocalSandbox(Sandbox):
                 stdout=stdout_write_fd,
                 stderr=stderr_write_fd,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                env=build_sandbox_subprocess_env(),
             )
         except Exception:
             for fd in (
@@ -533,6 +535,7 @@ class LocalSandbox(Sandbox):
                 capture_output=True,
                 text=True,
                 timeout=self.command_timeout_seconds,
+                env=build_sandbox_subprocess_env(),
             )
             stdout, stderr, returncode, timed_out = (
                 result.stdout,

@@ -197,7 +197,15 @@ class DeerMemManager(MemoryManager):
     def clear_memory(self, agent_name: str | None = None) -> dict[str, Any]:
         from deerflow.agents.memory.updater import clear_memory_data
 
-        return clear_memory_data(agent_name)
+        # DeerMem's durable buckets are agent-scoped and currently ignore the
+        # runtime user id, so every queued user for this agent targets the same
+        # data that is about to be cleared.
+        self.cancel_by_agent(agent_name, all_users=True)
+        result = clear_memory_data(agent_name)
+        # Close the window in which a producer can enqueue while the durable
+        # clear is in progress.
+        self.cancel_by_agent(agent_name, all_users=True)
+        return result
 
     def create_fact(self, **kwargs: Any) -> dict[str, Any]:
         from deerflow.agents.memory.updater import create_memory_fact

@@ -9,7 +9,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, cast
 
@@ -32,6 +32,11 @@ if TYPE_CHECKING:
     from deerflow.tools.builtins.tool_search import DeferredToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    """Return the timestamp convention used by subagent lifecycle metadata."""
+    return datetime.now(UTC)
 
 
 class SubagentStatus(Enum):
@@ -85,6 +90,8 @@ class SubagentResult:
     started_at: datetime | None = None
     completed_at: datetime | None = None
     ai_messages: list[dict[str, Any]] = field(default_factory=list)
+    tool_receipts: list[dict[str, Any]] = field(default_factory=list)
+    acceptance_verdict: dict[str, Any] | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _state_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -94,7 +101,7 @@ class SubagentResult:
             if self.status != SubagentStatus.PENDING:
                 return False
             self.status = SubagentStatus.RUNNING
-            self.started_at = datetime.now()
+            self.started_at = _utcnow()
             return True
 
     def try_set_terminal(
@@ -105,6 +112,8 @@ class SubagentResult:
         error: str | None = None,
         termination_reason: str | None = None,
         ai_messages: list[dict[str, Any]] | None = None,
+        tool_receipts: list[dict[str, Any]] | None = None,
+        acceptance_verdict: dict[str, Any] | None = None,
     ) -> bool:
         """Publish a terminal outcome once; late workers cannot overwrite it."""
         if not status.is_terminal:
@@ -120,8 +129,22 @@ class SubagentResult:
             # caller or worker may still hold, even when no replacement list
             # was supplied explicitly.
             self.ai_messages = list(ai_messages if ai_messages is not None else self.ai_messages)
-            self.completed_at = datetime.now()
+            self.tool_receipts = list(
+                tool_receipts if tool_receipts is not None else self.tool_receipts
+            )
+            self.acceptance_verdict = (
+                dict(acceptance_verdict)
+                if acceptance_verdict is not None
+                else self.acceptance_verdict
+            )
+            self.completed_at = _utcnow()
             return True
+
+    def update_tool_receipts(self, receipts: list[dict[str, Any]]) -> None:
+        """Publish the latest immutable receipt snapshot while a task runs."""
+        with self._state_lock:
+            if not self.status.is_terminal:
+                self.tool_receipts = [dict(receipt) for receipt in receipts]
 
 
 # Global storage for background task results
@@ -258,6 +281,7 @@ class SubagentExecutor:
         thinking_enabled: bool = False,
         deferred_registry: "DeferredToolRegistry | None" = None,
         middlewares: list[AgentMiddleware] | None = None,
+        acceptance_criteria: list[str] | None = None,
     ):
         """Initialize the executor.
 
@@ -278,6 +302,7 @@ class SubagentExecutor:
         self.thinking_enabled = thinking_enabled
         self.deferred_registry = deferred_registry
         self.middlewares = list(middlewares or [])
+        self.acceptance_criteria = list(acceptance_criteria or [])
         # Generate trace_id if not provided (for top-level calls)
         self.trace_id = trace_id or str(uuid.uuid4())[:8]
 
@@ -340,6 +365,13 @@ class SubagentExecutor:
         # so TokenUsageMiddleware and LoopDetectionMiddleware can push events in the
         # isolated subagent thread (where get_stream_writer() is not available).
         middlewares = build_subagent_runtime_middlewares(lazy_init=True, stream_callback=stream_callback)
+        from deerflow.agents.middlewares.tool_receipt_middleware import (
+            ToolReceiptMiddleware,
+        )
+
+        # Outermost tool wrapper so receipts observe converted errors and
+        # short-circuit ToolMessages produced by inner policy middleware.
+        middlewares.insert(0, ToolReceiptMiddleware())
         middlewares.extend(self.middlewares)
         if self.deferred_registry is not None:
             from deerflow.agents.middlewares.deferred_tool_filter_middleware import DeferredToolFilterMiddleware
@@ -349,6 +381,15 @@ class SubagentExecutor:
         from deerflow.agents.middlewares.finish_reason_middleware import build_finish_reason_middlewares
 
         middlewares.extend(build_finish_reason_middlewares())
+
+        from deerflow.subagents.report_contract import (
+            build_acceptance_criteria_system_note,
+            build_report_contract_section,
+        )
+
+        system_parts = [self.config.system_prompt, build_report_contract_section()]
+        if self.acceptance_criteria:
+            system_parts.append(build_acceptance_criteria_system_note())
 
         # recursion_limit counts graph super-steps, not turns. One tool-calling
         # turn costs ``count_steps_per_turn`` super-steps — model + tools + one
@@ -364,7 +405,7 @@ class SubagentExecutor:
             model=model,
             tools=self.tools,
             middleware=cast(Any, middlewares),
-            system_prompt=append_current_date(self.config.system_prompt),
+            system_prompt=append_current_date("\n\n".join(system_parts)),
             state_schema=ThreadState,
             context_schema=AgentContext,
         )
@@ -427,8 +468,13 @@ class SubagentExecutor:
             messages.append(SystemMessage(content=skill_section))
         if deferred_section:
             messages.append(SystemMessage(content=deferred_section))
-        # Then the actual task
-        messages.append(HumanMessage(content=task))
+        # Acceptance criteria remain untrusted task data; the system prompt
+        # carries only the framework-owned authority note.
+        from deerflow.subagents.report_contract import render_acceptance_criteria_block
+
+        criteria_block = render_acceptance_criteria_block(self.acceptance_criteria)
+        task_content = f"{task}\n\n{criteria_block}" if criteria_block else task
+        messages.append(HumanMessage(content=task_content))
 
         state: dict[str, Any] = {
             "messages": messages,
@@ -487,7 +533,7 @@ class SubagentExecutor:
                 task_id=task_id,
                 trace_id=self.trace_id,
                 status=SubagentStatus.RUNNING,
-                started_at=datetime.now(),
+                started_at=_utcnow(),
             )
 
         # Build AI-message output off-object and publish it together with the
@@ -596,13 +642,27 @@ class SubagentExecutor:
                                     stream_callback({"type": "tool_call_chunk", "tool_call": tc})
                             # Tool execution result
                             if isinstance(msg_chunk, ToolMessage):
-                                stream_callback({
+                                tool_result_event: dict[str, Any] = {
                                     "type": "tool_result_chunk",
                                     "tool_call_id": msg_chunk.tool_call_id,
                                     "name": getattr(msg_chunk, "name", None),
                                     "content": msg_chunk.content,
                                     "status": getattr(msg_chunk, "status", None),
-                                })
+                                }
+                                from deerflow.tools.builtins.present_file_tool import (
+                                    PRESENTED_ARTIFACTS_KEY,
+                                )
+
+                                presented = (msg_chunk.additional_kwargs or {}).get(
+                                    PRESENTED_ARTIFACTS_KEY
+                                )
+                                if (
+                                    msg_chunk.name == "present_files"
+                                    and isinstance(presented, list)
+                                    and all(isinstance(path, str) for path in presented)
+                                ):
+                                    tool_result_event["presented_artifacts"] = presented
+                                stream_callback(tool_result_event)
                         except Exception:
                             logger.debug(f"[trace={self.trace_id}] stream_callback raised, ignoring", exc_info=True)
                     # Don't update final_state from messages chunks
@@ -610,6 +670,14 @@ class SubagentExecutor:
 
                 # mode == "values": full state snapshot — one per completed graph node
                 final_state = chunk
+
+                from deerflow.agents.middlewares.tool_receipt import (
+                    extract_tool_receipts,
+                )
+
+                result.update_tool_receipts(
+                    extract_tool_receipts(list(chunk.get("messages", [])))
+                )
 
                 # Emit turn_complete so callers can track agent progress
                 if stream_callback is not None:
@@ -733,6 +801,29 @@ class SubagentExecutor:
                 "model_length_capped",
                 "recursion_limit",
             }
+
+            from deerflow.agents.middlewares.tool_receipt import (
+                extract_citing_turn_receipts,
+                extract_tool_receipts,
+            )
+            from deerflow.subagents.acceptance_checks import (
+                check_acceptance_criteria,
+            )
+
+            final_messages = list((final_state or {}).get("messages", []))
+            terminal_receipts = extract_citing_turn_receipts(final_messages)
+            if terminal_receipts is None:
+                terminal_receipts = extract_tool_receipts(final_messages)
+            acceptance_verdict = (
+                check_acceptance_criteria(
+                    self.acceptance_criteria,
+                    thread_data=(final_state or {}).get("thread_data")
+                    or self.thread_data,
+                    messages=final_messages,
+                )
+                if self.acceptance_criteria
+                else None
+            )
             if termination_reason in limit_reasons:
                 result.try_set_terminal(
                     SubagentStatus.LIMIT_REACHED,
@@ -741,12 +832,16 @@ class SubagentExecutor:
                     or f"Subagent stopped before completion ({termination_reason})",
                     termination_reason=str(termination_reason),
                     ai_messages=captured_ai_messages,
+                    tool_receipts=terminal_receipts,
+                    acceptance_verdict=acceptance_verdict,
                 )
             else:
                 result.try_set_terminal(
                     SubagentStatus.COMPLETED,
                     result=final_result,
                     ai_messages=captured_ai_messages,
+                    tool_receipts=terminal_receipts,
+                    acceptance_verdict=acceptance_verdict,
                 )
 
         except Exception as e:
@@ -825,7 +920,7 @@ class SubagentExecutor:
                     task_id=str(uuid.uuid4())[:8],
                     trace_id=self.trace_id,
                     status=SubagentStatus.RUNNING,
-                    started_at=datetime.now(),
+                    started_at=_utcnow(),
                 )
             result.try_set_terminal(SubagentStatus.FAILED, error=str(e))
             return result

@@ -17,11 +17,11 @@ class adds Windows -> WSL on the way in and the inverse pair on the way out.
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 from typing import ClassVar
 
+from deerflow.sandbox.env_policy import build_sandbox_subprocess_env
 from deerflow.sandbox.local.local_sandbox import LocalSandbox, PathMapping
 from deerflow.sandbox.local.wsl_exceptions import WslUnavailableError
 
@@ -164,7 +164,7 @@ class WslSandbox(LocalSandbox):
         wsl_command = self._translate_windows_paths_in_command(resolved)
 
         argv = self._build_wsl_argv(wsl_command)
-        env = {**os.environ, "WSL_UTF8": "1"}
+        env = build_sandbox_subprocess_env(overrides={"WSL_UTF8": "1"})
 
         try:
             result = subprocess.run(

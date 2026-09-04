@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from deerflow.config.extensions_config import ExtensionsConfig, McpServerConfig
+from deerflow.mcp.headers import illegal_header_value_reason
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,13 @@ def build_server_params(server_name: str, config: McpServerConfig) -> dict[str, 
         params["url"] = config.url
         # WebSocket connections in langchain-mcp-adapters do not accept headers.
         if config.headers and transport_type != "websocket":
+            for header_name, header_value in config.headers.items():
+                reason = illegal_header_value_reason(header_value)
+                if reason is not None:
+                    raise ValueError(
+                        f"MCP server '{server_name}' has a header '{header_name}' "
+                        f"that cannot be sent as an HTTP header value: it {reason}"
+                    )
             params["headers"] = config.headers
     else:
         raise ValueError(f"MCP server '{server_name}' has unsupported transport type: {transport_type}")

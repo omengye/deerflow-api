@@ -260,7 +260,9 @@ class AdminMemoryCandidateRequest(BaseModel):
 class AdminSummarizationUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    config: SummarizationConfig
+    # Parse inside the endpoint so this API preserves its established 400
+    # response for an invalid configuration instead of FastAPI's generic 422.
+    config: dict[str, Any]
     reload: bool = True
 
 
@@ -1156,6 +1158,9 @@ def _admin_config_response(raw_config: dict[str, Any], path: Path) -> dict[str, 
             "stream_bridge": {
                 "type": stream_bridge.get("type", "memory"),
                 "queue_maxsize": stream_bridge.get("queue_maxsize"),
+                "heartbeat_interval_seconds": stream_bridge.get(
+                    "heartbeat_interval_seconds", 15.0
+                ),
                 "redis_configured": bool(stream_bridge.get("redis_url")),
                 "redis_maxlen": stream_bridge.get("redis_maxlen"),
                 "redis_retention_seconds": stream_bridge.get("redis_retention_seconds"),
@@ -2182,16 +2187,23 @@ async def update_admin_summarization(req: AdminSummarizationUpdateRequest = Body
     """Update conversation-summarization configuration and reload new clients."""
     path = _config_path()
     config_data = _load_config_data(path)
-    _validate_configured_model_name(config_data, req.config.model_name, field="summarization.model_name")
-    _validate_summarization_config(req.config)
-    config_data["summarization"] = req.config.model_dump(exclude_none=True)
+    try:
+        parsed_config = SummarizationConfig.model_validate(req.config)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid summarization config: {exc.errors(include_url=False)}",
+        ) from exc
+    _validate_configured_model_name(config_data, parsed_config.model_name, field="summarization.model_name")
+    _validate_summarization_config(parsed_config)
+    config_data["summarization"] = parsed_config.model_dump(exclude_none=True)
     _atomic_write_config(config_data, path=path)
     try:
         reload_result = _reload_after_config_write(reload=req.reload)
     except Exception as exc:
         logger.exception("Admin summarization update wrote config but reload failed")
         raise HTTPException(status_code=500, detail=f"Summarization config saved but reload failed: {exc}") from exc
-    return {"success": True, "config": req.config.model_dump(), "reload": reload_result}
+    return {"success": True, "config": parsed_config.model_dump(), "reload": reload_result}
 
 
 @router.put("/models")

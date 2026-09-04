@@ -37,8 +37,8 @@ class ModelConfig(BaseModel):
         gt=0,
         description=(
             "Positive total context window size in tokens (prompt + completion). "
-            "Used to compute the real-time context usage percentage surfaced to "
-            "clients (ACP usage_update / API end event). Distinct from max_tokens, "
+            "Used for real-time context usage and profile-dependent features such "
+            "as fraction-based summarization thresholds. Distinct from max_tokens, "
             "which is the per-call output cap passed to the provider. Leave unset "
             "if the provider limit is unknown; the percentage is then not reported."
         ),

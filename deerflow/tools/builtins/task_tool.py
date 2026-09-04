@@ -32,6 +32,14 @@ class _TaskToolInput(BaseModel):
     prompt: str = Field(description="The task description for the subagent. Be specific and clear about what needs to be done. ALWAYS PROVIDE THIS PARAMETER SECOND.")
     subagent_type: str = Field(description="The type of subagent to use. ALWAYS PROVIDE THIS PARAMETER THIRD.")
     max_turns: int | None = Field(default=None, description="Optional maximum number of agent turns. Defaults to subagent's configured max.")
+    acceptance_criteria: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional bounded checklist. Deterministic forms are: "
+            "file:<path> exists, file:<path> non-empty, "
+            "file_written:<path>, and tests_passed:<exact command>."
+        ),
+    )
 
 
 _TASK_TOOL_DESCRIPTION = """Delegate a task to a specialized subagent that runs in its own context.
@@ -85,6 +93,7 @@ async def _task_tool_impl(
     subagent_type: str,
     tool_call_id: Annotated[str, InjectedToolCallId],
     max_turns: int | None = None,
+    acceptance_criteria: list[str] | None = None,
 ) -> str:
     available_subagent_names = get_available_subagent_names()
 
@@ -187,6 +196,7 @@ async def _task_tool_impl(
         thinking_enabled=parent_thinking_enabled,
         deferred_registry=deferred_registry,
         middlewares=list(metadata.get("subagent_middlewares") or []),
+        acceptance_criteria=acceptance_criteria,
     )
 
     # Resolve the live_event_callback from config metadata.
@@ -235,7 +245,14 @@ async def _task_tool_impl(
     # Client events remain correlated with the provider's tool-call ID. The
     # process-wide task registry uses a separate server-generated execution ID.
     def _token_stream_callback(event: dict[str, Any]) -> None:
-        _emit({"type": "task_token_chunk", "task_id": tool_call_id, **event})
+        _emit(
+            {
+                "type": "task_token_chunk",
+                "task_id": tool_call_id,
+                "subagent_type": subagent_type,
+                **event,
+            }
+        )
 
     execution_id = executor.execute_async(
         prompt,
@@ -298,10 +315,37 @@ async def _task_tool_impl(
 
             # Check if task completed, failed, or timed out
             if result.status == SubagentStatus.COMPLETED:
-                _emit({"type": "task_completed", "task_id": tool_call_id, "result": result.result})
+                from deerflow.agents.middlewares.receipt_verification import (
+                    render_citation_verdict,
+                    verify_receipt_citations,
+                )
+                from deerflow.subagents.acceptance_checks import (
+                    render_acceptance_section,
+                )
+
+                receipt_verdict = verify_receipt_citations(
+                    result.result or "",
+                    list(getattr(result, "tool_receipts", []) or []),
+                )
+                acceptance_verdict = getattr(result, "acceptance_verdict", None)
+                _emit(
+                    {
+                        "type": "task_completed",
+                        "task_id": tool_call_id,
+                        "result": result.result,
+                        "receipt_verdict": receipt_verdict,
+                        "acceptance_verdict": acceptance_verdict,
+                    }
+                )
                 logger.info(f"[trace={trace_id}] Task {tool_call_id} completed after {poll_count} polls")
                 cleanup_background_task(execution_id)
-                return f"Task Succeeded. Result: {result.result}"
+                sections = [f"Task Succeeded. Result: {result.result}"]
+                citation_summary = render_citation_verdict(receipt_verdict)
+                if citation_summary:
+                    sections.append(citation_summary)
+                if isinstance(acceptance_verdict, dict):
+                    sections.append(render_acceptance_section(acceptance_verdict))
+                return "\n\n".join(sections)
             elif result.status == SubagentStatus.LIMIT_REACHED:
                 reason = result.termination_reason or "limit_reached"
                 termination_message = (
@@ -379,6 +423,24 @@ async def _task_tool_impl(
         )
         cleanup_background_task(execution_id)
         raise
+    except Exception as exc:
+        # The poller owns the registry entry after execute_async succeeds.
+        # Unexpected failures (for example a status lookup or event bridge
+        # failure) must not leave that background execution running and
+        # permanently registered after this tool invocation unwinds.
+        logger.error(
+            "[trace=%s] Task %s poller exited unexpectedly (%s)",
+            trace_id,
+            tool_call_id,
+            type(exc).__name__,
+        )
+        finalize_cancelled_background_task(
+            execution_id,
+            status=SubagentStatus.CANCELLED,
+            error="Parent task stopped polling unexpectedly",
+        )
+        cleanup_background_task(execution_id)
+        raise
 
 
 def _create_task_tool() -> StructuredTool:
@@ -399,6 +461,7 @@ def _create_task_tool() -> StructuredTool:
         subagent_type: str,
         tool_call_id: str,
         max_turns: int | None = None,
+        acceptance_criteria: list[str] | None = None,
     ) -> str:
         """Sync wrapper that delegates to the async implementation."""
         coro = _task_tool_impl(
@@ -408,6 +471,7 @@ def _create_task_tool() -> StructuredTool:
             subagent_type=subagent_type,
             tool_call_id=tool_call_id,
             max_turns=max_turns,
+            acceptance_criteria=acceptance_criteria,
         )
 
         try:

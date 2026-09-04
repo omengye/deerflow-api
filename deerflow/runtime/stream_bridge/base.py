@@ -8,9 +8,15 @@ architecture.
 from __future__ import annotations
 
 import abc
+import math
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
+
+from deerflow.config.stream_bridge_config import (
+    DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    MAX_HEARTBEAT_INTERVAL_SECONDS,
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +43,41 @@ END_SENTINEL = StreamEvent(id="", event="__end__", data=None)
 class StreamBridge(abc.ABC):
     """Abstract base for stream bridges."""
 
+    def __init__(
+        self,
+        *,
+        heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    ) -> None:
+        self._heartbeat_interval = self._validate_heartbeat_interval(
+            heartbeat_interval
+        )
+
+    @property
+    def heartbeat_interval(self) -> float:
+        return self._heartbeat_interval
+
+    def _resolve_heartbeat_interval(
+        self, heartbeat_interval: float | None
+    ) -> float:
+        if heartbeat_interval is None:
+            return self._heartbeat_interval
+        return self._validate_heartbeat_interval(heartbeat_interval)
+
+    @staticmethod
+    def _validate_heartbeat_interval(heartbeat_interval: float) -> float:
+        if (
+            isinstance(heartbeat_interval, bool)
+            or not isinstance(heartbeat_interval, (int, float))
+            or not math.isfinite(heartbeat_interval)
+            or heartbeat_interval <= 0
+            or heartbeat_interval > MAX_HEARTBEAT_INTERVAL_SECONDS
+        ):
+            raise ValueError(
+                "heartbeat_interval must be a positive finite number no greater "
+                f"than {MAX_HEARTBEAT_INTERVAL_SECONDS:g} seconds"
+            )
+        return float(heartbeat_interval)
+
     @abc.abstractmethod
     async def publish(self, run_id: str, event: str, data: Any) -> None:
         """Enqueue a single event for *run_id* (producer side)."""
@@ -59,7 +100,7 @@ class StreamBridge(abc.ABC):
         run_id: str,
         *,
         last_event_id: str | None = None,
-        heartbeat_interval: float = 15.0,
+        heartbeat_interval: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Async iterator that yields events for *run_id* (consumer side).
 

@@ -184,6 +184,8 @@ stream_bridge:
   # memory: single-process development; redis: cross-process replay for SSE reconnects.
   type: memory
   queue_maxsize: 512
+  # Idle seconds between SSE/replay heartbeats (positive, maximum 86400).
+  heartbeat_interval_seconds: 15
   # Redis Streams backend. Enable by setting type: redis.
   redis_url: ${REDIS_URL:-redis://localhost:6379/0}
   redis_key_prefix: deerflow:stream

@@ -11,6 +11,7 @@ from deerflow.config.paths import VIRTUAL_PATH_PREFIX
 from deerflow.sandbox.output_paths import resolve_outputs_virtual_path
 
 OUTPUTS_VIRTUAL_PREFIX = f"{VIRTUAL_PATH_PREFIX}/outputs"
+PRESENTED_ARTIFACTS_KEY = "deerflow_presented_artifacts"
 
 
 def _get_thread_id(runtime: ToolRuntime[AgentContext, ThreadState]) -> str | None:
@@ -113,6 +114,13 @@ def present_file_tool(
     return Command(
         update={
             "artifacts": normalized_paths,
-            "messages": [ToolMessage("Successfully presented files", tool_call_id=tool_call_id)],
+            "messages": [
+                ToolMessage(
+                    "Successfully presented files",
+                    tool_call_id=tool_call_id,
+                    name="present_files",
+                    additional_kwargs={PRESENTED_ARTIFACTS_KEY: normalized_paths},
+                )
+            ],
         },
     )

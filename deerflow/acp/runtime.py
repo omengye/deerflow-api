@@ -207,7 +207,6 @@ class LocalACPRuntime:
                     ),
                     "recursion_limit": session.recursion_limit,
                     "agent_name": session.agent_name,
-                    "checkpoint_channel_mode": "full",
                     "excluded_tool_names": self.policy.excluded_tool_names(
                         enable_bash=self.config.enable_bash
                     ),

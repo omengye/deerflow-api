@@ -361,6 +361,44 @@ class MemoryUpdateQueue:
             self._process_requested = False
             self._condition.notify_all()
 
+    def cancel_by_agent(
+        self,
+        agent_name: str | None = None,
+        *,
+        user_id: str | None = None,
+        all_agents: bool = False,
+        all_users: bool = False,
+    ) -> int:
+        """Cancel pending writes for one durable-memory scope.
+
+        Only work still waiting in the debounce queue can be cancelled. A
+        backend write that has already started is deliberately left alone;
+        callers that clear durable memory should therefore cancel both before
+        and after the clear operation.
+
+        ``None`` is an actual legacy user identifier, not a wildcard. Backends
+        whose durable storage is not user-scoped can opt into ``all_users``.
+        """
+        with self._condition:
+            pending_before = len(self._queue)
+            self._queue = [
+                context
+                for context in self._queue
+                if not (
+                    (all_agents or context.agent_name == agent_name)
+                    and (all_users or context.user_id == user_id)
+                )
+            ]
+            removed = pending_before - len(self._queue)
+
+            if not self._queue:
+                if self._timer is not None:
+                    self._timer.cancel()
+                    self._timer = None
+                self._process_requested = False
+            self._condition.notify_all()
+            return removed
+
     @property
     def pending_count(self) -> int:
         """Get the number of pending updates."""

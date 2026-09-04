@@ -1,10 +1,12 @@
 """Configuration for stream bridge."""
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 StreamBridgeType = Literal["memory", "redis"]
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 15.0
+MAX_HEARTBEAT_INTERVAL_SECONDS = 86_400.0
 
 
 class StreamBridgeConfig(BaseModel):
@@ -49,8 +51,25 @@ class StreamBridgeConfig(BaseModel):
     )
     queue_maxsize: int = Field(
         default=256,
+        ge=1,
         description="Maximum number of events buffered per run in the memory bridge.",
     )
+    heartbeat_interval_seconds: float = Field(
+        default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        gt=0,
+        le=MAX_HEARTBEAT_INTERVAL_SECONDS,
+        allow_inf_nan=False,
+        description="Idle seconds between stream heartbeats (maximum 86400).",
+    )
+
+    @field_validator("heartbeat_interval_seconds", mode="before")
+    @classmethod
+    def reject_boolean_heartbeat_interval(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError(
+                "heartbeat_interval_seconds must be a number, not a boolean"
+            )
+        return value
 
 
 # Global configuration instance — None means no stream bridge is configured

@@ -8,7 +8,13 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
-from .base import END_SENTINEL, HEARTBEAT_SENTINEL, StreamBridge, StreamEvent
+from .base import (
+    DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    END_SENTINEL,
+    HEARTBEAT_SENTINEL,
+    StreamBridge,
+    StreamEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +35,10 @@ class RedisStreamBridge(StreamBridge):
         key_prefix: str = "deerflow:stream",
         maxlen: int = 10000,
         retention_seconds: int = 3600,
+        heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         client: Any | None = None,
     ) -> None:
+        super().__init__(heartbeat_interval=heartbeat_interval)
         self._key_prefix = key_prefix.rstrip(":")
         self._maxlen = maxlen
         self._retention_seconds = retention_seconds
@@ -103,8 +111,9 @@ class RedisStreamBridge(StreamBridge):
         run_id: str,
         *,
         last_event_id: str | None = None,
-        heartbeat_interval: float = 15.0,
+        heartbeat_interval: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        heartbeat_interval = self._resolve_heartbeat_interval(heartbeat_interval)
         key = self._key(run_id)
         if run_id in self._expired_runs:
             yield END_SENTINEL

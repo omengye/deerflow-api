@@ -141,10 +141,16 @@ class Mem0MemoryManager(MemoryManager):
         self._client.ping(user_id=self.config.default_user_id)
 
     def clear_memory(self, agent_name: str | None = None) -> dict[str, Any]:
+        # Queued contexts with no explicit user id resolve to default_user_id
+        # at write time. Cancel both spellings of that same mem0 scope.
+        self.cancel_by_agent(agent_name)
+        self.cancel_by_agent(agent_name, user_id=self.config.default_user_id)
         result = self._client.clear(
             user_id=self.config.default_user_id,
             agent_name=agent_name,
         )
+        self.cancel_by_agent(agent_name)
+        self.cancel_by_agent(agent_name, user_id=self.config.default_user_id)
         return result if isinstance(result, dict) else {"success": True}
 
     def close(self) -> None:

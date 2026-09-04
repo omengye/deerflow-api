@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.dependencies import get_client_manager
 from deerflow.config.extensions_config import McpServerConfig
+from deerflow.mcp.headers import illegal_header_value_reason
 
 logger = logging.getLogger(__name__)
 
@@ -387,6 +388,16 @@ def _validate_mcp_servers(mcp_servers: dict[str, Any]) -> None:
                 status_code=400,
                 detail=f"MCP server {name!r} 'headers' must map string keys to string values",
             )
+        for header_name, header_value in (headers or {}).items():
+            reason = illegal_header_value_reason(header_value)
+            if reason is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"MCP server {name!r} header {header_name!r} cannot be sent "
+                        f"as an HTTP header value because it {reason}"
+                    ),
+                )
         try:
             McpServerConfig.model_validate(cfg)
         except ValidationError as exc:

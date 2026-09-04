@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 _BLOCKED_TAG_NAMES = frozenset(
     {
         "analysis",
+        "acceptance_criteria",
         "available-deferred-tools",
         "available_skills",
         "citations",
@@ -49,6 +50,7 @@ _BLOCKED_TAG_NAMES = frozenset(
         "prompt",
         "relevant_memory",
         "response_style",
+        "report_contract",
         "role",
         "skill_system",
         "soul",
@@ -92,6 +94,11 @@ def _neutralize_boundaries(text: str) -> str:
         else "[END USER INPUT]",
         text,
     )
+
+
+def neutralize_untrusted_tags(text: str) -> str:
+    """Neutralize framework tags and boundary markers in untrusted data."""
+    return _neutralize_boundaries(_escape_reserved_tags(text))
 
 
 def sanitize_user_text(text: str) -> str:

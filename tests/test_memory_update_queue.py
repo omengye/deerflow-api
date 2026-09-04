@@ -14,8 +14,66 @@ class _Msg:
     content: str = "content"
 
 
-def _context(thread_id: str = "thread-1", *, agent_name: str | None = None) -> ConversationContext:
-    return ConversationContext(thread_id=thread_id, messages=[_Msg("existing")], agent_name=agent_name)
+def _context(
+    thread_id: str = "thread-1",
+    *,
+    agent_name: str | None = None,
+    user_id: str | None = None,
+) -> ConversationContext:
+    return ConversationContext(
+        thread_id=thread_id,
+        messages=[_Msg("existing")],
+        agent_name=agent_name,
+        user_id=user_id,
+    )
+
+
+def test_cancel_by_agent_only_removes_the_requested_memory_scope() -> None:
+    queue = MemoryUpdateQueue()
+    queue._queue.extend(
+        [
+            _context("a-1", agent_name="agent-a", user_id="user-1"),
+            _context("a-2", agent_name="agent-a", user_id="user-2"),
+            _context("a-legacy", agent_name="agent-a"),
+            _context("b-1", agent_name="agent-b", user_id="user-1"),
+        ]
+    )
+
+    assert queue.cancel_by_agent("agent-a", user_id="user-1") == 1
+    assert queue.cancel_by_agent("agent-a") == 1
+    assert [context.thread_id for context in queue._queue] == ["a-2", "b-1"]
+
+
+def test_cancel_by_agent_can_remove_all_users_for_agent_scoped_storage() -> None:
+    queue = MemoryUpdateQueue()
+    queue._queue.extend(
+        [
+            _context("a-1", agent_name="agent-a", user_id="user-1"),
+            _context("a-2", agent_name="agent-a", user_id="user-2"),
+            _context("b-1", agent_name="agent-b", user_id="user-1"),
+        ]
+    )
+
+    assert queue.cancel_by_agent("agent-a", all_users=True) == 2
+    assert [context.thread_id for context in queue._queue] == ["b-1"]
+
+
+def test_cancel_by_agent_stops_timer_when_no_pending_work_remains() -> None:
+    queue = MemoryUpdateQueue()
+
+    class FakeTimer:
+        cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    timer = FakeTimer()
+    queue._timer = timer  # type: ignore[assignment]
+    queue._queue.append(_context(agent_name="agent-a"))
+
+    assert queue.cancel_by_agent("agent-a") == 1
+    assert timer.cancelled is True
+    assert queue._timer is None
 
 
 def test_queue_merges_by_agent_and_thread_without_cross_agent_overwrite() -> None:

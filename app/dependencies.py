@@ -5,6 +5,7 @@ import logging
 import sqlite3
 import threading
 from collections.abc import Coroutine
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,72 @@ logger = logging.getLogger(__name__)
 
 _client_manager = None
 _lock = threading.Lock()
+
+_PUBLIC_ARTIFACT_PREFIX = "/mnt/user-data/outputs/"
+_LOOP_EVENT_TYPES = frozenset({"loop_warning", "loop_hard_stop"})
+_MAX_RECORDED_LOOP_EVENTS = 100
+
+
+def _record_run_artifacts(record: RunRecord, data: Any) -> None:
+    """Accumulate public artifact paths declared by this run's stream state."""
+    if not isinstance(data, dict):
+        return
+    if data.get("name") != "present_files" or data.get("status") == "error":
+        return
+    artifacts = data.get("presented_artifacts")
+    if not isinstance(artifacts, list):
+        return
+
+    recorded = record.metadata.setdefault("artifacts", [])
+    if not isinstance(recorded, list):
+        recorded = []
+        record.metadata["artifacts"] = recorded
+    seen = {path for path in recorded if isinstance(path, str)}
+    for path in artifacts:
+        if (
+            isinstance(path, str)
+            and path.startswith(_PUBLIC_ARTIFACT_PREFIX)
+            and path not in seen
+        ):
+            recorded.append(path)
+            seen.add(path)
+
+
+def _record_loop_event(record: RunRecord, event_type: str, data: Any) -> None:
+    """Persist a bounded, non-sensitive loop event in the in-memory run record."""
+    if not isinstance(data, dict):
+        return
+    resolved_type = data.get("type") if event_type == "custom" else event_type
+    if resolved_type not in _LOOP_EVENT_TYPES:
+        return
+
+    entry: dict[str, Any] = {
+        "type": resolved_type,
+        "recorded_at": datetime.now(UTC).isoformat(),
+    }
+    for key in ("reason", "incomplete", "task_id", "subagent_type", "_agent_name"):
+        value = data.get(key)
+        if isinstance(value, (str, bool)):
+            entry[key.lstrip("_")] = value
+    message = data.get("message")
+    if isinstance(message, str) and message.strip():
+        entry["message"] = message.strip()[:2000]
+
+    events = record.metadata.setdefault("loop_events", [])
+    if not isinstance(events, list):
+        events = []
+        record.metadata["loop_events"] = events
+    signature = tuple(entry.get(key) for key in ("type", "task_id", "message", "reason"))
+    if any(
+        isinstance(existing, dict)
+        and tuple(existing.get(key) for key in ("type", "task_id", "message", "reason"))
+        == signature
+        for existing in events
+    ):
+        return
+    events.append(entry)
+    if len(events) > _MAX_RECORDED_LOOP_EVENTS:
+        del events[: len(events) - _MAX_RECORDED_LOOP_EVENTS]
 
 
 def _rmtree_via_root_container(paths, thread_id: str) -> None:
@@ -74,6 +141,7 @@ class ClientManager:
         self._async_client_map: dict[tuple[object, ...], Any] = {}  # config_key -> DeerFlowClient with async checkpointer
         self._running_threads: set[str] = set()  # thread_ids currently running
         self._running_thread_counts: dict[str, int] = {}
+        self._artifact_archive_threads: set[str] = set()
         self._deleting_threads: set[str] = set()
         self._thread_lock = threading.Lock()
         self.run_manager = RunManager()
@@ -717,6 +785,7 @@ class ClientManager:
             bridge = self.stream_bridge
 
             async def _live_event_callback(event: dict[str, Any]) -> None:
+                _record_loop_event(record, str(event.get("type") or "custom"), event)
                 await bridge.publish(run_id, event.get("type", "custom"), event)
 
             client = await self.get_async_client(**kwargs)
@@ -730,8 +799,10 @@ class ClientManager:
                         llm_failure = data
                         record.metadata["llm_failure_reason"] = str(data.get("reason") or "unknown")
                         record.metadata["llm_failure_retriable"] = bool(data.get("retriable", False))
+                    _record_run_artifacts(record, data)
                     if isinstance(data, dict):
                         data = {**data, "_agent_name": _agent_name}
+                    _record_loop_event(record, event.type, data)
                     await self.stream_bridge.publish(run_id, event.type, data)
 
             if record.abort_event.is_set():
@@ -881,7 +952,10 @@ class ClientManager:
 
     def mark_thread_running(self, thread_id: str) -> bool:
         with self._thread_lock:
-            if thread_id in self._deleting_threads:
+            if (
+                thread_id in self._deleting_threads
+                or thread_id in self._artifact_archive_threads
+            ):
                 return False
             self._running_thread_counts[thread_id] = (
                 self._running_thread_counts.get(thread_id, 0) + 1
@@ -896,6 +970,25 @@ class ClientManager:
                 self._running_thread_counts[thread_id] = count - 1
             else:
                 self._running_thread_counts.pop(thread_id, None)
+                self._running_threads.discard(thread_id)
+
+    def try_reserve_artifact_archive(self, thread_id: str) -> bool:
+        """Atomically exclude run/deletion writers while an archive is built."""
+        with self._thread_lock:
+            if (
+                thread_id in self._running_threads
+                or thread_id in self._deleting_threads
+                or thread_id in self._artifact_archive_threads
+            ):
+                return False
+            self._artifact_archive_threads.add(thread_id)
+            self._running_threads.add(thread_id)
+            return True
+
+    def release_artifact_archive(self, thread_id: str) -> None:
+        with self._thread_lock:
+            self._artifact_archive_threads.discard(thread_id)
+            if self._running_thread_counts.get(thread_id, 0) == 0:
                 self._running_threads.discard(thread_id)
 
     def is_thread_running(self, thread_id: str) -> bool:
@@ -1229,6 +1322,7 @@ class ClientManager:
                 self.stream_bridge = MemoryStreamBridge(queue_maxsize=512)
         self._checkpointer = None
         self._running_threads.clear()
+        self._artifact_archive_threads.clear()
         self._stream_subscribers.clear()
         self._service_loop = None
 

@@ -196,7 +196,20 @@ def create_chat_model(
         # Enforce max_retries constraint to prevent cascading timeouts.
         model_settings_from_config["max_retries"] = model_settings_from_config.get("max_retries", 1)
 
+    translate_context_window = (
+        bool(model_config.context_window)
+        and "profile" not in kwargs
+        and "profile" not in model_settings_from_config
+    )
+
     model_instance = model_class(**{**model_settings_from_config, **kwargs})
+
+    if translate_context_window:
+        inferred_profile = getattr(model_instance, "profile", None)
+        model_instance.profile = {
+            **(inferred_profile or {}),
+            "max_input_tokens": model_config.context_window,
+        }
 
     callbacks = build_tracing_callbacks()
     if callbacks:

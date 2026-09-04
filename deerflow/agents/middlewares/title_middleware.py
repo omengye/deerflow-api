@@ -10,6 +10,7 @@ from langgraph.runtime import Runtime
 
 from deerflow.config.title_config import get_title_config
 from deerflow.models import aclose_chat_model, create_chat_model
+from deerflow.agents.middlewares.uploads_middleware import _strip_upload_blocks_from_content
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,8 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
         user_msg_content = next((m.content for m in messages if m.type == "human"), "")
         assistant_msg_content = next((m.content for m in messages if m.type == "ai"), "")
 
+        if isinstance(user_msg_content, (str, list)):
+            user_msg_content, _ = _strip_upload_blocks_from_content(user_msg_content)
         user_msg = self._normalize_content(user_msg_content)
         assistant_msg = self._strip_think_tags(self._normalize_content(assistant_msg_content))
 
@@ -100,6 +103,8 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
         return title[: config.max_chars] if len(title) > config.max_chars else title
 
     def _fallback_title(self, user_msg: str) -> str:
+        if not user_msg.strip():
+            return "New Conversation"
         config = get_title_config()
         fallback_chars = min(config.max_chars, 50)
         if len(user_msg) > fallback_chars:
@@ -119,8 +124,11 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
         if not self._should_generate_title(state):
             return None
 
-        config = get_title_config()
         prompt, user_msg = self._build_title_prompt(state)
+        if not user_msg.strip():
+            return {"title": self._fallback_title(user_msg)}
+
+        config = get_title_config()
 
         model = None
         try:

@@ -9,7 +9,13 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from .base import END_SENTINEL, HEARTBEAT_SENTINEL, StreamBridge, StreamEvent
+from .base import (
+    DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    END_SENTINEL,
+    HEARTBEAT_SENTINEL,
+    StreamBridge,
+    StreamEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +36,13 @@ class MemoryStreamBridge(StreamBridge):
     and reconnecting clients can replay buffered events from ``Last-Event-ID``.
     """
 
-    def __init__(self, *, queue_maxsize: int = 256) -> None:
+    def __init__(
+        self,
+        *,
+        queue_maxsize: int = 256,
+        heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    ) -> None:
+        super().__init__(heartbeat_interval=heartbeat_interval)
         self._maxsize = queue_maxsize
         self._streams: dict[str, _RunStream] = {}
         self._counters: dict[str, int] = {}
@@ -101,8 +113,9 @@ class MemoryStreamBridge(StreamBridge):
         run_id: str,
         *,
         last_event_id: str | None = None,
-        heartbeat_interval: float = 15.0,
+        heartbeat_interval: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        heartbeat_interval = self._resolve_heartbeat_interval(heartbeat_interval)
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
             if stream.expired:

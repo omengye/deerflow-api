@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from acp import schema
 
 from deerflow.config.extensions_config import ExtensionsConfig, McpServerConfig
+from deerflow.mcp.headers import illegal_header_value_reason
 
 _MAX_CLIENT_MCP_SERVERS = 8
 _MAX_NAME_LENGTH = 128
@@ -85,14 +86,13 @@ def _checked_http_headers(
                 f"duplicate HTTP header {name} for client MCP server {server_name}"
             )
 
-        value = item.value.strip()
-        if (
-            len(value) > _MAX_HTTP_HEADER_VALUE_LENGTH
-            or any(ord(char) < 32 or ord(char) == 127 for char in value)
-        ):
+        value = item.value
+        reason = illegal_header_value_reason(value)
+        if len(value) > _MAX_HTTP_HEADER_VALUE_LENGTH or reason is not None:
+            detail = "is oversized" if len(value) > _MAX_HTTP_HEADER_VALUE_LENGTH else reason
             raise ValueError(
                 f"HTTP header {name} for client MCP server {server_name} "
-                "contains control characters or is oversized"
+                f"cannot be sent as an HTTP header value because it {detail}"
             )
         seen_names.add(normalized_name)
         headers[name] = value

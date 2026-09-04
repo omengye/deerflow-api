@@ -77,12 +77,14 @@ def _build_runtime_middlewares(
     from deerflow.agents.middlewares.input_sanitization_middleware import InputSanitizationMiddleware
     from deerflow.agents.middlewares.thread_data_middleware import ThreadDataMiddleware
     from deerflow.agents.middlewares.tool_output_budget_middleware import ToolOutputBudgetMiddleware
+    from deerflow.agents.middlewares.tool_result_sanitization_middleware import ToolResultSanitizationMiddleware
     from deerflow.config import get_app_config
     from deerflow.sandbox.middleware import SandboxMiddleware
 
     middlewares: list[AgentMiddleware] = [
         InputSanitizationMiddleware(),
         ToolOutputBudgetMiddleware.from_app_config(get_app_config()),
+        ToolResultSanitizationMiddleware(),
         ThreadDataMiddleware(lazy_init=lazy_init),
         SandboxMiddleware(lazy_init=lazy_init),
     ]

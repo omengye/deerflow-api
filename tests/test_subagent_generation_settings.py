@@ -259,8 +259,12 @@ def test_executor_injects_current_date_into_system_prompt(monkeypatch: pytest.Mo
     )
     executor._create_agent()
 
-    assert captured["system_prompt"] == (
-        "subagent prompt\n<current_date>2042-03-04, Tuesday</current_date>"
+    assert captured["system_prompt"].startswith(
+        "subagent prompt\n\n<report_contract>"
+    )
+    assert "[r1 write_file]" in captured["system_prompt"]
+    assert captured["system_prompt"].endswith(
+        "<current_date>2042-03-04, Tuesday</current_date>"
     )
 
 

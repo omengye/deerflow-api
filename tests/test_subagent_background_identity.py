@@ -19,6 +19,24 @@ from deerflow.subagents.executor import (
 )
 
 
+def test_subagent_lifecycle_timestamps_are_utc_aware() -> None:
+    result = SubagentResult(
+        task_id="utc",
+        trace_id="trace-1",
+        status=SubagentStatus.PENDING,
+    )
+
+    assert result.try_mark_running() is True
+    assert result.started_at is not None
+    assert result.started_at.utcoffset() is not None
+    assert result.started_at.utcoffset().total_seconds() == 0
+
+    assert result.try_set_terminal(SubagentStatus.COMPLETED, result="done") is True
+    assert result.completed_at is not None
+    assert result.completed_at.utcoffset() is not None
+    assert result.completed_at.utcoffset().total_seconds() == 0
+
+
 class _DeferredPool:
     def __init__(self) -> None:
         self.calls = []

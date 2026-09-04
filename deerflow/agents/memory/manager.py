@@ -105,6 +105,24 @@ class MemoryManager(ABC):
     def clear_memory(self, agent_name: str | None = None) -> dict[str, Any]:
         raise MemoryOperationUnsupported("clear_memory is not supported by this backend")
 
+    def cancel_by_agent(
+        self,
+        agent_name: str | None = None,
+        *,
+        user_id: str | None = None,
+        all_agents: bool = False,
+        all_users: bool = False,
+    ) -> int:
+        """Cancel memory writes that have not started processing yet."""
+        from deerflow.agents.memory.queue import get_memory_queue
+
+        return get_memory_queue().cancel_by_agent(
+            agent_name,
+            user_id=user_id,
+            all_agents=all_agents,
+            all_users=all_users,
+        )
+
     def create_fact(self, **kwargs: Any) -> dict[str, Any]:
         raise MemoryOperationUnsupported("fact CRUD is not supported by this backend")
 
